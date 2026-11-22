@@ -23,6 +23,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -508,8 +509,35 @@ class SuperLiveClient:
         self._token: str = env_tok or db.get_setting("superlive_token", "")
         self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
         self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
+        self._rtc_id: str = (
+            os.environ.get("SUPERLIVE_RTC_ID", "").strip()
+            or db.get_setting("superlive_rtc_id", "")
+            or str(random.randint(1000000000, 4200000000))
+        )
         if not db.get_setting("superlive_device_id", ""):
             db.set_setting("superlive_device_id", self._device_id)
+        if not db.get_setting("superlive_rtc_id", ""):
+            db.set_setting("superlive_rtc_id", self._rtc_id)
+
+    def _client_params(self, source_url: str = "https://superlive.chat/") -> Dict[str, Any]:
+        return {
+            "os_type": "web",
+            "app_build": "5.25.23",
+            "app": "superlive",
+            "build_code": "1526-2991979-prod",
+            "app_language": "en",
+            "device_language": "en",
+            "device_preferred_languages": ["en-US", "en"],
+            "source_url": source_url,
+            "session_source_url": "https://superlive.chat/",
+            "referrer": "",
+            "incognito": False,
+            "rtc_id": self._rtc_id,
+            "web_type": 1,
+            "display_density": "2.75",
+            "display_resolution_width": 393,
+            "display_resolution_height": 873,
+        }
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -525,16 +553,15 @@ class SuperLiveClient:
     def _headers(self) -> Dict[str, str]:
         headers = {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
             ),
-            "Accept": "application/json, text/plain, */*",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
             "Content-Type": "application/json",
+            "Device-Id": self._device_id,
             "Origin": "https://superlive.chat",
             "Referer": "https://superlive.chat/",
-            "device-id": self._device_id,
-            "X-Device-Id": self._device_id,
-            "X-Platform": "web",
         }
         if self._token:
             headers["Authorization"] = f"{self._auth_scheme} {self._token}"
@@ -549,9 +576,12 @@ class SuperLiveClient:
 
     async def _post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
+        body = dict(payload or {})
+        if "client_params" not in body:
+            body["client_params"] = self._client_params()
         sess = await self._get_session()
         try:
-            async with sess.post(url, json=payload or {}, headers=self._headers()) as resp:
+            async with sess.post(url, json=body, headers=self._headers()) as resp:
                 text = await resp.text()
                 try:
                     data = json.loads(text)
@@ -774,6 +804,7 @@ class SuperLiveClient:
             flat.get("agora_uid")
             or flat.get("agora_user_id")
             or flat.get("rtc_uid")
+            or flat.get("rtc_id")
             or flat.get("uid")
             or "0"
         )
@@ -865,7 +896,7 @@ class SuperLiveClient:
         # 2) Safe discover fallback ONLY when profile didn't expose livestream_id
         disc_data: Dict[str, Any] = {}
         if not ls_id:
-            disc_data = await self._request_smart("discover", {"page": 1, "limit": 100})
+            disc_data = await self._request_smart("discover", {"next": None, "type": 0})
             info.raw_debug["discover_http"] = disc_data.get("_http_status")
             info.raw_debug["discover_sample"] = json.dumps(disc_data, ensure_ascii=False)[:700]
             if isinstance(disc_data, dict):
@@ -909,9 +940,9 @@ class SuperLiveClient:
             return info
 
         # 3) Retrieve livestream details & enter room for Agora/HLS credentials
-        ls_param: Any = int(ls_id) if ls_id.isdigit() else ls_id
-        ret_resp = await self._request_smart("livestream/retrieve", {"livestream_id": ls_param})
-        ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_param})
+        ls_str = str(ls_id)
+        ret_resp = await self._request_smart("livestream/retrieve", {"livestream_id": ls_str})
+        ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_str})
 
         info.raw_debug["retrieve_http"] = ret_resp.get("_http_status")
         info.raw_debug["enter_http"] = ent_resp.get("_http_status")
