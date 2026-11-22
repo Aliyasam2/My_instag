@@ -20,6 +20,7 @@ Key Features:
 import asyncio
 import datetime
 import html
+import inspect
 import json
 import logging
 import os
@@ -1340,29 +1341,120 @@ class AgoraStreamReceiver:
         except Exception:
             pass
 
+    @staticmethod
+    def _build_publish_config(svc: Any) -> Any:
+        """Build the publish_config object required by agora-python-server-sdk 2.3/2.4+."""
+        import agora.rtc.agora_service as _ag_svc  # type: ignore
+        import agora.rtc.agora_base as _ag_base  # type: ignore
+
+        pub_cls = None
+        # 1) Check type annotation on create_rtc_connection
+        try:
+            sig = inspect.signature(svc.create_rtc_connection)
+            param = sig.parameters.get("publish_config")
+            if param and param.annotation not in (inspect.Parameter.empty, Any, None):
+                ann = param.annotation
+                if isinstance(ann, type):
+                    pub_cls = ann
+                elif isinstance(ann, str):
+                    pub_cls = getattr(_ag_svc, ann, None) or getattr(_ag_base, ann, None)
+        except Exception:
+            pass
+
+        # 2) Fallback: search known class names across agora_service / agora_base / rtc_connection
+        if pub_cls is None:
+            mods = [_ag_svc, _ag_base]
+            try:
+                import agora.rtc.rtc_connection as _ag_conn  # type: ignore
+                mods.append(_ag_conn)
+            except Exception:
+                pass
+            for mod in mods:
+                for cname in ("RTCConnPublishConfig", "PublishConfig", "PublishConfigure"):
+                    cand = getattr(mod, cname, None)
+                    if isinstance(cand, type):
+                        pub_cls = cand
+                        break
+                if pub_cls is not None:
+                    break
+
+        if pub_cls is None:
+            return None
+
+        pub_cfg = pub_cls()
+        # Audience recorder: do not publish outbound audio/video
+        for attr in ("is_publish_audio", "is_publish_video", "publish_audio", "publish_video"):
+            if hasattr(pub_cfg, attr):
+                setattr(pub_cfg, attr, False)
+        if hasattr(pub_cfg, "audio_scenario"):
+            try:
+                pub_cfg.audio_scenario = AudioScenarioType.AUDIO_SCENARIO_CHORUS
+            except Exception:
+                pass
+        return pub_cfg
+
     def connect(self) -> None:
         svc = AgoraServiceManager.get_service(self.app_id)
         conn_cfg = RTCConnConfig(
             client_role_type=ClientRoleType.CLIENT_ROLE_AUDIENCE,
             channel_profile=ChannelProfileType.CHANNEL_PROFILE_LIVE_BROADCASTING,
         )
-        self._conn = svc.create_rtc_connection(conn_cfg)
-        local_user = self._conn.get_local_user()
-        local_user.set_user_role(ClientRoleType.CLIENT_ROLE_AUDIENCE)
-
-        # Subscribe to all audio & high-quality encoded video
-        local_user.subscribe_all_audio()
-        sub_opts = VideoSubscriptionOptions(
-            type=VideoStreamType.VIDEO_STREAM_HIGH,
-            encoded_frame_only=1,
-        )
-        local_user.subscribe_all_video(sub_opts)
+        # Support both SDK 2.2 (1 arg) and SDK 2.3/2.4+ (2 args: conn_cfg, publish_config)
+        sig_params = inspect.signature(svc.create_rtc_connection).parameters
+        if len(sig_params) >= 2:
+            pub_cfg = self._build_publish_config(svc)
+            self._conn = svc.create_rtc_connection(conn_cfg, pub_cfg)
+        else:
+            self._conn = svc.create_rtc_connection(conn_cfg)
 
         self._video_obs = _VideoEncodedObserver(self)
         self._audio_obs = _AudioPcmObserver(self)
-        local_user.register_video_encoded_frame_observer(self._video_obs)
-        local_user.set_playback_audio_frame_before_mixing_parameters(self.channels, self.sample_rate)
-        local_user.register_audio_frame_observer(self._audio_obs)
+
+        local_user = self._conn.get_local_user() if hasattr(self._conn, "get_local_user") else None
+        if local_user is not None:
+            if hasattr(local_user, "set_user_role"):
+                local_user.set_user_role(ClientRoleType.CLIENT_ROLE_AUDIENCE)
+            if hasattr(local_user, "subscribe_all_audio"):
+                local_user.subscribe_all_audio()
+            if hasattr(local_user, "subscribe_all_video"):
+                try:
+                    sub_opts = VideoSubscriptionOptions(
+                        type=VideoStreamType.VIDEO_STREAM_HIGH,
+                        encoded_frame_only=1,
+                    )
+                except TypeError:
+                    sub_opts = VideoSubscriptionOptions()
+                    if hasattr(sub_opts, "type"):
+                        sub_opts.type = VideoStreamType.VIDEO_STREAM_HIGH
+                    if hasattr(sub_opts, "encoded_frame_only"):
+                        sub_opts.encoded_frame_only = 1
+                    elif hasattr(sub_opts, "encodedFrameOnly"):
+                        sub_opts.encodedFrameOnly = 1
+                local_user.subscribe_all_video(sub_opts)
+
+            if hasattr(local_user, "set_playback_audio_frame_before_mixing_parameters"):
+                local_user.set_playback_audio_frame_before_mixing_parameters(self.channels, self.sample_rate)
+
+            # Register video encoded frame observer (supports both 2.2 and 2.4 method names)
+            if hasattr(local_user, "register_video_encoded_frame_observer"):
+                local_user.register_video_encoded_frame_observer(self._video_obs)
+            elif hasattr(local_user, "set_encoded_video_frame_observer"):
+                local_user.set_encoded_video_frame_observer(self._video_obs)
+            elif hasattr(self._conn, "register_video_encoded_frame_observer"):
+                self._conn.register_video_encoded_frame_observer(self._video_obs)
+            elif hasattr(self._conn, "set_encoded_video_frame_observer"):
+                self._conn.set_encoded_video_frame_observer(self._video_obs)
+
+            # Register audio frame observer
+            if hasattr(local_user, "register_audio_frame_observer"):
+                local_user.register_audio_frame_observer(self._audio_obs)
+            elif hasattr(self._conn, "register_audio_frame_observer"):
+                self._conn.register_audio_frame_observer(self._audio_obs)
+        else:
+            if hasattr(self._conn, "register_audio_frame_observer"):
+                self._conn.register_audio_frame_observer(self._audio_obs)
+            if hasattr(self._conn, "register_video_encoded_frame_observer"):
+                self._conn.register_video_encoded_frame_observer(self._video_obs)
 
         self._conn.connect(self.token, self.channel_name, str(self.uid))
         self.started_at = time.time()
