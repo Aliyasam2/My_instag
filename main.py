@@ -826,76 +826,124 @@ class SuperLiveClient:
                     return found
         return ""
 
-    def _build_agora_uri(self, payload: Dict[str, Any], ls_id: str = "") -> str:
-        """Construct agora://<app_id>/<channel>?token=<tok>&uid=<uid>&ls_id=<ls_id> from API response."""
+    def _build_agora_uri(
+        self,
+        payload: Dict[str, Any],
+        ls_id: str = "",
+        debug_out: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Construct agora://<app_id>/<channel>?token=<tok>&uid=<uid>&ls_id=<ls_id>
+        Safely distinguishes Agora RTC (video/audio) tokens from RTM (chat) tokens,
+        and extracts the embedded 32-hex App ID from 006... tokens automatically.
+        """
         flat: Dict[str, Any] = {}
-        agora_sig_token = ""
-        stack: List[Any] = [payload]
+        rtc_tokens: List[Tuple[str, str]] = []
+        any_tokens: List[Tuple[str, str]] = []
+        agora_key_summary: List[str] = []
+
+        stack: List[Tuple[str, Any]] = [("", payload)]
         while stack:
-            cur = stack.pop()
+            prefix, cur = stack.pop()
             if isinstance(cur, dict):
                 for k, v in cur.items():
+                    kl = str(k).lower()
+                    full_k = f"{prefix}.{k}" if prefix else str(k)
                     if isinstance(v, (dict, list)):
-                        stack.append(v)
+                        stack.append((full_k, v))
                     else:
-                        if isinstance(v, str) and len(v) >= 50 and v.startswith(("006", "007")) and not agora_sig_token:
-                            agora_sig_token = v
-                        if k not in flat and v not in (None, ""):
-                            flat[k] = v
+                        if any(w in kl for w in ("agora", "rtc", "rtm", "channel", "token", "stream", "uid")):
+                            v_preview = f"len={len(v)}:{v[:6]}.." if isinstance(v, str) and len(v) > 24 else str(v)
+                            agora_key_summary.append(f"{k}={v_preview}")
+                        if isinstance(v, str) and len(v) >= 50 and v.startswith(("006", "007")):
+                            if "rtm" not in kl and "chat" not in kl and "msg" not in kl:
+                                rtc_tokens.append((kl, v))
+                            any_tokens.append((kl, v))
+                        if kl not in flat and v not in (None, ""):
+                            flat[kl] = v
             elif isinstance(cur, list):
-                for item in cur[:50]:
+                for idx, item in enumerate(cur[:40]):
                     if isinstance(item, (dict, list)):
-                        stack.append(item)
-                    elif isinstance(item, str) and len(item) >= 50 and item.startswith(("006", "007")) and not agora_sig_token:
-                        agora_sig_token = item
+                        stack.append((f"{prefix}[{idx}]", item))
+                    elif isinstance(item, str) and len(item) >= 50 and item.startswith(("006", "007")):
+                        any_tokens.append((prefix.lower(), item))
 
+        if debug_out is not None:
+            debug_out["agora_keys"] = ", ".join(agora_key_summary[:18])
+
+        # Prefer explicit RTC/livestream channel keys (avoid chat/rtm channels)
         channel = (
-            flat.get("channel_name")
-            or flat.get("channel_id")
+            flat.get("agora_channel_name")
             or flat.get("agora_channel")
-            or flat.get("agora_channel_name")
+            or flat.get("rtc_channel_name")
             or flat.get("rtc_channel")
+            or flat.get("channel_name")
+            or flat.get("channel_id")
             or flat.get("channel")
             or ls_id
         )
-        token = (
-            agora_sig_token
-            or flat.get("agora_token")
-            or flat.get("agora_rtc_token")
-            or flat.get("rtc_token")
-            or flat.get("viewer_token")
-            or flat.get("audience_token")
-            or flat.get("subscriber_token")
-            or flat.get("channel_token")
-            or flat.get("stream_token")
-            or flat.get("token")
-            or ""
-        )
+
+        # Pick RTC token (strictly preferring non-RTM tokens)
+        token = ""
+        for pref_k in (
+            "agora_token",
+            "agora_rtc_token",
+            "rtc_token",
+            "viewer_token",
+            "audience_token",
+            "subscriber_token",
+            "channel_token",
+            "stream_token",
+        ):
+            val = flat.get(pref_k)
+            if isinstance(val, str) and len(val) >= 30:
+                token = val
+                break
+        if not token and rtc_tokens:
+            token = rtc_tokens[0][1]
+        if not token and any_tokens:
+            token = any_tokens[0][1]
         if not token:
             for k, v in flat.items():
-                if "token" in str(k).lower() and isinstance(v, str) and len(v) >= 30:
+                if "token" in k and "rtm" not in k and isinstance(v, str) and len(v) >= 30:
                     token = v
                     break
 
-        uid = (
+        # Auto-extract exact 32-hex Agora App ID from 006... tokens if present
+        app_id = flat.get("agora_app_id") or flat.get("app_id") or DEFAULT_AGORA_APP_ID
+        if isinstance(token, str) and token.startswith("006") and len(token) >= 35:
+            cand_app = token[3:35]
+            if re.fullmatch(r"[0-9a-fA-F]{32}", cand_app):
+                app_id = cand_app
+
+        # Build prioritized candidate UIDs (explicit API uid, self._rtc_id, "0")
+        explicit_uid = (
             flat.get("agora_uid")
             or flat.get("agora_user_id")
             or flat.get("rtc_uid")
+            or flat.get("viewer_uid")
             or flat.get("rtc_id")
-            or flat.get("uid")
-            or self._rtc_id
-            or "0"
+            or ""
         )
-        app_id = flat.get("agora_app_id") or flat.get("app_id") or DEFAULT_AGORA_APP_ID
+        uid_list: List[str] = []
+        for u in (str(explicit_uid), str(self._rtc_id), "0"):
+            u = u.strip()
+            if u and u not in uid_list:
+                uid_list.append(u)
+
+        # Also store any alternate non-RTM token just in case
+        alt_tokens = [t for _, t in rtc_tokens if t != token]
 
         if channel and (token or str(channel) != str(ls_id)):
-            qs = urllib.parse.urlencode(
-                {
-                    "token": str(token),
-                    "uid": str(uid),
-                    "ls_id": str(ls_id or channel),
-                }
-            )
+            qs_dict = {
+                "token": str(token),
+                "uid": uid_list[0] if uid_list else "0",
+                "uids": ",".join(uid_list),
+                "ls_id": str(ls_id or channel),
+            }
+            if alt_tokens:
+                qs_dict["alt_token"] = alt_tokens[0]
+            qs = urllib.parse.urlencode(qs_dict)
             return f"agora://{app_id}/{channel}?{qs}"
         return ""
 
@@ -1145,7 +1193,7 @@ class SuperLiveClient:
 
         if not info.stream_url:
             merged = {"retrieve": ret_resp, "enter": ent_resp, "profile": prof_resp}
-            agora_uri = self._build_agora_uri(merged, ls_id=ls_id)
+            agora_uri = self._build_agora_uri(merged, ls_id=ls_id, debug_out=info.raw_debug)
             if agora_uri:
                 info.stream_url = agora_uri
 
@@ -1421,7 +1469,12 @@ class AgoraStreamReceiver:
         self.app_id = parsed.netloc or DEFAULT_AGORA_APP_ID
         self.channel_name = parsed.path.lstrip("/")
         self.token = (qs.get("token") or [""])[0]
+        self.alt_token = (qs.get("alt_token") or [""])[0]
         self.uid = (qs.get("uid") or ["0"])[0]
+        raw_uids = (qs.get("uids") or [self.uid])[0]
+        self.uid_candidates: List[str] = [u.strip() for u in raw_uids.split(",") if u.strip()] or [self.uid, "0"]
+        if "0" not in self.uid_candidates:
+            self.uid_candidates.append("0")
 
         self.h264_path = h264_path
         self.pcm_path = pcm_path
@@ -1954,12 +2007,46 @@ class RecordingManager:
         receiver = AgoraStreamReceiver(rec.stream_url, h264_file, pcm_file)
         reached_size_cap = False
 
-        await asyncio.to_thread(receiver.connect)
+        # Try candidate UIDs / tokens quickly if Agora returns fail(8) (INVALID_TOKEN / UID mismatch)
+        attempts: List[Tuple[str, str]] = [(receiver.token, u) for u in receiver.uid_candidates]
+        if receiver.alt_token:
+            attempts.extend((receiver.alt_token, u) for u in receiver.uid_candidates)
+
+        connected_ok = False
+        for idx, (tok_try, uid_try) in enumerate(attempts):
+            if rec.stop_event.is_set():
+                break
+            receiver.token = tok_try
+            receiver.uid = uid_try
+            receiver.conn_events.clear()
+            await asyncio.to_thread(receiver.connect)
+            # Wait up to 4.5s for connected or fail(8)
+            for _ in range(9):
+                await asyncio.sleep(0.5)
+                if "connected" in receiver.conn_events or receiver.video_frames > 0 or receiver.audio_frames > 0:
+                    connected_ok = True
+                    break
+                if any(ev.startswith("fail(") or ev.startswith("disconn(") for ev in receiver.conn_events):
+                    break
+            if connected_ok or idx == len(attempts) - 1:
+                break
+            # Disconnect failed attempt cleanly before trying next UID/token
+            if receiver._conn is not None:
+                try:
+                    await asyncio.to_thread(receiver._conn.disconnect)
+                    await asyncio.to_thread(receiver._conn.release)
+                except Exception:
+                    pass
+                receiver._conn = None
+
         try:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(2.0)
                 rec.bytes_written = receiver.bytes_written
 
+                # Fast-exit if Agora rejected all token/UID candidates
+                if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
+                    break
                 # Auto-stop when broadcaster stops sending frames
                 idle = time.time() - receiver.last_frame_at
                 if idle >= AGORA_INACTIVITY_TIMEOUT:
@@ -2382,7 +2469,8 @@ class SuperLiveRecBot:
                 f"• Discover HTTP: <code>{d.get('discover_http', '-')}</code>\n"
                 f"• Retrieve/Enter HTTP: <code>{d.get('retrieve_http', '-')} / {d.get('enter_http', '-')}</code>\n"
                 f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n"
-                f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n\n"
+                f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n"
+                f"• Agora Keys: <code>{html.escape(str(d.get('agora_keys', '-'))[:600])}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
                 f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
             )
