@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+from aiohttp import web
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import DocumentAttributeVideo
@@ -482,6 +483,16 @@ class Database:
             row = conn.execute("SELECT COUNT(*) AS c FROM recordings WHERE status = 'completed'").fetchone()
             return int(row["c"]) if row else 0
 
+    def mark_stale_recordings_interrupted(self) -> int:
+        now = datetime.datetime.utcnow().isoformat()
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE recordings SET status = 'interrupted', ended_at = ?, notes = 'Server restarted during capture' "
+                "WHERE status = 'recording'",
+                (now,),
+            )
+            return cur.rowcount
+
 
 # ==============================================================================
 # SUPERLIVE API CLIENT (Fixed disc_data bug + Robust Stream Discovery)
@@ -813,31 +824,54 @@ class SuperLiveClient:
     def _build_agora_uri(self, payload: Dict[str, Any], ls_id: str = "") -> str:
         """Construct agora://<app_id>/<channel>?token=<tok>&uid=<uid>&ls_id=<ls_id> from API response."""
         flat: Dict[str, Any] = {}
-        stack = [payload]
+        agora_sig_token = ""
+        stack: List[Any] = [payload]
         while stack:
             cur = stack.pop()
             if isinstance(cur, dict):
                 for k, v in cur.items():
-                    if isinstance(v, dict):
+                    if isinstance(v, (dict, list)):
                         stack.append(v)
-                    elif k not in flat and v not in (None, ""):
-                        flat[k] = v
+                    else:
+                        if isinstance(v, str) and len(v) >= 50 and v.startswith(("006", "007")) and not agora_sig_token:
+                            agora_sig_token = v
+                        if k not in flat and v not in (None, ""):
+                            flat[k] = v
+            elif isinstance(cur, list):
+                for item in cur[:50]:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+                    elif isinstance(item, str) and len(item) >= 50 and item.startswith(("006", "007")) and not agora_sig_token:
+                        agora_sig_token = item
 
         channel = (
             flat.get("channel_name")
             or flat.get("channel_id")
             or flat.get("agora_channel")
             or flat.get("agora_channel_name")
+            or flat.get("rtc_channel")
             or flat.get("channel")
             or ls_id
         )
         token = (
-            flat.get("agora_token")
+            agora_sig_token
+            or flat.get("agora_token")
+            or flat.get("agora_rtc_token")
             or flat.get("rtc_token")
-            or flat.get("token")
+            or flat.get("viewer_token")
+            or flat.get("audience_token")
+            or flat.get("subscriber_token")
+            or flat.get("channel_token")
             or flat.get("stream_token")
+            or flat.get("token")
             or ""
         )
+        if not token:
+            for k, v in flat.items():
+                if "token" in str(k).lower() and isinstance(v, str) and len(v) >= 30:
+                    token = v
+                    break
+
         uid = (
             flat.get("agora_uid")
             or flat.get("agora_user_id")
@@ -860,7 +894,52 @@ class SuperLiveClient:
             return f"agora://{app_id}/{channel}?{qs}"
         return ""
 
-    async def check_creator_and_get_stream(self, creator_id: str) -> CreatorStreamInfo:
+    async def fetch_discover_map(self, max_pages: int = 4) -> Tuple[Dict[str, Dict[str, Any]], int, str]:
+        """Fetch paginated /discover ONCE and index live streams by user_id, shared_id, and username."""
+        await self.ensure_initialized()
+        live_map: Dict[str, Dict[str, Any]] = {}
+        first_http = 0
+        first_sample = ""
+        cursor: Any = None
+        for page_idx in range(max_pages):
+            disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
+            if page_idx == 0:
+                first_http = int(disc_data.get("_http_status") or 0)
+                first_sample = json.dumps(disc_data, ensure_ascii=False)[:700]
+            if not isinstance(disc_data, dict):
+                break
+            streams_list = (
+                disc_data.get("items")
+                or disc_data.get("livestreams")
+                or disc_data.get("streams")
+                or (disc_data.get("data") or {}).get("items")
+                or (disc_data.get("data") or {}).get("livestreams")
+                or (disc_data.get("data") if isinstance(disc_data.get("data"), list) else [])
+                or []
+            )
+            for item in streams_list:
+                if not isinstance(item, dict):
+                    continue
+                host = item.get("user") or item.get("host") or item.get("broadcaster") or item
+                for key_val in (
+                    host.get("user_id"),
+                    host.get("id"),
+                    host.get("shared_id"),
+                    host.get("short_id"),
+                    item.get("user_id"),
+                    item.get("shared_id"),
+                    str(host.get("username") or "").lower(),
+                ):
+                    if key_val:
+                        live_map[str(key_val)] = item
+            cursor = disc_data.get("next")
+            if not cursor:
+                break
+        return live_map, first_http, first_sample
+
+    async def check_creator_and_get_stream(
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
         Uses recursive field inspection + safe discover fallback + detailed raw_debug for /debug.
@@ -871,8 +950,27 @@ class SuperLiveClient:
         info.raw_debug["has_token"] = bool(self._token)
 
         target_uid = str(creator_id)
+        ls_id = ""
+        is_live_flag = False
+        prof_resp: Dict[str, Any] = {}
+        user_obj: Dict[str, Any] = {}
 
-        # 1) Query user profile by internal user_id (string)
+        # 0) Fast path: check pre-fetched discover_map first (avoids 100x API spam!)
+        if discover_map is not None:
+            matched_item = discover_map.get(target_uid) or discover_map.get(target_uid.lower())
+            if matched_item:
+                host = matched_item.get("user") or matched_item.get("host") or matched_item.get("broadcaster") or matched_item
+                ls_id = str(host.get("livestream_id") or matched_item.get("livestream_id") or matched_item.get("id") or "")
+                real_uid = str(host.get("user_id") or host.get("id") or target_uid)
+                info.creator_id = real_uid
+                info.username = str(host.get("username") or host.get("shared_id") or "")
+                info.display_name = str(host.get("name") or host.get("nickname") or info.username or real_uid)
+                info.avatar_url = self._extract_avatar(host)
+                info.title = str(matched_item.get("title") or "")
+                is_live_flag = bool(ls_id)
+                info.raw_debug["discover_cache_hit"] = True
+
+        # 1) Query user profile only if not already matched in discover_map
         prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
             await self.ensure_initialized(force=True)
@@ -939,7 +1037,7 @@ class SuperLiveClient:
 
         # 2) Safe discover fallback ONLY when profile didn't expose livestream_id (supports pagination + shared_id!)
         disc_data: Dict[str, Any] = {}
-        if not ls_id:
+        if not ls_id and discover_map is None:
             cursor: Any = None
             for page_idx in range(4):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
@@ -1012,7 +1110,8 @@ class SuperLiveClient:
         ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_str})
 
         info.raw_debug["retrieve_http"] = ret_resp.get("_http_status")
-        info.raw_debug["retrieve_sample"] = json.dumps(ret_resp, ensure_ascii=False)[:900]
+        slim_ret = {k: v for k, v in ret_resp.items() if k not in ("user", "target_bar", "top_gifters", "gifts")}
+        info.raw_debug["retrieve_sample"] = json.dumps(slim_ret, ensure_ascii=False)[:1100]
         info.raw_debug["enter_http"] = ent_resp.get("_http_status")
         info.raw_debug["enter_sample"] = json.dumps(ent_resp, ensure_ascii=False)[:700]
 
@@ -1567,6 +1666,7 @@ class RecordingManager:
         self.db = db
         self.api = api
         self.active: Dict[str, ActiveRecording] = {}
+        self._fail_cooldown: Dict[str, float] = {}
 
     def max_concurrent(self) -> int:
         raw = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
@@ -1584,6 +1684,10 @@ class RecordingManager:
         cid = str(stream_info.creator_id)
         if cid in self.active:
             return False, f"استریم <b>{html.escape(stream_info.display_name or cid)}</b> همین الان در حال ضبط هست."
+        if triggered_by == "watchlist":
+            cd_until = self._fail_cooldown.get(cid, 0.0)
+            if time.time() < cd_until:
+                return False, "cooldown"
 
         limit = self.max_concurrent()
         if limit > 0 and len(self.active) >= limit:
@@ -1695,6 +1799,7 @@ class RecordingManager:
 
             if total_size == 0:
                 final_status = "empty"
+                self._fail_cooldown[rec.creator_id] = time.time() + 180.0
                 notes = "هیچ فریم ویدیویی/صوتی دریافت نشد (ممکن است لایو بسته شده یا خصوصی باشد)."
                 await self.bot.send_message(
                     rec.chat_id,
@@ -1706,6 +1811,7 @@ class RecordingManager:
                 )
         except Exception as e:
             final_status = "error"
+            self._fail_cooldown[rec.creator_id] = time.time() + 180.0
             notes = str(e)[:300]
             log.exception("Recording failed for %s", rec.creator_id)
             try:
@@ -1944,16 +2050,24 @@ class RecordingManager:
             )
         ]
 
-        sent = await self.bot.send_file(
-            rec.chat_id,
-            str(mp4_path),
-            caption=caption,
-            parse_mode="html",
-            thumb=str(thumb_file) if thumb_file else None,
-            attributes=attrs,
-            supports_streaming=True,
-            progress_callback=progress_cb,
-        )
+        sent = None
+        for attempt in range(3):
+            try:
+                sent = await self.bot.send_file(
+                    rec.chat_id,
+                    str(mp4_path),
+                    caption=caption,
+                    parse_mode="html",
+                    thumb=str(thumb_file) if thumb_file else None,
+                    attributes=attrs,
+                    supports_streaming=True,
+                    progress_callback=progress_cb,
+                )
+                break
+            except FloodWaitError as fw:
+                wait_s = int(getattr(fw, "seconds", 10)) + 2
+                log.warning("FloodWait %ss while uploading %s (attempt %d)", wait_s, rec.creator_id, attempt + 1)
+                await asyncio.sleep(wait_s)
 
         # Optional: Forward to user's private Archive Channel
         arch_chat_raw = self.db.get_setting("archive_chat_id", "")
@@ -2005,6 +2119,12 @@ class WatchlistMonitor:
                 owner_id = self.db.get_owner_id()
                 if owner_id:
                     items = self.db.list_watchlist()
+                    discover_map: Optional[Dict[str, Dict[str, Any]]] = None
+                    if items:
+                        try:
+                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=4)
+                        except Exception as e:
+                            log.warning("Batch discover fetch failed: %s", e)
                     for item in items:
                         if self._stop.is_set():
                             break
@@ -2012,7 +2132,7 @@ class WatchlistMonitor:
                         if not item["auto_record"] or self.rec_mgr.is_recording(cid):
                             continue
                         try:
-                            info = await self.api.check_creator_and_get_stream(cid)
+                            info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
                             if info.is_live:
                                 self.db.update_watch_status(
                                     cid, "live", display_name=info.display_name, username=info.username
@@ -2564,8 +2684,52 @@ class SuperLiveRecBot:
         await event.answer("تنظیمات ذخیره شد ✅")
         await self._send_settings_view(event, edit=True)
 
+    async def _start_health_server(self) -> Optional[web.AppRunner]:
+        port_raw = os.environ.get("PORT", "").strip()
+        if not port_raw or not port_raw.isdigit():
+            return None
+        port = int(port_raw)
+        app = web.Application()
+
+        async def handle_health(_request: Any) -> web.Response:
+            _, free_mb, _ = get_disk_stats()
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "service": "SuperLiveRec Personal Unlimited",
+                    "active_recordings": len(self.rec_mgr.active),
+                    "watchlist_count": len(self.db.list_watchlist()),
+                    "free_disk_mb": round(free_mb, 1),
+                    "agora_ready": AGORA_AVAILABLE,
+                }
+            )
+
+        app.router.add_get("/", handle_health)
+        app.router.add_get("/health", handle_health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        log.info("Healthcheck HTTP server listening on port %d", port)
+        return runner
+
     async def run(self) -> None:
+        # Clean up stale interrupted recordings & orphan temp directories from prior restarts
+        stale = self.db.mark_stale_recordings_interrupted()
+        if stale:
+            log.info("Marked %d stale recordings as interrupted.", stale)
+        if self.db.get_setting("auto_delete", "1") == "1":
+            for child in RECORDINGS_DIR.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
         self._register_handlers()
+        health_runner = await self._start_health_server()
         log.info("Starting SuperLiveRec Personal Unlimited Bot (Telethon MTProto)...")
         await self.bot.start(bot_token=BOT_TOKEN)
         me = await self.bot.get_me()
@@ -2577,6 +2741,8 @@ class SuperLiveRecBot:
             await self.monitor.stop()
             await self.rec_mgr.stop_all()
             await self.api.close()
+            if health_runner:
+                await health_runner.cleanup()
 
 
 async def main() -> None:
