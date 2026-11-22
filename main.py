@@ -810,8 +810,7 @@ class SuperLiveClient:
                     return found
         return ""
 
-    @staticmethod
-    def _build_agora_uri(payload: Dict[str, Any], ls_id: str = "") -> str:
+    def _build_agora_uri(self, payload: Dict[str, Any], ls_id: str = "") -> str:
         """Construct agora://<app_id>/<channel>?token=<tok>&uid=<uid>&ls_id=<ls_id> from API response."""
         flat: Dict[str, Any] = {}
         stack = [payload]
@@ -845,6 +844,7 @@ class SuperLiveClient:
             or flat.get("rtc_uid")
             or flat.get("rtc_id")
             or flat.get("uid")
+            or self._rtc_id
             or "0"
         )
         app_id = flat.get("agora_app_id") or flat.get("app_id") or DEFAULT_AGORA_APP_ID
@@ -1012,6 +1012,7 @@ class SuperLiveClient:
         ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_str})
 
         info.raw_debug["retrieve_http"] = ret_resp.get("_http_status")
+        info.raw_debug["retrieve_sample"] = json.dumps(ret_resp, ensure_ascii=False)[:900]
         info.raw_debug["enter_http"] = ent_resp.get("_http_status")
         info.raw_debug["enter_sample"] = json.dumps(ent_resp, ensure_ascii=False)[:700]
 
@@ -1405,6 +1406,16 @@ class AgoraStreamReceiver:
             client_role_type=ClientRoleType.CLIENT_ROLE_AUDIENCE,
             channel_profile=ChannelProfileType.CHANNEL_PROFILE_LIVE_BROADCASTING,
         )
+        for attr, val in (
+            ("auto_subscribe_audio", 1),
+            ("auto_subscribe_video", 1),
+            ("enable_audio_recording_or_playout", 1),
+        ):
+            if hasattr(conn_cfg, attr):
+                try:
+                    setattr(conn_cfg, attr, val)
+                except Exception:
+                    pass
         # Support both SDK 2.2 (1 arg) and SDK 2.3/2.4+ (2 args: conn_cfg, publish_config)
         sig_params = inspect.signature(svc.create_rtc_connection).parameters
         if len(sig_params) >= 2:
@@ -1465,6 +1476,23 @@ class AgoraStreamReceiver:
                 else:
                     reg_fn(self._audio_obs)
         else:
+            if hasattr(self._conn, "subscribe_all_audio"):
+                try:
+                    self._conn.subscribe_all_audio()
+                except Exception:
+                    pass
+            if hasattr(self._conn, "subscribe_all_video"):
+                try:
+                    sub_opts = VideoSubscriptionOptions()
+                    if hasattr(sub_opts, "type"):
+                        sub_opts.type = VideoStreamType.VIDEO_STREAM_HIGH
+                    if hasattr(sub_opts, "encoded_frame_only"):
+                        sub_opts.encoded_frame_only = 1
+                    elif hasattr(sub_opts, "encodedFrameOnly"):
+                        sub_opts.encodedFrameOnly = 1
+                    self._conn.subscribe_all_video(sub_opts)
+                except Exception:
+                    pass
             reg_fn = getattr(self._conn, "register_audio_frame_observer", None)
             if reg_fn is not None:
                 n_params = len(inspect.signature(reg_fn).parameters)
@@ -1670,7 +1698,10 @@ class RecordingManager:
                 notes = "هیچ فریم ویدیویی/صوتی دریافت نشد (ممکن است لایو بسته شده یا خصوصی باشد)."
                 await self.bot.send_message(
                     rec.chat_id,
-                    f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> تمام شد ولی دیتایی دریافت نشد.\nعلت احتمالی: لایو لحظه‌ای بسته شده یا نیاز به لاگین SuperLive دارد.",
+                    (
+                        f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> تمام شد ولی دیتایی دریافت نشد.\n"
+                        f"📊 جزئیات فنی: <code>{html.escape(rec.status_text)}</code>"
+                    ),
                     parse_mode="html",
                 )
         except Exception as e:
@@ -1805,7 +1836,11 @@ class RecordingManager:
             ch = receiver.channels
             await asyncio.to_thread(receiver.close)
 
-        rec.status_text = "در حال ترکیب صدا و تصویر (FFmpeg Mux)..."
+        rec.status_text = (
+            f"v_frames={receiver.video_frames}, a_frames={receiver.audio_frames}, "
+            f"uid={receiver.uid}, tok_len={len(receiver.token)}, ch={receiver.channel_name[:12]}"
+        )
+        log.info("Agora capture ended for %s: %s", rec.creator_id, rec.status_text)
         mux_cmd = build_mux_command(
             FFMPEG_BIN or "ffmpeg",
             h264_file,
@@ -2187,7 +2222,7 @@ class SuperLiveRecBot:
                 f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n"
                 f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
-                f"<b>Discover/Enter JSON:</b>\n<code>{html.escape(str(d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
+                f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
             )
             await msg.edit(report[:4000], parse_mode="html")
 
