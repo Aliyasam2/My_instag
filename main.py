@@ -1259,7 +1259,7 @@ class _VideoEncodedObserver(IVideoEncodedFrameObserver):  # type: ignore
         super().__init__()
         self.receiver = receiver
 
-    def on_encoded_video_frame(self, uid: Any, image_buffer: Any, length: int, video_encoded_frame_info: Any) -> int:
+    def on_encoded_video_frame(self, uid: Any, image_buffer: Any, length: int, video_encoded_frame_info: Any = None, *args: Any, **kwargs: Any) -> int:
         self.receiver.handle_video_frame(image_buffer, length)
         return 1
 
@@ -1269,13 +1269,19 @@ class _AudioPcmObserver(IAudioFrameObserver):  # type: ignore
         super().__init__()
         self.receiver = receiver
 
-    def on_playback_audio_frame_before_mixing(self, agora_local_user: Any, channel_id: str, uid: str, audio_frame: Any) -> int:
-        self.receiver.handle_audio_frame(audio_frame)
+    def on_playback_audio_frame_before_mixing(self, *args: Any, **kwargs: Any) -> int:
+        audio_frame = kwargs.get("audio_frame")
+        if audio_frame is None:
+            for a in args:
+                if hasattr(a, "buffer"):
+                    audio_frame = a
+                    break
+        if audio_frame is not None:
+            self.receiver.handle_audio_frame(audio_frame)
         return 1
 
-    def on_playback_audio_frame(self, agora_local_user: Any, channel_id: str, audio_frame: Any) -> int:
-        self.receiver.handle_audio_frame(audio_frame)
-        return 1
+    def on_playback_audio_frame(self, *args: Any, **kwargs: Any) -> int:
+        return self.on_playback_audio_frame_before_mixing(*args, **kwargs)
 
 
 class AgoraStreamReceiver:
@@ -1445,16 +1451,33 @@ class AgoraStreamReceiver:
             elif hasattr(self._conn, "set_encoded_video_frame_observer"):
                 self._conn.set_encoded_video_frame_observer(self._video_obs)
 
-            # Register audio frame observer
-            if hasattr(local_user, "register_audio_frame_observer"):
-                local_user.register_audio_frame_observer(self._audio_obs)
-            elif hasattr(self._conn, "register_audio_frame_observer"):
-                self._conn.register_audio_frame_observer(self._audio_obs)
+            # Register audio frame observer (SDK 2.4+ requires enable_vad and vad_configure)
+            reg_fn = (
+                getattr(local_user, "register_audio_frame_observer", None)
+                or getattr(self._conn, "register_audio_frame_observer", None)
+            )
+            if reg_fn is not None:
+                n_params = len(inspect.signature(reg_fn).parameters)
+                if n_params >= 3:
+                    reg_fn(self._audio_obs, 0, None)
+                elif n_params == 2:
+                    reg_fn(self._audio_obs, 0)
+                else:
+                    reg_fn(self._audio_obs)
         else:
-            if hasattr(self._conn, "register_audio_frame_observer"):
-                self._conn.register_audio_frame_observer(self._audio_obs)
+            reg_fn = getattr(self._conn, "register_audio_frame_observer", None)
+            if reg_fn is not None:
+                n_params = len(inspect.signature(reg_fn).parameters)
+                if n_params >= 3:
+                    reg_fn(self._audio_obs, 0, None)
+                elif n_params == 2:
+                    reg_fn(self._audio_obs, 0)
+                else:
+                    reg_fn(self._audio_obs)
             if hasattr(self._conn, "register_video_encoded_frame_observer"):
                 self._conn.register_video_encoded_frame_observer(self._video_obs)
+            elif hasattr(self._conn, "set_encoded_video_frame_observer"):
+                self._conn.set_encoded_video_frame_observer(self._video_obs)
 
         self._conn.connect(self.token, self.channel_name, str(self.uid))
         self.started_at = time.time()
