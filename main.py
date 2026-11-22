@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -502,15 +503,19 @@ class SuperLiveClient:
     def __init__(self, db: Database):
         self.db = db
         self._session: Optional[aiohttp.ClientSession] = None
-        self._token: str = db.get_setting("superlive_token", "")
-        self._device_id: str = db.get_setting("superlive_device_id", "") or f"web_{int(time.time())}"
+        env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip()
+        env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip()
+        self._token: str = env_tok or db.get_setting("superlive_token", "")
+        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
+        self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
         if not db.get_setting("superlive_device_id", ""):
             db.set_setting("superlive_device_id", self._device_id)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=25)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            jar = aiohttp.CookieJar(unsafe=True)
+            self._session = aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
         return self._session
 
     async def close(self) -> None:
@@ -527,11 +532,20 @@ class SuperLiveClient:
             "Content-Type": "application/json",
             "Origin": "https://superlive.chat",
             "Referer": "https://superlive.chat/",
+            "device-id": self._device_id,
             "X-Device-Id": self._device_id,
+            "X-Platform": "web",
         }
         if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
+            headers["Authorization"] = f"{self._auth_scheme} {self._token}"
         return headers
+
+    def set_credentials(self, token: str, device_id: str = "") -> None:
+        self._token = token.strip()
+        self.db.set_setting("superlive_token", self._token)
+        if device_id.strip():
+            self._device_id = device_id.strip()
+            self.db.set_setting("superlive_device_id", self._device_id)
 
     async def _post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
@@ -540,11 +554,15 @@ class SuperLiveClient:
             async with sess.post(url, json=payload or {}, headers=self._headers()) as resp:
                 text = await resp.text()
                 try:
-                    return json.loads(text)
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        data.setdefault("_http_status", resp.status)
+                        return data
+                    return {"_http_status": resp.status, "data": data}
                 except Exception:
-                    return {"_http_status": resp.status, "_raw": text[:400]}
+                    return {"_http_status": resp.status, "_raw": text[:600]}
         except Exception as e:
-            return {"_error": str(e)}
+            return {"_http_status": 0, "_error": str(e)}
 
     async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
@@ -553,45 +571,91 @@ class SuperLiveClient:
             async with sess.get(url, params=params or {}, headers=self._headers()) as resp:
                 text = await resp.text()
                 try:
-                    return json.loads(text)
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        data.setdefault("_http_status", resp.status)
+                        return data
+                    return {"_http_status": resp.status, "data": data}
                 except Exception:
-                    return {"_http_status": resp.status, "_raw": text[:400]}
+                    return {"_http_status": resp.status, "_raw": text[:600]}
         except Exception as e:
-            return {"_error": str(e)}
+            return {"_http_status": 0, "_error": str(e)}
 
-    async def ensure_initialized(self) -> None:
-        if self._token:
-            return
-        data = await self._post(
+    async def _request_smart(
+        self, endpoint: str, payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Try POST JSON first; auto-switch Token/Bearer on 401/403 and GET on 404/405."""
+        res = await self._post(endpoint, payload)
+        status = res.get("_http_status", 0)
+        if status in (401, 403) and self._token:
+            alt_scheme = "Bearer" if self._auth_scheme == "Token" else "Token"
+            prev_scheme = self._auth_scheme
+            self._auth_scheme = alt_scheme
+            retry = await self._post(endpoint, payload)
+            if retry.get("_http_status", 0) in (200, 201):
+                self.db.set_setting("superlive_auth_scheme", alt_scheme)
+                return retry
+            self._auth_scheme = prev_scheme
+        if status in (404, 405):
+            get_res = await self._get(endpoint, payload)
+            if get_res.get("_http_status", 0) in (200, 201):
+                return get_res
+        return res
+
+    @staticmethod
+    def _deep_find_keys(obj: Any, target_keys: Tuple[str, ...]) -> Dict[str, Any]:
+        """Recursively collect first non-empty values for any matching keys."""
+        found: Dict[str, Any] = {}
+        stack: List[Any] = [obj]
+        seen = 0
+        while stack and seen < 400:
+            cur = stack.pop()
+            seen += 1
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    kl = str(k).lower()
+                    if kl in target_keys and kl not in found and v not in (None, "", [], {}):
+                        found[kl] = v
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for item in cur[:50]:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+        return found
+
+    async def ensure_initialized(self, force: bool = False) -> Dict[str, Any]:
+        if self._token and not force:
+            return {"_cached": True}
+        data = await self._request_smart(
             "initialize",
             {"device_id": self._device_id, "platform": "web", "language": "en"},
         )
+        found = self._deep_find_keys(data, ("token", "access_token", "auth_token", "jwt", "session_token"))
         token = (
-            data.get("token")
-            or data.get("access_token")
-            or (data.get("data") or {}).get("token")
-            or (data.get("data") or {}).get("access_token")
+            found.get("access_token")
+            or found.get("token")
+            or found.get("auth_token")
+            or found.get("jwt")
+            or found.get("session_token")
         )
         if token:
             self._token = str(token)
             self.db.set_setting("superlive_token", self._token)
+        return data
 
     async def email_signin(self, email: str, password: str) -> Tuple[bool, str]:
         data = await self._post(
             "signup/email_signin",
             {"email": email, "password": password, "device_id": self._device_id},
         )
-        token = (
-            data.get("token")
-            or data.get("access_token")
-            or (data.get("data") or {}).get("token")
-            or (data.get("data") or {}).get("access_token")
-        )
+        found = self._deep_find_keys(data, ("token", "access_token", "auth_token", "jwt"))
+        token = found.get("access_token") or found.get("token") or found.get("auth_token") or found.get("jwt")
         if token:
             self._token = str(token)
             self.db.set_setting("superlive_token", self._token)
             return True, "ورود به اکانت SuperLive با موفقیت انجام شد."
-        err = data.get("message") or data.get("error") or data.get("_error") or "توکن دریافت نشد."
+        err = data.get("message") or data.get("error") or data.get("_error") or f"HTTP {data.get('_http_status')}"
         return False, f"خطا در ورود: {err}"
 
     async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
@@ -601,9 +665,8 @@ class SuperLiveClient:
         if not ident:
             return "", "", "", ""
 
-        # If numeric ID, query users/profile directly
         if ident.isdigit():
-            prof = await self._post("users/profile", {"user_id": int(ident)})
+            prof = await self._request_smart("users/profile", {"user_id": int(ident)})
             user_obj = self._extract_user_dict(prof)
             if user_obj:
                 cid = str(user_obj.get("id") or user_obj.get("user_id") or ident)
@@ -613,8 +676,7 @@ class SuperLiveClient:
                 return cid, uname, dname, avatar
             return ident, "", ident, ""
 
-        # Otherwise search by profile_share_search
-        res = await self._post("user/profile_share_search", {"query": ident, "keyword": ident})
+        res = await self._request_smart("user/profile_share_search", {"query": ident, "keyword": ident})
         candidates = (
             res.get("users")
             or (res.get("data") or {}).get("users")
@@ -636,14 +698,15 @@ class SuperLiveClient:
     def _extract_user_dict(payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             return {}
-        for key in ("user", "profile", "data"):
+        for key in ("user", "profile", "data", "result"):
             val = payload.get(key)
             if isinstance(val, dict):
-                if any(k in val for k in ("id", "user_id", "username", "name", "livestream_id")):
+                if any(k in val for k in ("id", "user_id", "username", "name", "livestream_id", "livestream", "is_live")):
                     return val
-                if isinstance(val.get("user"), dict):
-                    return val["user"]
-        if any(k in payload for k in ("id", "user_id", "username", "name", "livestream_id")):
+                for sub in ("user", "profile"):
+                    if isinstance(val.get(sub), dict):
+                        return val[sub]
+        if any(k in payload for k in ("id", "user_id", "username", "name", "livestream_id", "livestream", "is_live")):
             return payload
         return {}
 
@@ -659,6 +722,7 @@ class SuperLiveClient:
             "rtmp_url",
             "m3u8_url",
             "pull_url",
+            "playback_url",
             "url",
         ):
             v = obj.get(k)
@@ -670,7 +734,6 @@ class SuperLiveClient:
             ):
                 if any(ext in v.lower() for ext in (".m3u8", ".flv", ".mp4", "rtmp://", "agora://", "live", "stream")):
                     return v
-        # Nested search
         for v in obj.values():
             if isinstance(v, dict):
                 found = SuperLiveClient._extract_direct_stream_url(v)
@@ -730,61 +793,113 @@ class SuperLiveClient:
     async def check_creator_and_get_stream(self, creator_id: str) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
-        Fixes the previous `disc_data` NameError by explicitly fetching discover only as a safe fallback.
+        Uses recursive field inspection + safe discover fallback + detailed raw_debug for /debug.
         """
-        await self.ensure_initialized()
+        init_res = await self.ensure_initialized()
         info = CreatorStreamInfo(creator_id=str(creator_id))
+        info.raw_debug["init_status"] = init_res.get("_http_status", "cached")
+        info.raw_debug["has_token"] = bool(self._token)
+
         uid_param: Any = int(creator_id) if str(creator_id).isdigit() else creator_id
 
-        # 1) Query user profile
-        prof_resp = await self._post("users/profile", {"user_id": uid_param})
-        user_obj = self._extract_user_dict(prof_resp)
-        info.raw_debug["profile_keys"] = list(user_obj.keys())[:20]
+        # 1) Query user profile (try user_id, fallback to id)
+        prof_resp = await self._request_smart("users/profile", {"user_id": uid_param})
+        if prof_resp.get("_http_status") in (401, 403):
+            # Re-initialize guest token once on auth expiry
+            await self.ensure_initialized(force=True)
+            prof_resp = await self._request_smart("users/profile", {"user_id": uid_param})
+        if prof_resp.get("_http_status") not in (200, 201) or not self._extract_user_dict(prof_resp):
+            alt_prof = await self._request_smart("users/profile", {"id": uid_param})
+            if alt_prof.get("_http_status") in (200, 201) and self._extract_user_dict(alt_prof):
+                prof_resp = alt_prof
 
+        info.raw_debug["profile_http"] = prof_resp.get("_http_status")
+        info.raw_debug["profile_sample"] = json.dumps(prof_resp, ensure_ascii=False)[:900]
+
+        user_obj = self._extract_user_dict(prof_resp)
         if user_obj:
             info.username = str(user_obj.get("username") or user_obj.get("unique_id") or "")
             info.display_name = str(user_obj.get("name") or user_obj.get("nickname") or info.username or creator_id)
             info.avatar_url = str(user_obj.get("avatar") or user_obj.get("profile_image") or "")
 
+        # Recursive search inside ENTIRE profile response for livestream identifiers
+        deep = self._deep_find_keys(
+            prof_resp,
+            (
+                "livestream_id",
+                "live_id",
+                "stream_id",
+                "broadcast_id",
+                "room_id",
+                "channel_name",
+                "agora_channel",
+                "is_live",
+                "is_streaming",
+                "live_status",
+                "online_status",
+                "livestream",
+                "current_livestream",
+                "active_livestream",
+            ),
+        )
         ls_id = str(
-            user_obj.get("livestream_id")
-            or user_obj.get("live_id")
-            or (user_obj.get("livestream") or {}).get("id")
-            or (user_obj.get("current_livestream") or {}).get("id")
+            deep.get("livestream_id")
+            or deep.get("live_id")
+            or deep.get("stream_id")
+            or deep.get("broadcast_id")
+            or deep.get("room_id")
             or ""
         )
+        for nested_key in ("livestream", "current_livestream", "active_livestream"):
+            nested = deep.get(nested_key)
+            if not ls_id and isinstance(nested, dict):
+                ls_id = str(nested.get("id") or nested.get("livestream_id") or nested.get("live_id") or "")
+
         is_live_flag = bool(
-            user_obj.get("is_live")
-            or user_obj.get("is_streaming")
-            or user_obj.get("live_status") in (1, True, "live", "online")
+            deep.get("is_live")
+            or deep.get("is_streaming")
+            or deep.get("live_status") in (1, True, "live", "online", "LIVE", "ONLINE")
             or ls_id
         )
 
         # 2) Safe discover fallback ONLY when profile didn't expose livestream_id
         disc_data: Dict[str, Any] = {}
         if not ls_id:
-            disc_data = await self._post("discover", {"page": 1, "limit": 60})
+            disc_data = await self._request_smart("discover", {"page": 1, "limit": 100})
+            info.raw_debug["discover_http"] = disc_data.get("_http_status")
+            info.raw_debug["discover_sample"] = json.dumps(disc_data, ensure_ascii=False)[:700]
             if isinstance(disc_data, dict):
                 streams_list = (
                     disc_data.get("livestreams")
                     or disc_data.get("streams")
+                    or disc_data.get("items")
                     or (disc_data.get("data") or {}).get("livestreams")
+                    or (disc_data.get("data") or {}).get("items")
                     or (disc_data.get("data") if isinstance(disc_data.get("data"), list) else [])
                     or []
                 )
                 for item in streams_list:
                     if not isinstance(item, dict):
                         continue
-                    host = item.get("user") or item.get("host") or item
-                    hid = str(host.get("id") or host.get("user_id") or item.get("user_id") or "")
-                    hname = str(host.get("username") or "")
-                    if hid == str(creator_id) or (hname and hname.lower() == str(creator_id).lower()):
-                        ls_id = str(item.get("livestream_id") or item.get("id") or "")
+                    host = item.get("user") or item.get("host") or item.get("broadcaster") or item
+                    ids = {
+                        str(host.get("id") or ""),
+                        str(host.get("user_id") or ""),
+                        str(host.get("short_id") or ""),
+                        str(item.get("user_id") or ""),
+                        str(item.get("host_id") or ""),
+                    }
+                    names = {
+                        str(host.get("username") or "").lower(),
+                        str(host.get("unique_id") or "").lower(),
+                    }
+                    if str(creator_id) in ids or str(creator_id).lower() in names:
+                        ls_id = str(item.get("livestream_id") or item.get("id") or item.get("live_id") or "")
                         is_live_flag = True
                         info.title = str(item.get("title") or "")
                         info.viewers = int(item.get("viewer_count") or item.get("viewers") or 0)
                         if not info.display_name:
-                            info.display_name = str(host.get("name") or hname or creator_id)
+                            info.display_name = str(host.get("name") or host.get("username") or creator_id)
                         break
 
         info.livestream_id = ls_id
@@ -795,13 +910,14 @@ class SuperLiveClient:
 
         # 3) Retrieve livestream details & enter room for Agora/HLS credentials
         ls_param: Any = int(ls_id) if ls_id.isdigit() else ls_id
-        ret_resp = await self._post("livestream/retrieve", {"livestream_id": ls_param})
-        ent_resp = await self._post("livestream/enter", {"livestream_id": ls_param})
+        ret_resp = await self._request_smart("livestream/retrieve", {"livestream_id": ls_param})
+        ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_param})
 
-        info.raw_debug["retrieve_ok"] = "_error" not in ret_resp
-        info.raw_debug["enter_ok"] = "_error" not in ent_resp
+        info.raw_debug["retrieve_http"] = ret_resp.get("_http_status")
+        info.raw_debug["enter_http"] = ent_resp.get("_http_status")
+        info.raw_debug["enter_sample"] = json.dumps(ent_resp, ensure_ascii=False)[:700]
 
-        for candidate_resp in (ent_resp, ret_resp, user_obj):
+        for candidate_resp in (ent_resp, ret_resp, prof_resp, user_obj):
             if not isinstance(candidate_resp, dict):
                 continue
             if not info.title:
@@ -825,13 +941,12 @@ class SuperLiveClient:
                 break
 
         if not info.stream_url:
-            merged = {"retrieve": ret_resp, "enter": ent_resp}
+            merged = {"retrieve": ret_resp, "enter": ent_resp, "profile": prof_resp}
             agora_uri = self._build_agora_uri(merged, ls_id=ls_id)
             if agora_uri:
                 info.stream_url = agora_uri
 
         return info
-
 
 # ==============================================================================
 # MEDIA PROCESSING: FFMPEG MUXING (H.264 + PCM -> MP4), PROBE & CONTACT SHEET
@@ -1842,6 +1957,27 @@ class SuperLiveRecBot:
                 ],
             )
 
+        @self.bot.on(events.NewMessage(pattern=r"^/debug\s+(.+)$"))
+        async def cmd_debug(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            raw = event.pattern_match.group(1).strip()
+            msg = await event.reply("🛠 در حال دریافت پاسخ خام سرور SuperLive...")
+            cid, _, _, _ = await self.api.resolve_creator(raw)
+            info = await self.api.check_creator_and_get_stream(cid or raw)
+            d = info.raw_debug
+            report = (
+                f"🛠 <b>گزارش دیباگ API برای <code>{html.escape(info.creator_id)}</code></b>\n"
+                f"• Init: <code>{d.get('init_status')}</code> | Token: <code>{d.get('has_token')}</code>\n"
+                f"• Profile HTTP: <code>{d.get('profile_http')}</code>\n"
+                f"• Discover HTTP: <code>{d.get('discover_http', '-')}</code>\n"
+                f"• Retrieve/Enter HTTP: <code>{d.get('retrieve_http', '-')} / {d.get('enter_http', '-')}</code>\n"
+                f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n\n"
+                f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
+                f"<b>Discover/Enter JSON:</b>\n<code>{html.escape(str(d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
+            )
+            await msg.edit(report[:4000], parse_mode="html")
+
         @self.bot.on(events.NewMessage(pattern=r"^/login\s+(\S+)\s+(.+)$"))
         async def cmd_login(event: Any) -> None:
             if not self._is_owner(event.sender_id):
@@ -1854,6 +1990,23 @@ class SuperLiveRecBot:
             except Exception:
                 pass
             await event.respond(f"{'✅' if ok else '❌'} {msg_text}")
+
+        @self.bot.on(events.NewMessage(pattern=r"^/settoken\s+(\S+)(?:\s+(\S+))?$"))
+        async def cmd_settoken(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            tok = event.pattern_match.group(1).strip()
+            dev = (event.pattern_match.group(2) or "").strip()
+            self.api.set_credentials(tok, dev)
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await event.respond(
+                "✅ توکن و Device-ID با موفقیت ذخیره شد (پیام شما برای امنیت حذف شد).\n"
+                "الان با <code>/debug آیدی_استریمر</code> یا <code>/rec آیدی_استریمر</code> تست کن!",
+                parse_mode="html",
+            )
 
         @self.bot.on(events.NewMessage(pattern=r"^/setarchive(?:\s+(-?\d+|off))?$"))
         async def cmd_setarchive(event: Any) -> None:
