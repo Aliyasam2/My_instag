@@ -136,6 +136,10 @@ try:
         VideoSubscriptionOptions,
     )
     from agora.rtc.audio_frame_observer import IAudioFrameObserver  # type: ignore
+    try:
+        from agora.rtc.rtc_connection_observer import IRTCConnectionObserver  # type: ignore
+    except ImportError:
+        IRTCConnectionObserver = object  # type: ignore
 
     try:
         from agora.rtc.video_encoded_frame_observer import IVideoEncodedFrameObserver  # type: ignore
@@ -147,6 +151,7 @@ except Exception as _ag_err:
     AGORA_IMPORT_ERROR = str(_ag_err)
     IAudioFrameObserver = object  # type: ignore
     IVideoEncodedFrameObserver = object  # type: ignore
+    IRTCConnectionObserver = object  # type: ignore
 
 
 # ==============================================================================
@@ -1384,6 +1389,30 @@ class _AudioPcmObserver(IAudioFrameObserver):  # type: ignore
         return self.on_playback_audio_frame_before_mixing(*args, **kwargs)
 
 
+class _ConnObserver(IRTCConnectionObserver):  # type: ignore
+    def __init__(self, receiver: "AgoraStreamReceiver"):
+        super().__init__()
+        self.receiver = receiver
+
+    def on_connected(self, *args: Any, **kwargs: Any) -> None:
+        self.receiver.conn_events.append("connected")
+
+    def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
+        reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.conn_events.append(f"disconn({reason})")
+
+    def on_connecting(self, *args: Any, **kwargs: Any) -> None:
+        self.receiver.conn_events.append("connecting")
+
+    def on_user_joined(self, *args: Any, **kwargs: Any) -> None:
+        uid = args[-1] if args else kwargs.get("user_id", "?")
+        self.receiver.conn_events.append(f"joined({uid})")
+
+    def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
+        reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.conn_events.append(f"fail({reason})")
+
+
 class AgoraStreamReceiver:
     """Captures raw H.264 video AND raw PCM audio from an Agora RTC channel."""
     def __init__(self, agora_uri: str, h264_path: Path, pcm_path: Path):
@@ -1409,6 +1438,9 @@ class AgoraStreamReceiver:
         self.channels = 1
         self._conn: Any = None
         self._closed = False
+        self.conn_events: List[str] = []
+        self.connect_rc: Any = None
+        self.diag_flags: str = ""
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or not image_buffer or length <= 0:
@@ -1606,7 +1638,16 @@ class AgoraStreamReceiver:
             elif hasattr(self._conn, "set_encoded_video_frame_observer"):
                 self._conn.set_encoded_video_frame_observer(self._video_obs)
 
-        self._conn.connect(self.token, self.channel_name, str(self.uid))
+        self._conn_obs = _ConnObserver(self)
+        if hasattr(self._conn, "register_observer"):
+            try:
+                self._conn.register_observer(self._conn_obs)
+            except Exception as e:
+                self.conn_events.append(f"obs_err:{e}")
+
+        v_methods = [m for m in dir(self._conn) if "video" in m.lower() or "subscrib" in m.lower()][:6]
+        self.diag_flags = f"lu={local_user is not None},vm={v_methods}"
+        self.connect_rc = self._conn.connect(self.token, self.channel_name, str(self.uid))
         self.started_at = time.time()
         self.last_frame_at = time.time()
 
@@ -1943,8 +1984,9 @@ class RecordingManager:
             await asyncio.to_thread(receiver.close)
 
         rec.status_text = (
-            f"v_frames={receiver.video_frames}, a_frames={receiver.audio_frames}, "
-            f"uid={receiver.uid}, tok_len={len(receiver.token)}, ch={receiver.channel_name[:12]}"
+            f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
+            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, tok={len(receiver.token)}, "
+            f"{receiver.diag_flags}"
         )
         log.info("Agora capture ended for %s: %s", rec.creator_id, rec.status_text)
         mux_cmd = build_mux_command(
