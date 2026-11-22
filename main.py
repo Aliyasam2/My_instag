@@ -770,6 +770,14 @@ class SuperLiveClient:
     def _extract_direct_stream_url(obj: Any) -> str:
         if not isinstance(obj, dict):
             return ""
+        skip_parent_keys = {
+            "profile_image", "avatar", "thumbnail", "cover", "image",
+            "badge", "badges", "gift", "gifts", "icon", "icons", "banner",
+        }
+        image_markers = (
+            "cdn.spl-live.com/pp/", "/pp/", "/avatar", "/thumbnail",
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", "_s", "_b",
+        )
         for k in (
             "hls_url",
             "flv_url",
@@ -779,18 +787,22 @@ class SuperLiveClient:
             "m3u8_url",
             "pull_url",
             "playback_url",
-            "url",
         ):
             v = obj.get(k)
-            if isinstance(v, str) and (
-                v.startswith("http://")
-                or v.startswith("https://")
-                or v.startswith("rtmp://")
-                or v.startswith("agora://")
-            ):
-                if any(ext in v.lower() for ext in (".m3u8", ".flv", ".mp4", "rtmp://", "agora://", "live", "stream")):
+            if isinstance(v, str):
+                vl = v.lower()
+                if any(m in vl for m in image_markers):
+                    continue
+                if (
+                    vl.startswith("rtmp://")
+                    or vl.startswith("rtmps://")
+                    or vl.startswith("agora://")
+                    or (vl.startswith(("http://", "https://")) and any(ext in vl for ext in (".m3u8", ".flv")))
+                ):
                     return v
-        for v in obj.values():
+        for k, v in obj.items():
+            if str(k).lower() in skip_parent_keys:
+                continue
             if isinstance(v, dict):
                 found = SuperLiveClient._extract_direct_stream_url(v)
                 if found:
@@ -2057,7 +2069,8 @@ class SuperLiveRecBot:
                 f"• Profile HTTP: <code>{d.get('profile_http')}</code>\n"
                 f"• Discover HTTP: <code>{d.get('discover_http', '-')}</code>\n"
                 f"• Retrieve/Enter HTTP: <code>{d.get('retrieve_http', '-')} / {d.get('enter_http', '-')}</code>\n"
-                f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n\n"
+                f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n"
+                f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
                 f"<b>Discover/Enter JSON:</b>\n<code>{html.escape(str(d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
             )
