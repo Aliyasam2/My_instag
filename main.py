@@ -688,41 +688,67 @@ class SuperLiveClient:
         err = data.get("message") or data.get("error") or data.get("_error") or f"HTTP {data.get('_http_status')}"
         return False, f"خطا در ورود: {err}"
 
+    @staticmethod
+    def _extract_avatar(user_obj: Dict[str, Any]) -> str:
+        img = user_obj.get("profile_image") or user_obj.get("avatar")
+        if isinstance(img, dict):
+            return str(img.get("url") or img.get("thumbnail_url") or "")
+        return str(img or "")
+
+    async def _search_by_shared_id(self, ident: str) -> Dict[str, Any]:
+        """Resolve a SuperLive public shared_id (e.g. 59534891) into the full user object with real user_id."""
+        for payload in (
+            {"shared_id": str(ident)},
+            {"search_text": str(ident)},
+            {"query": str(ident), "keyword": str(ident)},
+        ):
+            res = await self._request_smart("user/profile_share_search", payload)
+            if res.get("_http_status") not in (200, 201):
+                continue
+            u = self._extract_user_dict(res)
+            if u and (u.get("user_id") or u.get("id")):
+                return u
+            for list_key in ("users", "items", "results", "data"):
+                arr = res.get(list_key)
+                if isinstance(arr, list):
+                    for cand in arr:
+                        if not isinstance(cand, dict):
+                            continue
+                        sub = cand.get("user") if isinstance(cand.get("user"), dict) else cand
+                        if str(sub.get("shared_id") or "") == str(ident) or str(sub.get("user_id") or "") == str(ident):
+                            return sub
+                    if arr and isinstance(arr[0], dict):
+                        sub0 = arr[0].get("user") if isinstance(arr[0].get("user"), dict) else arr[0]
+                        if sub0.get("user_id") or sub0.get("id"):
+                            return sub0
+        return {}
+
     async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
-        """Resolve any SuperLive ID / username / URL into (creator_id, username, display_name, avatar)."""
+        """Resolve any SuperLive user_id, public shared_id, username, or URL into (real_user_id, username, display_name, avatar)."""
         await self.ensure_initialized()
         ident = extract_creator_identifier(raw_query)
         if not ident:
             return "", "", "", ""
 
+        # 1) Try direct users/profile (in case ident is already internal user_id)
         if ident.isdigit():
-            prof = await self._request_smart("users/profile", {"user_id": int(ident)})
+            prof = await self._request_smart("users/profile", {"user_id": str(ident)})
             user_obj = self._extract_user_dict(prof)
-            if user_obj:
-                cid = str(user_obj.get("id") or user_obj.get("user_id") or ident)
-                uname = str(user_obj.get("username") or user_obj.get("unique_id") or "")
+            if user_obj and not prof.get("error"):
+                cid = str(user_obj.get("user_id") or user_obj.get("id") or ident)
+                uname = str(user_obj.get("username") or user_obj.get("shared_id") or "")
                 dname = str(user_obj.get("name") or user_obj.get("nickname") or uname or cid)
-                avatar = str(user_obj.get("avatar") or user_obj.get("profile_image") or "")
-                return cid, uname, dname, avatar
-            return ident, "", ident, ""
+                return cid, uname, dname, self._extract_avatar(user_obj)
 
-        res = await self._request_smart("user/profile_share_search", {"query": ident, "keyword": ident})
-        candidates = (
-            res.get("users")
-            or (res.get("data") or {}).get("users")
-            or (res.get("data") if isinstance(res.get("data"), list) else [])
-            or []
-        )
-        for cand in candidates:
-            if not isinstance(cand, dict):
-                continue
-            cid = str(cand.get("id") or cand.get("user_id") or "")
-            uname = str(cand.get("username") or cand.get("unique_id") or "")
-            dname = str(cand.get("name") or cand.get("nickname") or uname or cid)
-            avatar = str(cand.get("avatar") or cand.get("profile_image") or "")
-            if cid:
-                return cid, uname, dname, avatar
-        return ident, ident, ident, ""
+        # 2) Resolve via profile_share_search (translates public shared_id like 59534891 -> internal user_id)
+        found_u = await self._search_by_shared_id(ident)
+        if found_u:
+            cid = str(found_u.get("user_id") or found_u.get("id") or ident)
+            uname = str(found_u.get("username") or found_u.get("shared_id") or "")
+            dname = str(found_u.get("name") or found_u.get("nickname") or uname or cid)
+            return cid, uname, dname, self._extract_avatar(found_u)
+
+        return ident, "", ident, ""
 
     @staticmethod
     def _extract_user_dict(payload: Any) -> Dict[str, Any]:
@@ -831,27 +857,32 @@ class SuperLiveClient:
         info.raw_debug["init_status"] = init_res.get("_http_status", "cached")
         info.raw_debug["has_token"] = bool(self._token)
 
-        uid_param: Any = int(creator_id) if str(creator_id).isdigit() else creator_id
+        target_uid = str(creator_id)
 
-        # 1) Query user profile (try user_id, fallback to id)
-        prof_resp = await self._request_smart("users/profile", {"user_id": uid_param})
+        # 1) Query user profile by internal user_id (string)
+        prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
-            # Re-initialize guest token once on auth expiry
             await self.ensure_initialized(force=True)
-            prof_resp = await self._request_smart("users/profile", {"user_id": uid_param})
-        if prof_resp.get("_http_status") not in (200, 201) or not self._extract_user_dict(prof_resp):
-            alt_prof = await self._request_smart("users/profile", {"id": uid_param})
-            if alt_prof.get("_http_status") in (200, 201) and self._extract_user_dict(alt_prof):
-                prof_resp = alt_prof
+            prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
+
+        # If SuperLive says "There is no user found with given id" (code 9), creator_id is a public shared_id!
+        err_obj = prof_resp.get("error") if isinstance(prof_resp.get("error"), dict) else {}
+        if prof_resp.get("_http_status") == 400 and (err_obj.get("code") == 9 or "no user" in str(err_obj.get("message", "")).lower()):
+            resolved_u = await self._search_by_shared_id(target_uid)
+            if resolved_u and (resolved_u.get("user_id") or resolved_u.get("id")):
+                target_uid = str(resolved_u.get("user_id") or resolved_u.get("id"))
+                info.creator_id = target_uid
+                info.raw_debug["resolved_from_shared_id"] = f"{creator_id} -> {target_uid}"
+                prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
 
         info.raw_debug["profile_http"] = prof_resp.get("_http_status")
         info.raw_debug["profile_sample"] = json.dumps(prof_resp, ensure_ascii=False)[:900]
 
         user_obj = self._extract_user_dict(prof_resp)
         if user_obj:
-            info.username = str(user_obj.get("username") or user_obj.get("unique_id") or "")
-            info.display_name = str(user_obj.get("name") or user_obj.get("nickname") or info.username or creator_id)
-            info.avatar_url = str(user_obj.get("avatar") or user_obj.get("profile_image") or "")
+            info.username = str(user_obj.get("username") or user_obj.get("shared_id") or "")
+            info.display_name = str(user_obj.get("name") or user_obj.get("nickname") or info.username or target_uid)
+            info.avatar_url = self._extract_avatar(user_obj)
 
         # Recursive search inside ENTIRE profile response for livestream identifiers
         deep = self._deep_find_keys(
@@ -893,22 +924,27 @@ class SuperLiveClient:
             or ls_id
         )
 
-        # 2) Safe discover fallback ONLY when profile didn't expose livestream_id
+        # 2) Safe discover fallback ONLY when profile didn't expose livestream_id (supports pagination + shared_id!)
         disc_data: Dict[str, Any] = {}
         if not ls_id:
-            disc_data = await self._request_smart("discover", {"next": None, "type": 0})
-            info.raw_debug["discover_http"] = disc_data.get("_http_status")
-            info.raw_debug["discover_sample"] = json.dumps(disc_data, ensure_ascii=False)[:700]
-            if isinstance(disc_data, dict):
+            cursor: Any = None
+            for page_idx in range(4):
+                disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
+                if page_idx == 0:
+                    info.raw_debug["discover_http"] = disc_data.get("_http_status")
+                    info.raw_debug["discover_sample"] = json.dumps(disc_data, ensure_ascii=False)[:700]
+                if not isinstance(disc_data, dict):
+                    break
                 streams_list = (
-                    disc_data.get("livestreams")
+                    disc_data.get("items")
+                    or disc_data.get("livestreams")
                     or disc_data.get("streams")
-                    or disc_data.get("items")
-                    or (disc_data.get("data") or {}).get("livestreams")
                     or (disc_data.get("data") or {}).get("items")
+                    or (disc_data.get("data") or {}).get("livestreams")
                     or (disc_data.get("data") if isinstance(disc_data.get("data"), list) else [])
                     or []
                 )
+                matched = False
                 for item in streams_list:
                     if not isinstance(item, dict):
                         continue
@@ -916,22 +952,40 @@ class SuperLiveClient:
                     ids = {
                         str(host.get("id") or ""),
                         str(host.get("user_id") or ""),
+                        str(host.get("shared_id") or ""),
                         str(host.get("short_id") or ""),
                         str(item.get("user_id") or ""),
+                        str(item.get("shared_id") or ""),
                         str(item.get("host_id") or ""),
                     }
                     names = {
                         str(host.get("username") or "").lower(),
                         str(host.get("unique_id") or "").lower(),
                     }
-                    if str(creator_id) in ids or str(creator_id).lower() in names:
-                        ls_id = str(item.get("livestream_id") or item.get("id") or item.get("live_id") or "")
-                        is_live_flag = True
+                    if str(creator_id) in ids or target_uid in ids or str(creator_id).lower() in names:
+                        ls_id = str(
+                            host.get("livestream_id")
+                            or item.get("livestream_id")
+                            or item.get("id")
+                            or item.get("live_id")
+                            or ""
+                        )
+                        real_uid = str(host.get("user_id") or host.get("id") or "")
+                        if real_uid:
+                            info.creator_id = real_uid
+                        is_live_flag = bool(ls_id)
                         info.title = str(item.get("title") or "")
-                        info.viewers = int(item.get("viewer_count") or item.get("viewers") or 0)
+                        vc = item.get("viewer_count") or item.get("viewers") or 0
+                        info.viewers = int(vc) if str(vc).isdigit() else 0
                         if not info.display_name:
                             info.display_name = str(host.get("name") or host.get("username") or creator_id)
+                        matched = True
                         break
+                if matched:
+                    break
+                cursor = disc_data.get("next")
+                if not cursor:
+                    break
 
         info.livestream_id = ls_id
         info.is_live = is_live_flag and bool(ls_id)
