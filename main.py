@@ -1235,10 +1235,14 @@ class SuperLiveClient:
             explicit_uid = tok_info["uid"] or explicit_uid
 
         uid_list: List[str] = []
-        for u in (str(explicit_uid), str(self._rtc_id), "0"):
-            u = u.strip()
-            if u and u not in uid_list:
-                uid_list.append(u)
+        tok_uid = str(tok_info.get("uid") or "").strip()
+        if tok_uid:
+            uid_list.append(tok_uid)
+        else:
+            for u in (str(explicit_uid), str(self._rtc_id), "0"):
+                u = u.strip()
+                if u and u not in uid_list:
+                    uid_list.append(u)
 
         # Also store any alternate non-RTM token just in case
         alt_tokens = [t for _, t in rtc_tokens if t != token]
@@ -1839,9 +1843,7 @@ class AgoraStreamReceiver:
         self.alt_token = (qs.get("alt_token") or [""])[0]
         self.uid = (qs.get("uid") or ["0"])[0]
         raw_uids = (qs.get("uids") or [self.uid])[0]
-        self.uid_candidates: List[str] = [u.strip() for u in raw_uids.split(",") if u.strip()] or [self.uid, "0"]
-        if "0" not in self.uid_candidates:
-            self.uid_candidates.append("0")
+        self.uid_candidates: List[str] = [u.strip() for u in raw_uids.split(",") if u.strip()] or [self.uid]
 
         self.h264_path = h264_path
         self.pcm_path = pcm_path
@@ -2486,10 +2488,11 @@ class RecordingManager:
                     try:
                         m = await self.bot.send_message(
                             rec.chat_id,
-                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).",
+                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).\n"
+                            f"<code>{html.escape(rec.agora_diag[:250])}</code>",
                             parse_mode="html",
                         )
-                        schedule_delete(m, 15)
+                        schedule_delete(m, 60)
                     except Exception:
                         pass
             elif rec.uploaded_parts > 0:
@@ -2605,21 +2608,26 @@ class RecordingManager:
             attempts.extend((receiver.alt_token, u) for u in receiver.uid_candidates)
 
         connected_ok = False
+        attempt_log: List[str] = []
         for idx, (tok_try, uid_try) in enumerate(attempts):
             if rec.stop_event.is_set():
                 break
             receiver.token = tok_try
             receiver.uid = uid_try
             receiver.conn_events.clear()
+            receiver.is_connected = False
+            receiver.dropped_at = 0.0
+            receiver.fatal_error = False
             await asyncio.to_thread(receiver.connect)
-            # Wait up to 4.5s for connected or fail(8)
-            for _ in range(9):
+            # Wait up to 6s for connected or fail
+            for _ in range(12):
                 await asyncio.sleep(0.5)
                 if "connected" in receiver.conn_events or receiver.video_frames > 0 or receiver.audio_frames > 0:
                     connected_ok = True
                     break
                 if any(ev.startswith("fail(") or ev.startswith("disconn(") for ev in receiver.conn_events):
                     break
+            attempt_log.append(f"{uid_try}:{'/'.join(receiver.conn_events) or 'timeout'}")
             if connected_ok or idx == len(attempts) - 1:
                 break
             # Disconnect failed attempt cleanly before trying next UID/token
@@ -2647,7 +2655,7 @@ class RecordingManager:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(1.0)
                 if not connected_ok:
-                    log.warning("Agora never connected for %s: %s", rec.creator_id, receiver.conn_events[-4:])
+                    log.warning("Agora never connected for %s: %s", rec.creator_id, "; ".join(attempt_log))
                     rec.status_text = "اتصال برقرار نشد"
                     break
                 dropped = receiver.fatal_error or (
@@ -2699,7 +2707,8 @@ class RecordingManager:
 
         rec.agora_diag = (
             f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
-            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
+            f"tries=[{'; '.join(attempt_log)}], ev={','.join(receiver.conn_events[:6])}, "
+            f"uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
         )
         log.info("Agora session ended for %s: %s", rec.creator_id, rec.agora_diag)
         min_sec = max(5, int(self.db.get_setting("min_clip_sec", "5") or 5))
@@ -3506,7 +3515,8 @@ class SuperLiveRecBot:
                 f"• Token Info: <code>{html.escape(str(d.get('token_info', '-')))}</code>\n"
                 f"• Agora Keys: <code>{html.escape(str(d.get('agora_keys', '-'))[:600])}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
-                f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
+                f"<b>Enter JSON:</b>\n<code>{html.escape(str(d.get('enter_sample') or '')[:800])}</code>\n\n"
+                f"<b>Retrieve JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('discover_sample') or '')[:800])}</code>"
             )
             await msg.edit(report[:4000], parse_mode="html")
 
