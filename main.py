@@ -1339,7 +1339,11 @@ class SuperLiveClient:
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False
+        self,
+        creator_id: str,
+        discover_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        light: bool = False,
+        known_ls_id: str = "",
     ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
@@ -1351,7 +1355,7 @@ class SuperLiveClient:
         info.raw_debug["has_token"] = bool(self._token)
 
         target_uid = str(creator_id)
-        ls_id = ""
+        ls_id = str(known_ls_id or "")
         is_live_flag = False
         prof_resp: Dict[str, Any] = {}
         user_obj: Dict[str, Any] = {}
@@ -1451,7 +1455,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(8):
+            for page_idx in range(15):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -2276,7 +2280,6 @@ class RecordingManager:
             return None
         now = time.time()
         excl = exclude_slots or set()
-        # Rotate starting index so load spreads across all accounts in the pool
         start = self._acc_rr % len(accs)
         ordered = accs[start:] + accs[:start]
         best_healthy = None
@@ -2341,37 +2344,75 @@ class RecordingManager:
         else:
             self.manually_stopped_ls.pop(cid, None)
 
-        client = self.free_account()
+        tried_slots: set = set()
+        client: Optional[SuperLiveClient] = None
+        fresh: Optional[CreatorStreamInfo] = None
+        last_err_msg = ""
+        known_ls = str(stream_info.livestream_id or "")
+        for _ in range(max(1, len(self.accounts()))):
+            cand = self.free_account(exclude_slots=tried_slots)
+            if cand is None:
+                break
+            tried_slots.add(cand.slot)
+            self._reserve(cand.slot, cid)
+            try:
+                f = await cand.check_creator_and_get_stream(cid, known_ls_id=known_ls)
+            except Exception as e:
+                f = None
+                log.warning("Fresh stream fetch failed (%s): %s", cand.label, e)
+            if f and f.is_live and f.stream_url:
+                client = cand
+                fresh = f
+                break
+            self._release(cand.slot, cid)
+            fresh = f
+            client = cand
+            if not f:
+                self._acc_cooldown[cand.slot] = time.time() + 60.0
+                continue
+            if not f.is_live:
+                break
+            d = f.raw_debug
+            reason = ""
+            err_detail = ""
+            for k in ("enter_sample", "retrieve_sample"):
+                txt = str(d.get(k, ""))
+                if not reason:
+                    m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', txt)
+                    if m and m.group(1) not in ("null", '""'):
+                        reason = m.group(1).strip('"')
+                if not err_detail:
+                    m2 = re.search(r'"message":\s*"([^"]+)"', txt)
+                    if m2:
+                        err_detail = m2.group(1)
+            if "private" in reason or "private_livestream" in str(d.get("agora_keys", "")):
+                self.db.update_watch_status(cid, "private", display_name=f.display_name or stream_info.display_name)
+                return False, ("🟡 این لایو الان <b>خصوصی (Private / پولی)</b> شده و سرور فقط به کسایی که "
+                               "پرداخت کردن اجازه ورود میده. وقتی دوباره عمومی بشه میشه ضبطش کرد.")
+            # If this account got HTTP 400/401/403 (e.g. account-level restriction or expired token), cool it down and try next account
+            if d.get("retrieve_http") in (400, 401, 403) or d.get("enter_http") in (400, 401, 403):
+                self._acc_cooldown[cand.slot] = time.time() + 120.0
+                last_err_msg = err_detail
+                if "ended" in err_detail.lower() or "not found" in err_detail.lower() or "no livestream" in err_detail.lower():
+                    self.db.update_watch_status(cid, "offline", display_name=f.display_name or stream_info.display_name)
+                    return False, "🔴 این لایو تموم شده یا الان آفلاینه."
+                continue
+            break
+
         if client is None:
             return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
                            f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
-        # Reserve the account, then get a fresh token issued for THIS account
-        self._reserve(client.slot, cid)
-        try:
-            fresh = await client.check_creator_and_get_stream(cid)
-        except Exception as e:
-            fresh = None
-            log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
         if not fresh or not fresh.is_live or not fresh.stream_url:
-            self._release(client.slot, cid)
             if not fresh:
                 return False, "⚠️ ارتباط با SuperLive برقرار نشد."
             if not fresh.is_live:
-                return False, "⚫ این استریمر الان لایو نیست."
+                self.db.update_watch_status(cid, "offline", display_name=fresh.display_name or stream_info.display_name)
+                return False, "🔴 این استریمر الان لایو نیست."
             d = fresh.raw_debug
-            reason = ""
-            for k in ("enter_sample", "retrieve_sample"):
-                m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get(k, "")))
-                if m and m.group(1) not in ("null", '""'):
-                    reason = m.group(1).strip('"')
-                    break
-            if "private" in reason or "private_livestream" in str(d.get("agora_keys", "")):
-                return False, ("🔒 این لایو الان <b>خصوصی (Private / پولی)</b> شده و سرور فقط به کسایی که "
-                               "پرداخت کردن اجازه ورود میده. وقتی دوباره عمومی بشه میشه ضبطش کرد.")
             return False, (
                 "⚠️ لایو روشنه ولی اطلاعات اتصال (Agora) داده نشد.\n"
                 f"• Retrieve/Enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code>"
-                + (f"\n• دلیل سرور: <code>{html.escape(reason)}</code>" if reason else "")
+                + (f"\n• پیام سرور: <code>{html.escape(last_err_msg[:180])}</code>" if last_err_msg else "")
                 + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
                 + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
             )
@@ -2379,7 +2420,8 @@ class RecordingManager:
         if reason:
             self._release(client.slot, cid)
             if "private" in reason:
-                return False, "🔒 این لایو الان <b>خصوصی (Private)</b> هست؛ سرور فقط چند ثانیه اجازه دیدن میده. وقتی عمومی شد ضبط کن."
+                self.db.update_watch_status(cid, "private", display_name=fresh.display_name or stream_info.display_name)
+                return False, "🟡 این لایو الان <b>خصوصی (Private)</b> هست؛ وقتی عمومی شد ضبط کن."
             return False, f"⛔ سرور اجازه ورود نداد: <code>{html.escape(reason)}</code>"
         fresh.display_name = fresh.display_name or stream_info.display_name
         stream_info = fresh
@@ -2490,7 +2532,6 @@ class RecordingManager:
                     short_drops = 0
                 elif session_dur < 15.0:
                     short_drops += 1
-                    # If this account got fail(3)/fail(8) without connecting, cool it down and try another free account
                     if rec.client is not None and not rec.connected and ("fail(3)" in rec.agora_diag or "fail(8)" in rec.agora_diag):
                         self._acc_cooldown[rec.client.slot] = time.time() + 120.0
                         alt = self.free_account(exclude_slots=tried_slots)
@@ -2507,7 +2548,7 @@ class RecordingManager:
                         break
                 # Stream went quiet: is the creator really offline or was it a network hiccup?
                 try:
-                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id)
+                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id, known_ls_id=rec.livestream_id)
                 except Exception:
                     info = None
                 if info and info.livestream_id:
@@ -2583,7 +2624,7 @@ class RecordingManager:
                 tg_chat_id=rec.chat_id,
                 notes=notes,
             )
-            self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
+            self.db.update_watch_status(rec.creator_id, "private" if rec.private_hit else "offline", display_name=rec.creator_name)
             self.active.pop(rec.creator_id, None)
             if rec.client is not None:
                 self._release(rec.client.slot, rec.creator_id)
@@ -2686,7 +2727,6 @@ class RecordingManager:
             receiver.dropped_at = 0.0
             receiver.fatal_error = False
             await asyncio.to_thread(receiver.connect)
-            # Wait up to 6s for connected or fail
             for _ in range(12):
                 await asyncio.sleep(0.5)
                 if "connected" in receiver.conn_events or receiver.video_frames > 0 or receiver.audio_frames > 0:
@@ -2697,7 +2737,6 @@ class RecordingManager:
             attempt_log.append(f"{uid_try}:{'/'.join(receiver.conn_events) or 'timeout'}")
             if connected_ok or idx == len(attempts) - 1:
                 break
-            # Disconnect failed attempt cleanly before trying next UID/token
             if receiver._conn is not None:
                 try:
                     await asyncio.to_thread(receiver._conn.disconnect)
@@ -2736,7 +2775,7 @@ class RecordingManager:
                     if "private" in reason:
                         log.info("Livestream %s of %s turned private", rec.livestream_id, rec.creator_id)
                         rec.private_hit = True
-                        rec.status_text = "🔒 لایو خصوصی شد"
+                        rec.status_text = "🟡 لایو خصوصی شد"
                         break
                 if dropped:
                     log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
@@ -2927,6 +2966,8 @@ class WatchlistMonitor:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._notified_ls: Dict[str, str] = {}  # creator_id -> livestream_id already announced
+        self.last_discover_map: Dict[str, Dict[str, Any]] = {}
+        self.last_discover_at: float = 0.0
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -2960,7 +3001,7 @@ class WatchlistMonitor:
         try:
             m = await self.bot.send_message(
                 owner_id,
-                f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
+                f"🟢 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
                 + (" · ⏺ ضبط خودکار شروع شد" if started else ""),
                 parse_mode="html",
                 buttons=[row],
@@ -2982,7 +3023,10 @@ class WatchlistMonitor:
                 discover_map: Optional[Dict[str, Dict[str, Any]]] = None
                 if items:
                     try:
-                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=8)
+                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=12)
+                        if discover_map:
+                            self.last_discover_map = discover_map
+                            self.last_discover_at = time.time()
                     except Exception as e:
                         log.warning("Batch discover fetch failed: %s", e)
                 for item in items:
@@ -3003,7 +3047,7 @@ class WatchlistMonitor:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
                             if info.livestream_id and "private" in (await self.api.disallowed_reason(info.livestream_id)):
-                                self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
+                                self.db.update_watch_status(cid, "private", display_name=info.display_name, username=info.username)
                                 continue  # private right now -> retry next poll silently
                             if item["auto_record"] and self.rec_mgr.has_capacity():
                                 ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
@@ -3097,7 +3141,11 @@ class SuperLiveRecBot:
     def _status_icon(self, cid: str, last_status: str) -> str:
         if self.rec_mgr.is_recording(cid):
             return "⏺"
-        return "🔴" if last_status == "live" else "⚫"
+        if last_status == "live":
+            return "🟢"
+        if last_status == "private":
+            return "🟡"
+        return "🔴"
 
     def render(self, view: str, *args: Any) -> Tuple[str, List[List[Any]]]:
         return getattr(self, f"_v_{view}")(*args)
@@ -3105,6 +3153,7 @@ class SuperLiveRecBot:
     def _v_home(self) -> Tuple[str, List[List[Any]]]:
         wl = self.db.list_watchlist()
         live_cnt = sum(1 for x in wl if x["last_status"] == "live")
+        priv_cnt = sum(1 for x in wl if x["last_status"] == "private")
         active = list(self.rec_mgr.active.values())
         cnt, dur, size = self.db.clip_stats()
         used_mb, free_mb, total_mb = get_disk_stats()
@@ -3114,7 +3163,7 @@ class SuperLiveRecBot:
             "🎥 <b>SuperLive Recorder</b>",
             SEP,
             f"⏺ در حال ضبط: <b>{len(active)}</b>",
-            f"👀 واچلیست: <b>{len(wl)}</b>   ·   🔴 آنلاین: <b>{live_cnt}</b>",
+            f"👀 واچلیست: <b>{len(wl)}</b>   ·   🟢 آنلاین: <b>{live_cnt}</b>   ·   🟡 خصوصی: <b>{priv_cnt}</b>",
             f"📚 آرشیو: <b>{cnt}</b> ویدیو   ·   <b>{fmt_duration(dur)}</b>   ·   <b>{fmt_bytes(size)}</b>",
             SEP,
             f"💽 دیسک آزاد: <code>{free_mb/1024:.1f}/{total_mb/1024:.1f} GB</code>   🧠 رم: <code>{ram}</code>",
@@ -3134,17 +3183,22 @@ class SuperLiveRecBot:
 
     def _v_watchlist(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
         items = self.db.list_watchlist()
-        # recording first, then live, then offline
-        items.sort(key=lambda x: (0 if self.rec_mgr.is_recording(x["creator_id"]) else (1 if x["last_status"] == "live" else 2)))
+        # recording first, then online (green), then private (yellow), then offline (red)
+        items.sort(key=lambda x: (
+            0 if self.rec_mgr.is_recording(x["creator_id"])
+            else (1 if x["last_status"] == "live" else (2 if x["last_status"] == "private" else 3))
+        ))
         per = 8
         pages = max(1, (len(items) + per - 1) // per)
         page = max(0, min(page, pages - 1))
         chunk = items[page * per:(page + 1) * per]
         rec_n = sum(1 for x in items if self.rec_mgr.is_recording(x["creator_id"]))
         live_n = sum(1 for x in items if x["last_status"] == "live")
+        priv_n = sum(1 for x in items if x["last_status"] == "private")
+        off_n = len(items) - live_n - priv_n
         lines = [
             f"📋 <b>واچلیست</b>  ·  {len(items)} نفر",
-            f"⏺ {rec_n} در حال ضبط   🔴 {live_n} آنلاین   ⚫ {len(items) - live_n} آفلاین",
+            f"⏺ {rec_n} ضبط   🟢 {live_n} آنلاین   🟡 {priv_n} خصوصی   🔴 {off_n} آفلاین",
             SEP,
         ]
         if not chunk:
@@ -3181,9 +3235,11 @@ class SuperLiveRecBot:
         if r:
             st = "⏺ در حال ضبط"
         elif w.get("last_status") == "live":
-            st = "🔴 آنلاین"
+            st = "🟢 آنلاین"
+        elif w.get("last_status") == "private":
+            st = "🟡 لایو خصوصی"
         else:
-            st = "⚫ آفلاین"
+            st = "🔴 آفلاین"
         lines = [
             f"👤 <b>{html.escape(name)}</b>",
             f"🆔 <code>{cid}</code>" + (f"   @{html.escape(w['username'])}" if w.get("username") else ""),
@@ -3541,7 +3597,7 @@ class SuperLiveRecBot:
                 await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
                 return
             info = await self.api.check_creator_and_get_stream(cid)
-            status = "🔴 آنلاین (LIVE)" if info.is_live else "⚫ آفلاین"
+            status = "🟢 آنلاین (LIVE)" if info.is_live else "🔴 آفلاین"
             proto = "Agora RTC" if info.stream_url.startswith("agora://") else ("HLS/Direct" if info.stream_url else "نامشخص")
             await msg.edit(
                 f"🔎 <b>نتیجه بررسی استریمر</b>\n\n"
@@ -3918,9 +3974,15 @@ class SuperLiveRecBot:
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
         added = self.db.add_watch(cid, uname, dname, avatar)
-        info = await self.api.check_creator_and_get_stream(cid, light=True)
-        if info.display_name:
-            self.db.update_watch_status(cid, "live" if info.is_live else "offline", display_name=info.display_name, username=info.username)
+        dmap = self.monitor.last_discover_map if (time.time() - self.monitor.last_discover_at < 45) else None
+        info = await self.api.check_creator_and_get_stream(cid, discover_map=dmap, light=True)
+        if not info.is_live and dmap is not None:
+            info = await self.api.check_creator_and_get_stream(cid, light=True)
+        if info.display_name or info.is_live:
+            st_val = "live" if info.is_live else "offline"
+            if info.is_live and info.livestream_id and "private" in (await self.api.disallowed_reason(info.livestream_id)):
+                st_val = "private"
+            self.db.update_watch_status(cid, st_val, display_name=info.display_name, username=info.username)
         if info.is_live:
             ok, _ = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="watchlist")
             self.monitor._notified_ls[info.creator_id] = info.livestream_id or "live"
@@ -3938,13 +4000,17 @@ class SuperLiveRecBot:
                 pass
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
-        info = await self.api.check_creator_and_get_stream(cid, light=True)
+        dmap = self.monitor.last_discover_map if (time.time() - self.monitor.last_discover_at < 45) else None
+        info = await self.api.check_creator_and_get_stream(cid, discover_map=dmap, light=True)
+        if not info.is_live and dmap is not None:
+            info = await self.api.check_creator_and_get_stream(cid, light=True)
         try:
             await wait.delete()
         except Exception:
             pass
         if not info.is_live:
-            await self.toast(event, f"⚫ <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
+            self.db.update_watch_status(cid, "offline", display_name=info.display_name or dname)
+            await self.toast(event, f"🔴 <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
         else:
             ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
             await self.toast(event, msg_text, ttl=6 if ok else 60)
