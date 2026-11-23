@@ -53,6 +53,7 @@ from telethon.tl.types import DocumentAttributeVideo
 # CONFIGURATION (Override via Environment Variables on Altare / VPS)
 # ==============================================================================
 
+# Set BOT_TOKEN in the server environment; never commit a live token.
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
     "8837565058:AAFDtM7wJRI2AOgV67dPDdK-206STorQ1Ew",
@@ -63,21 +64,12 @@ BOT_TOKEN = os.environ.get(
 TG_API_ID = int(os.environ.get("TG_API_ID", "2040"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627").strip()
 
-# Optional: lock bot to your Telegram numeric user ID (0 = auto-bind to first /start user)
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+# Lock bot to the owner's Telegram numeric user ID. Override via OWNER_ID if needed.
+OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
 
 # SuperLive Web API & Agora defaults
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
 DEFAULT_AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310").strip()
-
-# Preloaded SuperLive accounts (loaded automatically on startup without duplicating in DB)
-PRELOADED_ACCOUNTS: List[Dict[str, str]] = [
-    {"label": "elinoori50", "token": "daf6dee61e5271a57f96544dfb69459e5c3f0b0e", "device_id": ""},
-    {"label": "elyaszabeti", "token": "8a28ea961cb43959140d2c5b5400c2ad153e1052", "device_id": ""},
-    {"label": "refegidewadi12", "token": "640858521e925fb3f06dcc2be641b590b61adcf0", "device_id": ""},
-    {"label": "اکانت 4", "token": "99da0e6171df700c93e67f436815af2026b8dd6a", "device_id": ""},
-    {"label": "elllyaszabeti", "token": "ae0b4e5362c4a370d4f3a716ee953121cae2c71c", "device_id": ""},
-]
 
 # Storage & Limits (tuned for 6 GiB RAM / 10 GiB Disk)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "./superliverec_data")).resolve()
@@ -97,8 +89,8 @@ AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
 VIDEO_STALL_TIMEOUT = int(os.environ.get("VIDEO_STALL_TIMEOUT", "12"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
-# Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
-DEFAULT_MAX_CONCURRENT = 0  # unlimited
+# Resource safeguard; actual concurrency is also limited by available SuperLive accounts.
+DEFAULT_MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_RECORDINGS", "2")))
 
 # ==============================================================================
 # LOGGING
@@ -735,32 +727,6 @@ class AccountPool:
         raw = db.get_setting("account_slots", "0")
         slots = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()} | {0})
         self.clients: Dict[int, "SuperLiveClient"] = {n: SuperLiveClient(db, n) for n in slots}
-        self._seed_preloaded()
-
-    def _seed_preloaded(self) -> None:
-        existing_tokens = {c._token: c for c in self.clients.values() if c._token}
-        for acc in PRELOADED_ACCOUNTS:
-            tok = (acc.get("token") or "").strip()
-            if not tok:
-                continue
-            lbl = (acc.get("label") or "").strip()
-            dev = (acc.get("device_id") or "").strip()
-            if tok in existing_tokens:
-                c = existing_tokens[tok]
-                if lbl and c.label.startswith("اکانت "):
-                    c.label = lbl
-                    self.db.set_setting(c._k("superlive_label"), lbl)
-                continue
-            if not self.clients[0].has_token():
-                c = self.clients[0]
-                c.set_credentials(tok, dev)
-                if lbl:
-                    c.label = lbl
-                    self.db.set_setting(c._k("superlive_label"), lbl)
-                existing_tokens[tok] = c
-            else:
-                c = self.add(tok, dev, lbl)
-                existing_tokens[tok] = c
 
     def _save(self) -> None:
         self.db.set_setting("account_slots", ",".join(str(n) for n in sorted(self.clients)))
@@ -834,15 +800,6 @@ class SuperLiveClient:
 
     def has_token(self) -> bool:
         return bool(self._token)
-
-    async def disallowed_reason(self, ls_id: str) -> str:
-        """'' if we may watch, else server reason (e.g. private_not_accepted)."""
-        try:
-            ret = await self._request_smart("livestream/retrieve", {"livestream_id": str(ls_id)})
-            r = ret.get("disallowed_reason")
-            return str(r) if r else ""
-        except Exception:
-            return ""
 
     def wipe(self) -> None:
         for k in ("superlive_token", "superlive_device_id", "superlive_auth_scheme", "superlive_rtc_id", "superlive_label"):
@@ -1270,14 +1227,10 @@ class SuperLiveClient:
             explicit_uid = tok_info["uid"] or explicit_uid
 
         uid_list: List[str] = []
-        tok_uid = str(tok_info.get("uid") or "").strip()
-        if tok_uid:
-            uid_list.append(tok_uid)
-        else:
-            for u in (str(explicit_uid), str(self._rtc_id), "0"):
-                u = u.strip()
-                if u and u not in uid_list:
-                    uid_list.append(u)
+        for u in (str(explicit_uid), str(self._rtc_id), "0"):
+            u = u.strip()
+            if u and u not in uid_list:
+                uid_list.append(u)
 
         # Also store any alternate non-RTM token just in case
         alt_tokens = [t for _, t in rtc_tokens if t != token]
@@ -1339,11 +1292,7 @@ class SuperLiveClient:
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self,
-        creator_id: str,
-        discover_map: Optional[Dict[str, Dict[str, Any]]] = None,
-        light: bool = False,
-        known_ls_id: str = "",
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False
     ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
@@ -1355,7 +1304,7 @@ class SuperLiveClient:
         info.raw_debug["has_token"] = bool(self._token)
 
         target_uid = str(creator_id)
-        ls_id = str(known_ls_id or "")
+        ls_id = ""
         is_live_flag = False
         prof_resp: Dict[str, Any] = {}
         user_obj: Dict[str, Any] = {}
@@ -1455,7 +1404,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(15):
+            for page_idx in range(8):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -1660,7 +1609,6 @@ def build_mux_command(
             "-c:a", "aac",
             "-b:a", "128k",
             "-af", "aresample=async=1",
-            "-shortest",
             "-movflags", "+faststart",
             str(output_mp4),
         ]
@@ -1842,15 +1790,10 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
         self.receiver = receiver
 
     def on_connected(self, *args: Any, **kwargs: Any) -> None:
-        self.receiver.is_connected = True
-        self.receiver.dropped_at = 0.0
         self.receiver.conn_events.append("connected")
 
     def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
-        self.receiver.is_connected = False
-        if self.receiver.dropped_at == 0.0:
-            self.receiver.dropped_at = time.time()
         self.receiver.conn_events.append(f"disconn({reason})")
         self.receiver.event_times.append((time.time(), "drop"))
 
@@ -1863,10 +1806,6 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
 
     def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
-        self.receiver.is_connected = False
-        self.receiver.fatal_error = True
-        if self.receiver.dropped_at == 0.0:
-            self.receiver.dropped_at = time.time()
         self.receiver.conn_events.append(f"fail({reason})")
         self.receiver.event_times.append((time.time(), "drop"))
 
@@ -1882,7 +1821,9 @@ class AgoraStreamReceiver:
         self.alt_token = (qs.get("alt_token") or [""])[0]
         self.uid = (qs.get("uid") or ["0"])[0]
         raw_uids = (qs.get("uids") or [self.uid])[0]
-        self.uid_candidates: List[str] = [u.strip() for u in raw_uids.split(",") if u.strip()] or [self.uid]
+        self.uid_candidates: List[str] = [u.strip() for u in raw_uids.split(",") if u.strip()] or [self.uid, "0"]
+        if "0" not in self.uid_candidates:
+            self.uid_candidates.append("0")
 
         self.h264_path = h264_path
         self.pcm_path = pcm_path
@@ -1911,9 +1852,6 @@ class AgoraStreamReceiver:
         self._need_keyframe = True
         self.last_video_at = 0.0
         self.event_times: List[Tuple[float, str]] = []
-        self.is_connected = False
-        self.dropped_at = 0.0
-        self.fatal_error = False
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
@@ -1959,7 +1897,7 @@ class AgoraStreamReceiver:
                     return
                 # The SDK keeps firing playback callbacks with SILENCE after the connection drops,
                 # so audio is only written while video is actually arriving (A/V stay the same length).
-                if self._need_keyframe or time.time() - self.last_video_at > 1.0:
+                if self._need_keyframe or time.time() - self.last_video_at > 3.0:
                     return
                 self._pcm_fh.write(data)
                 self.audio_frames += 1
@@ -2233,7 +2171,6 @@ class ActiveRecording:
     uploaded_bytes: int = 0
     connected: bool = False
     client: Any = None
-    private_hit: bool = False
 
 
 FAILED_DIR = BASE_DIR / "failed_uploads"
@@ -2246,11 +2183,9 @@ class RecordingManager:
         self.db = db
         self.pool = pool
         self.api = pool.primary
-        self.busy: Dict[int, List[str]] = {}  # account slot -> creator_ids being recorded
+        self.busy: Dict[int, str] = {}  # account slot -> creator_id
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
-        self._acc_cooldown: Dict[int, float] = {}
-        self._acc_rr: int = 0
         # livestream_ids the user stopped manually -> don't auto-restart the same live
         self.manually_stopped_ls: Dict[str, str] = {}
         self._upload_sem = asyncio.Semaphore(int(os.environ.get("MAX_PARALLEL_UPLOADS", "3")))
@@ -2269,51 +2204,16 @@ class RecordingManager:
     def accounts(self) -> List[SuperLiveClient]:
         return self.pool.usable() or [self.pool.primary]
 
-    def per_account(self) -> int:
-        raw = self.db.get_setting("recs_per_account", "1")
-        return max(1, int(raw)) if raw.isdigit() else 1
-
-    def free_account(self, exclude_slots: Optional[set] = None) -> Optional[SuperLiveClient]:
-        lim = self.per_account()
-        accs = self.accounts()
-        if not accs:
+    def free_account(self) -> Optional[SuperLiveClient]:
+        if len(self.active) >= self.max_concurrent():
             return None
-        now = time.time()
-        excl = exclude_slots or set()
-        start = self._acc_rr % len(accs)
-        ordered = accs[start:] + accs[:start]
-        best_healthy = None
-        best_any = None
-        for c in ordered:
-            if c.slot in excl:
-                continue
-            n = len(self.busy.get(c.slot, []))
-            if n >= lim:
-                continue
-            if best_any is None or n < len(self.busy.get(best_any.slot, [])):
-                best_any = c
-            if now >= self._acc_cooldown.get(c.slot, 0.0):
-                if best_healthy is None or n < len(self.busy.get(best_healthy.slot, [])):
-                    best_healthy = c
-        chosen = best_healthy or best_any
-        if chosen is not None:
-            self._acc_rr = (self._acc_rr + 1) % max(1, len(accs))
-        return chosen
-
-    def _reserve(self, slot: int, cid: str) -> None:
-        lst = self.busy.setdefault(slot, [])
-        if cid not in lst:
-            lst.append(cid)
-
-    def _release(self, slot: int, cid: str) -> None:
-        lst = self.busy.get(slot, [])
-        if cid in lst:
-            lst.remove(cid)
-        if not lst:
-            self.busy.pop(slot, None)
+        for c in self.accounts():
+            if c.slot not in self.busy:
+                return c
+        return None
 
     def max_concurrent(self) -> int:
-        return len(self.accounts()) * self.per_account()
+        return min(len(self.accounts()), DEFAULT_MAX_CONCURRENT)
 
     def has_capacity(self) -> bool:
         return self.free_account() is not None
@@ -2344,93 +2244,47 @@ class RecordingManager:
         else:
             self.manually_stopped_ls.pop(cid, None)
 
-        tried_slots: set = set()
-        client: Optional[SuperLiveClient] = None
-        fresh: Optional[CreatorStreamInfo] = None
-        last_err_msg = ""
-        known_ls = str(stream_info.livestream_id or "")
-        for _ in range(max(1, len(self.accounts()))):
-            cand = self.free_account(exclude_slots=tried_slots)
-            if cand is None:
-                break
-            tried_slots.add(cand.slot)
-            self._reserve(cand.slot, cid)
-            try:
-                f = await cand.check_creator_and_get_stream(cid, known_ls_id=known_ls)
-            except Exception as e:
-                f = None
-                log.warning("Fresh stream fetch failed (%s): %s", cand.label, e)
-            if f and f.is_live and f.stream_url:
-                client = cand
-                fresh = f
-                break
-            self._release(cand.slot, cid)
-            fresh = f
-            client = cand
-            if not f:
-                self._acc_cooldown[cand.slot] = time.time() + 60.0
-                continue
-            if not f.is_live:
-                break
-            d = f.raw_debug
-            reason = ""
-            err_detail = ""
-            for k in ("enter_sample", "retrieve_sample"):
-                txt = str(d.get(k, ""))
-                if not reason:
-                    m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', txt)
-                    if m and m.group(1) not in ("null", '""'):
-                        reason = m.group(1).strip('"')
-                if not err_detail:
-                    m2 = re.search(r'"message":\s*"([^"]+)"', txt)
-                    if m2:
-                        err_detail = m2.group(1)
-            if "private" in reason or "private_livestream" in str(d.get("agora_keys", "")):
-                self.db.update_watch_status(cid, "private", display_name=f.display_name or stream_info.display_name)
-                return False, ("🟡 این لایو الان <b>خصوصی (Private / پولی)</b> شده و سرور فقط به کسایی که "
-                               "پرداخت کردن اجازه ورود میده. وقتی دوباره عمومی بشه میشه ضبطش کرد.")
-            # If this account got HTTP 400/401/403 (e.g. account-level restriction or expired token), cool it down and try next account
-            if d.get("retrieve_http") in (400, 401, 403) or d.get("enter_http") in (400, 401, 403):
-                self._acc_cooldown[cand.slot] = time.time() + 120.0
-                last_err_msg = err_detail
-                if "ended" in err_detail.lower() or "not found" in err_detail.lower() or "no livestream" in err_detail.lower():
-                    self.db.update_watch_status(cid, "offline", display_name=f.display_name or stream_info.display_name)
-                    return False, "🔴 این لایو تموم شده یا الان آفلاینه."
-                continue
-            break
-
+        client = self.free_account()
         if client is None:
             return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
                            f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
+        # Reserve the account, then get a fresh token issued for THIS account
+        self.busy[client.slot] = cid
+        try:
+            fresh = await client.check_creator_and_get_stream(cid)
+        except Exception as e:
+            fresh = None
+            log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
         if not fresh or not fresh.is_live or not fresh.stream_url:
+            self.busy.pop(client.slot, None)
             if not fresh:
                 return False, "⚠️ ارتباط با SuperLive برقرار نشد."
             if not fresh.is_live:
-                self.db.update_watch_status(cid, "offline", display_name=fresh.display_name or stream_info.display_name)
-                return False, "🔴 این استریمر الان لایو نیست."
+                return False, "⚫ این استریمر الان لایو نیست."
             d = fresh.raw_debug
+            reason = ""
+            for k in ("enter_sample", "retrieve_sample"):
+                m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get(k, "")))
+                if m and m.group(1) not in ("null", '""'):
+                    reason = m.group(1).strip('"')
+                    break
+            if "private" in reason or "private_livestream" in str(d.get("agora_keys", "")):
+                return False, ("🔒 این لایو الان <b>خصوصی (Private / پولی)</b> شده و سرور فقط به کسایی که "
+                               "پرداخت کردن اجازه ورود میده. وقتی دوباره عمومی بشه میشه ضبطش کرد.")
             return False, (
                 "⚠️ لایو روشنه ولی اطلاعات اتصال (Agora) داده نشد.\n"
                 f"• Retrieve/Enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code>"
-                + (f"\n• پیام سرور: <code>{html.escape(last_err_msg[:180])}</code>" if last_err_msg else "")
+                + (f"\n• دلیل سرور: <code>{html.escape(reason)}</code>" if reason else "")
                 + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
                 + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
             )
-        reason = await client.disallowed_reason(fresh.livestream_id) if fresh.livestream_id else ""
-        if reason:
-            self._release(client.slot, cid)
-            if "private" in reason:
-                self.db.update_watch_status(cid, "private", display_name=fresh.display_name or stream_info.display_name)
-                return False, "🟡 این لایو الان <b>خصوصی (Private)</b> هست؛ وقتی عمومی شد ضبط کن."
-            return False, f"⛔ سرور اجازه ورود نداد: <code>{html.escape(reason)}</code>"
         fresh.display_name = fresh.display_name or stream_info.display_name
         stream_info = fresh
-        old_cid = cid
         cid = str(stream_info.creator_id or cid)
-        self._release(client.slot, old_cid)
         if cid in self.active:
+            self.busy.pop(client.slot, None)
             return False, "⏺ همین الان در حال ضبطه."
-        self._reserve(client.slot, cid)
+        self.busy[client.slot] = cid
         _, free_mb, _ = get_disk_stats()
         err = ""
         if free_mb < MIN_FREE_DISK_MB:
@@ -2440,7 +2294,7 @@ class RecordingManager:
         elif not FFMPEG_BIN:
             err = "FFmpeg روی سرور پیدا نشد."
         if err:
-            self._release(client.slot, cid)
+            self.busy.pop(client.slot, None)
             return False, err
 
         cname = stream_info.display_name or stream_info.username or cid
@@ -2493,6 +2347,7 @@ class RecordingManager:
         work_dir.mkdir(parents=True, exist_ok=True)
         upload_lock = asyncio.Lock()
         upload_tasks: List[asyncio.Task] = []
+        upload_failures: List[str] = []
         final_status = "completed"
         notes = ""
 
@@ -2504,6 +2359,7 @@ class RecordingManager:
                     async with upload_lock:  # keeps parts in order
                         await coro_factory()
                 except Exception as e:
+                    upload_failures.append(str(e)[:250])
                     log.exception("Upload job failed for %s: %s", rec.creator_id, e)
                 finally:
                     rec.uploads_pending -= 1
@@ -2513,49 +2369,21 @@ class RecordingManager:
 
         try:
             restarts = 0
-            short_drops = 0
-            tried_slots: set = {rec.client.slot} if rec.client is not None else set()
             while not rec.stop_event.is_set():
                 parts_before = rec.part_number
-                iter_start = time.time()
                 if rec.stream_url.startswith("agora://"):
                     await self._agora_session(rec, work_dir, enqueue)
                 else:
                     await self._ffmpeg_session(rec, work_dir, enqueue)
-                session_dur = time.time() - iter_start
                 if rec.stop_event.is_set():
                     break
-                if rec.private_hit:
-                    break
-                if session_dur >= 30.0 and rec.part_number > parts_before:
+                if rec.part_number > parts_before:
                     restarts = 0
-                    short_drops = 0
-                elif session_dur < 15.0:
-                    short_drops += 1
-                    if rec.client is not None and not rec.connected and ("fail(3)" in rec.agora_diag or "fail(8)" in rec.agora_diag):
-                        self._acc_cooldown[rec.client.slot] = time.time() + 120.0
-                        alt = self.free_account(exclude_slots=tried_slots)
-                        if alt is not None:
-                            self._release(rec.client.slot, rec.creator_id)
-                            self._reserve(alt.slot, rec.creator_id)
-                            rec.client = alt
-                            tried_slots.add(alt.slot)
-                            log.info("Switching %s to account %s after %s", rec.creator_id, alt.label, rec.agora_diag)
-                    if short_drops >= max(3, len(self.accounts())):
-                        log.warning("Stopping %s after %d consecutive short drops (<15s): %s",
-                                    rec.creator_id, short_drops, rec.agora_diag)
-                        self._fail_cooldown[rec.creator_id] = time.time() + 180.0
-                        break
                 # Stream went quiet: is the creator really offline or was it a network hiccup?
                 try:
-                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id, known_ls_id=rec.livestream_id)
+                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id)
                 except Exception:
                     info = None
-                if info and info.livestream_id:
-                    reason = await (rec.client or self.api).disallowed_reason(info.livestream_id)
-                    if "private" in reason:
-                        rec.private_hit = True
-                        break
                 if info and info.is_live and info.stream_url and restarts < 10:
                     restarts += 1
                     rec.stream_url = info.stream_url
@@ -2576,17 +2404,6 @@ class RecordingManager:
             if upload_tasks:
                 await asyncio.gather(*upload_tasks, return_exceptions=True)
 
-            if rec.private_hit:
-                try:
-                    m = await self.bot.send_message(
-                        rec.chat_id,
-                        f"🔒 لایو <b>{html.escape(rec.creator_name)}</b> خصوصی شد؛ ضبط متوقف شد"
-                        + (f" ({rec.uploaded_parts} پارت ارسال شد)." if rec.uploaded_parts else "."),
-                        parse_mode="html",
-                    )
-                    schedule_delete(m, 30)
-                except Exception:
-                    pass
             if rec.uploaded_parts == 0 and final_status == "completed":
                 final_status = "empty"
                 self._fail_cooldown[rec.creator_id] = time.time() + 180.0
@@ -2596,11 +2413,10 @@ class RecordingManager:
                     try:
                         m = await self.bot.send_message(
                             rec.chat_id,
-                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).\n"
-                            f"<code>{html.escape(rec.agora_diag[:250])}</code>",
+                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).",
                             parse_mode="html",
                         )
-                        schedule_delete(m, 60)
+                        schedule_delete(m, 15)
                     except Exception:
                         pass
             elif rec.uploaded_parts > 0:
@@ -2616,6 +2432,11 @@ class RecordingManager:
                 except Exception:
                     pass
 
+            if upload_failures:
+                final_status = "upload_failed" if rec.uploaded_parts == 0 else "partial_upload"
+                notes = (notes + " | " if notes else "") + "Upload failed; local files retained: " + "; ".join(upload_failures[:3])
+                log.error("Retaining local recording files after upload failure: %s", work_dir)
+
             self.db.finish_recording_record(
                 rec.db_rec_id,
                 status=final_status,
@@ -2624,11 +2445,12 @@ class RecordingManager:
                 tg_chat_id=rec.chat_id,
                 notes=notes,
             )
-            self.db.update_watch_status(rec.creator_id, "private" if rec.private_hit else "offline", display_name=rec.creator_name)
+            self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
             self.active.pop(rec.creator_id, None)
-            if rec.client is not None:
-                self._release(rec.client.slot, rec.creator_id)
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if rec.client is not None and self.busy.get(rec.client.slot) == rec.creator_id:
+                self.busy.pop(rec.client.slot, None)
+            if not upload_failures:
+                shutil.rmtree(work_dir, ignore_errors=True)
             self._changed()
 
     def notify_ttl(self) -> int:
@@ -2716,27 +2538,24 @@ class RecordingManager:
             attempts.extend((receiver.alt_token, u) for u in receiver.uid_candidates)
 
         connected_ok = False
-        attempt_log: List[str] = []
         for idx, (tok_try, uid_try) in enumerate(attempts):
             if rec.stop_event.is_set():
                 break
             receiver.token = tok_try
             receiver.uid = uid_try
             receiver.conn_events.clear()
-            receiver.is_connected = False
-            receiver.dropped_at = 0.0
-            receiver.fatal_error = False
             await asyncio.to_thread(receiver.connect)
-            for _ in range(12):
+            # Wait up to 4.5s for connected or fail(8)
+            for _ in range(9):
                 await asyncio.sleep(0.5)
                 if "connected" in receiver.conn_events or receiver.video_frames > 0 or receiver.audio_frames > 0:
                     connected_ok = True
                     break
                 if any(ev.startswith("fail(") or ev.startswith("disconn(") for ev in receiver.conn_events):
                     break
-            attempt_log.append(f"{uid_try}:{'/'.join(receiver.conn_events) or 'timeout'}")
             if connected_ok or idx == len(attempts) - 1:
                 break
+            # Disconnect failed attempt cleanly before trying next UID/token
             if receiver._conn is not None:
                 try:
                     await asyncio.to_thread(receiver._conn.disconnect)
@@ -2752,34 +2571,17 @@ class RecordingManager:
         last_seg: Dict[str, Any] = {}
         session_start = time.time()
         last_enter = time.time()
-        last_priv = time.time()
         receiver.event_times.clear()
-        if connected_ok:
-            receiver.dropped_at = 0.0
-            receiver.fatal_error = False
         try:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(1.0)
-                if not connected_ok:
-                    log.warning("Agora never connected for %s: %s", rec.creator_id, "; ".join(attempt_log))
-                    rec.status_text = "اتصال برقرار نشد"
-                    break
-                dropped = receiver.fatal_error or (
-                    receiver.dropped_at > 0.0
-                    and not receiver.is_connected
-                    and time.time() - receiver.dropped_at >= 4.0
-                )
-                if rec.livestream_id and (time.time() - last_priv >= 15 or dropped):
-                    last_priv = time.time()
-                    reason = await (rec.client or self.api).disallowed_reason(rec.livestream_id)
-                    if "private" in reason:
-                        log.info("Livestream %s of %s turned private", rec.livestream_id, rec.creator_id)
-                        rec.private_hit = True
-                        rec.status_text = "🟡 لایو خصوصی شد"
-                        break
-                if dropped:
+                if connected_ok and receiver.event_times:
                     log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
                     rec.status_text = "اتصال قطع شد، اتصال مجدد..."
+                    break
+                if not connected_ok:
+                    log.warning("Agora never connected for %s: %s", rec.creator_id, receiver.conn_events[-4:])
+                    rec.status_text = "اتصال برقرار نشد"
                     break
                 if receiver.video_frames == 0 and time.time() - session_start >= 25:
                     log.warning("No video at all for %s after 25s: %s", rec.creator_id, receiver.conn_events[-4:])
@@ -2794,6 +2596,8 @@ class RecordingManager:
                 rec.bytes_written = receiver.seg_bytes
                 if receiver.seg_video_frames == 1:
                     rec.seg_started_at = receiver.seg_started_at
+                if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
+                    break
                 _, free_mb, _ = get_disk_stats()
                 if free_mb < MIN_FREE_DISK_MB:
                     rec.stop_event.set()
@@ -2813,23 +2617,14 @@ class RecordingManager:
 
         rec.agora_diag = (
             f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
-            f"tries=[{'; '.join(attempt_log)}], ev={','.join(receiver.conn_events[:6])}, "
-            f"uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
+            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
         )
         log.info("Agora session ended for %s: %s", rec.creator_id, rec.agora_diag)
-        min_sec = max(5, int(self.db.get_setting("min_clip_sec", "5") or 5))
-        seg_ok = (
-            last_seg.get("video_frames", 0) >= 15
-            and (rec.manual_stop or last_seg.get("elapsed", 0.0) >= min_sec)
-        )
-        if seg_ok:
+        if last_seg.get("video_frames", 0) > 0:
             part_no = rec.part_number
             rec.part_number += 1
             enqueue(lambda o=last_seg, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
         else:
-            if last_seg.get("video_frames", 0) > 0:
-                log.info("Discarding short Agora segment for %s (frames=%s, elapsed=%.1fs < %ss)",
-                         rec.creator_id, last_seg.get("video_frames"), last_seg.get("elapsed", 0.0), min_sec)
             for k in ("h264", "pcm"):
                 try:
                     Path(last_seg.get(k)).unlink(missing_ok=True)
@@ -2859,11 +2654,6 @@ class RecordingManager:
         async with self._upload_sem:
             dur, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
             fsize = mp4_path.stat().st_size
-            min_sec = max(5, int(self.db.get_setting("min_clip_sec", "5") or 5))
-            if dur < (2 if rec.manual_stop else min_sec):
-                log.info("Skipping %ss clip of %s (< %ss)", dur, rec.creator_id, min_sec)
-                mp4_path.unlink(missing_ok=True)
-                return
             thumb_path = mp4_path.with_suffix(".thumb.jpg")
             sheet_path = mp4_path.with_suffix(".sheet.jpg")
             thumb_file, sheet_file = await asyncio.to_thread(
@@ -2933,16 +2723,17 @@ class RecordingManager:
                     )
                 except Exception:
                     pass
-                return
+                # Surface failure to lifecycle; retain this file for recovery.
+                raise RuntimeError(f"Telegram upload failed for part {part_no}; retained at {dest}")
 
-            # Uploaded -> free the disk immediately
+            # Telegram confirmed the send. Persist metadata before deleting the local copy.
+            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
+                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
             mp4_path.unlink(missing_ok=True)
             rec.uploaded_parts += 1
             rec.uploaded_duration += dur
             rec.uploaded_bytes += fsize
             rec.upload_status = f"پارت {part_no}: ارسال شد ✅"
-            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
-                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
 
             arch_raw = self.db.get_setting("archive_chat_id", "")
             if arch_raw:
@@ -2966,8 +2757,6 @@ class WatchlistMonitor:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._notified_ls: Dict[str, str] = {}  # creator_id -> livestream_id already announced
-        self.last_discover_map: Dict[str, Dict[str, Any]] = {}
-        self.last_discover_at: float = 0.0
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -2983,8 +2772,8 @@ class WatchlistMonitor:
         if self._notified_ls.get(info.creator_id) == key:
             return
         if not started and not info.stream_url:
-            # quick joinability probe with a completely idle account (never disturb active recordings)
-            probe = next((c for c in self.rec_mgr.accounts() if not self.rec_mgr.busy.get(c.slot)), None)
+            # quick joinability probe with a free account (doesn't disturb busy ones)
+            probe = self.rec_mgr.free_account()
             if probe is not None:
                 try:
                     full = await probe.check_creator_and_get_stream(info.creator_id)
@@ -3001,7 +2790,7 @@ class WatchlistMonitor:
         try:
             m = await self.bot.send_message(
                 owner_id,
-                f"🟢 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
+                f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
                 + (" · ⏺ ضبط خودکار شروع شد" if started else ""),
                 parse_mode="html",
                 buttons=[row],
@@ -3023,10 +2812,7 @@ class WatchlistMonitor:
                 discover_map: Optional[Dict[str, Dict[str, Any]]] = None
                 if items:
                     try:
-                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=12)
-                        if discover_map:
-                            self.last_discover_map = discover_map
-                            self.last_discover_at = time.time()
+                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=8)
                     except Exception as e:
                         log.warning("Batch discover fetch failed: %s", e)
                 for item in items:
@@ -3046,9 +2832,6 @@ class WatchlistMonitor:
                         if info.is_live:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
-                            if info.livestream_id and "private" in (await self.api.disallowed_reason(info.livestream_id)):
-                                self.db.update_watch_status(cid, "private", display_name=info.display_name, username=info.username)
-                                continue  # private right now -> retry next poll silently
                             if item["auto_record"] and self.rec_mgr.has_capacity():
                                 ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
                                 started = ok
@@ -3141,11 +2924,7 @@ class SuperLiveRecBot:
     def _status_icon(self, cid: str, last_status: str) -> str:
         if self.rec_mgr.is_recording(cid):
             return "⏺"
-        if last_status == "live":
-            return "🟢"
-        if last_status == "private":
-            return "🟡"
-        return "🔴"
+        return "🔴" if last_status == "live" else "⚫"
 
     def render(self, view: str, *args: Any) -> Tuple[str, List[List[Any]]]:
         return getattr(self, f"_v_{view}")(*args)
@@ -3153,7 +2932,6 @@ class SuperLiveRecBot:
     def _v_home(self) -> Tuple[str, List[List[Any]]]:
         wl = self.db.list_watchlist()
         live_cnt = sum(1 for x in wl if x["last_status"] == "live")
-        priv_cnt = sum(1 for x in wl if x["last_status"] == "private")
         active = list(self.rec_mgr.active.values())
         cnt, dur, size = self.db.clip_stats()
         used_mb, free_mb, total_mb = get_disk_stats()
@@ -3163,7 +2941,7 @@ class SuperLiveRecBot:
             "🎥 <b>SuperLive Recorder</b>",
             SEP,
             f"⏺ در حال ضبط: <b>{len(active)}</b>",
-            f"👀 واچلیست: <b>{len(wl)}</b>   ·   🟢 آنلاین: <b>{live_cnt}</b>   ·   🟡 خصوصی: <b>{priv_cnt}</b>",
+            f"👀 واچلیست: <b>{len(wl)}</b>   ·   🔴 آنلاین: <b>{live_cnt}</b>",
             f"📚 آرشیو: <b>{cnt}</b> ویدیو   ·   <b>{fmt_duration(dur)}</b>   ·   <b>{fmt_bytes(size)}</b>",
             SEP,
             f"💽 دیسک آزاد: <code>{free_mb/1024:.1f}/{total_mb/1024:.1f} GB</code>   🧠 رم: <code>{ram}</code>",
@@ -3183,22 +2961,17 @@ class SuperLiveRecBot:
 
     def _v_watchlist(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
         items = self.db.list_watchlist()
-        # recording first, then online (green), then private (yellow), then offline (red)
-        items.sort(key=lambda x: (
-            0 if self.rec_mgr.is_recording(x["creator_id"])
-            else (1 if x["last_status"] == "live" else (2 if x["last_status"] == "private" else 3))
-        ))
+        # recording first, then live, then offline
+        items.sort(key=lambda x: (0 if self.rec_mgr.is_recording(x["creator_id"]) else (1 if x["last_status"] == "live" else 2)))
         per = 8
         pages = max(1, (len(items) + per - 1) // per)
         page = max(0, min(page, pages - 1))
         chunk = items[page * per:(page + 1) * per]
         rec_n = sum(1 for x in items if self.rec_mgr.is_recording(x["creator_id"]))
         live_n = sum(1 for x in items if x["last_status"] == "live")
-        priv_n = sum(1 for x in items if x["last_status"] == "private")
-        off_n = len(items) - live_n - priv_n
         lines = [
             f"📋 <b>واچلیست</b>  ·  {len(items)} نفر",
-            f"⏺ {rec_n} ضبط   🟢 {live_n} آنلاین   🟡 {priv_n} خصوصی   🔴 {off_n} آفلاین",
+            f"⏺ {rec_n} در حال ضبط   🔴 {live_n} آنلاین   ⚫ {len(items) - live_n} آفلاین",
             SEP,
         ]
         if not chunk:
@@ -3235,11 +3008,9 @@ class SuperLiveRecBot:
         if r:
             st = "⏺ در حال ضبط"
         elif w.get("last_status") == "live":
-            st = "🟢 آنلاین"
-        elif w.get("last_status") == "private":
-            st = "🟡 لایو خصوصی"
+            st = "🔴 آنلاین"
         else:
-            st = "🔴 آفلاین"
+            st = "⚫ آفلاین"
         lines = [
             f"👤 <b>{html.escape(name)}</b>",
             f"🆔 <code>{cid}</code>" + (f"   @{html.escape(w['username'])}" if w.get("username") else ""),
@@ -3349,24 +3120,18 @@ class SuperLiveRecBot:
                  "<i>هر اکانت همزمان فقط یه لایو رو میتونه ضبط کنه. برای ضبط همزمان N نفر، N اکانت لازمه.</i>", ""]
         buttons: List[List[Any]] = []
         for slot, c in sorted(self.pool.clients.items()):
-            busy_list = self.rec_mgr.busy.get(slot, [])
-            busy = busy_list[0] if busy_list else None
+            busy = self.rec_mgr.busy.get(slot)
             if not c.has_token():
                 st = "⚪ بدون توکن"
             elif busy:
                 r = self.rec_mgr.active.get(busy)
-                parts_txt = []
-                for b in busy_list:
-                    r = self.rec_mgr.active.get(b)
-                    if r:
-                        parts_txt.append(
-                            f"\n     ⏺ <b>{html.escape(short(r.creator_name, 18))}</b> · 🎞 "
-                            f"<a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
-                            f" · ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
-                            f" · {'🟢' if r.connected else '🟡'}")
-                    else:
-                        parts_txt.append("\n     ⏳ در حال آمادهسازی...")
-                st = f"مشغول ({len(busy_list)})" + "".join(parts_txt)
+                if r:
+                    st = (f"⏺ در حال ضبط <b>{html.escape(short(r.creator_name, 18))}</b>\n"
+                          f"     🎞 لایو: <a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
+                          f"  ·  ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
+                          f"  ·  {'🟢 تصویر میرسه' if r.connected else '🟡 در حال اتصال'}")
+                else:
+                    st = "⏳ در حال آمادهسازی..."
             else:
                 st = "🟢 آزاد"
             lines.append(f"• <b>{html.escape(c.label)}</b>{' (اصلی)' if slot == 0 else ''} — {st}")
@@ -3391,8 +3156,7 @@ class SuperLiveRecBot:
         part = g("part_mb", "1900")
         poll = g("poll_interval", str(DEFAULT_POLL_INTERVAL))
         accs = self.rec_mgr.accounts()
-        per = self.rec_mgr.per_account()
-        conc_txt = f"{len(accs) * per}  ({len(accs)} اکانت × {per})"
+        conc_txt = f"{len(accs)} (به تعداد اکانتها)"
         arch = g("archive_chat_id", "") or "خاموش"
         ttl_txt = "هیچوقت" if ttl == "0" else f"{ttl} ثانیه"
         split_txt = "خاموش" if split == "0" else f"هر {split} دقیقه"
@@ -3416,7 +3180,6 @@ class SuperLiveRecBot:
             [Button.inline(f"🔔 اعلان: {'ON' if notify else 'OFF'}", data="set:notify"), Button.inline(f"🧹 حذف: {ttl_txt}", data="set:ttl")],
             [Button.inline(f"✂️ تکهتکه: {split_txt}", data="set:split"), Button.inline(f"📦 {part}MB", data="set:part")],
             [Button.inline(f"⏱ چک: {poll}s", data="set:poll"), Button.inline(f"👥 اکانتها ({len(accs)})", data="acc")],
-            [Button.inline(f"⚡ ضبط همزمان هر اکانت: {per}", data="set:per")],
             [Button.inline("🏠", data="h")],
         ]
         return text, buttons
@@ -3597,7 +3360,7 @@ class SuperLiveRecBot:
                 await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
                 return
             info = await self.api.check_creator_and_get_stream(cid)
-            status = "🟢 آنلاین (LIVE)" if info.is_live else "🔴 آفلاین"
+            status = "🔴 آنلاین (LIVE)" if info.is_live else "⚫ آفلاین"
             proto = "Agora RTC" if info.stream_url.startswith("agora://") else ("HLS/Direct" if info.stream_url else "نامشخص")
             await msg.edit(
                 f"🔎 <b>نتیجه بررسی استریمر</b>\n\n"
@@ -3638,8 +3401,7 @@ class SuperLiveRecBot:
                 f"• Token Info: <code>{html.escape(str(d.get('token_info', '-')))}</code>\n"
                 f"• Agora Keys: <code>{html.escape(str(d.get('agora_keys', '-'))[:600])}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
-                f"<b>Enter JSON:</b>\n<code>{html.escape(str(d.get('enter_sample') or '')[:800])}</code>\n\n"
-                f"<b>Retrieve JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('discover_sample') or '')[:800])}</code>"
+                f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
             )
             await msg.edit(report[:4000], parse_mode="html")
 
@@ -3939,7 +3701,7 @@ class SuperLiveRecBot:
                     await event.edit("🗑 این اکانت حذف بشه؟", buttons=[[Button.inline("✅ بله", data=f"accrm:{parts[1]}"), Button.inline("‹ انصراف", data="acc")]])
                 elif head == "accrm":
                     slot = int(parts[1])
-                    if self.rec_mgr.busy.get(slot):
+                    if slot in self.rec_mgr.busy:
                         await event.answer("این اکانت الان در حال ضبطه", alert=True)
                         return
                     self.pool.remove(slot)
@@ -3974,15 +3736,9 @@ class SuperLiveRecBot:
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
         added = self.db.add_watch(cid, uname, dname, avatar)
-        dmap = self.monitor.last_discover_map if (time.time() - self.monitor.last_discover_at < 45) else None
-        info = await self.api.check_creator_and_get_stream(cid, discover_map=dmap, light=True)
-        if not info.is_live and dmap is not None:
-            info = await self.api.check_creator_and_get_stream(cid, light=True)
-        if info.display_name or info.is_live:
-            st_val = "live" if info.is_live else "offline"
-            if info.is_live and info.livestream_id and "private" in (await self.api.disallowed_reason(info.livestream_id)):
-                st_val = "private"
-            self.db.update_watch_status(cid, st_val, display_name=info.display_name, username=info.username)
+        info = await self.api.check_creator_and_get_stream(cid, light=True)
+        if info.display_name:
+            self.db.update_watch_status(cid, "live" if info.is_live else "offline", display_name=info.display_name, username=info.username)
         if info.is_live:
             ok, _ = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="watchlist")
             self.monitor._notified_ls[info.creator_id] = info.livestream_id or "live"
@@ -4000,17 +3756,13 @@ class SuperLiveRecBot:
                 pass
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
-        dmap = self.monitor.last_discover_map if (time.time() - self.monitor.last_discover_at < 45) else None
-        info = await self.api.check_creator_and_get_stream(cid, discover_map=dmap, light=True)
-        if not info.is_live and dmap is not None:
-            info = await self.api.check_creator_and_get_stream(cid, light=True)
+        info = await self.api.check_creator_and_get_stream(cid, light=True)
         try:
             await wait.delete()
         except Exception:
             pass
         if not info.is_live:
-            self.db.update_watch_status(cid, "offline", display_name=info.display_name or dname)
-            await self.toast(event, f"🔴 <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
+            await self.toast(event, f"⚫ <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
         else:
             ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
             await self.toast(event, msg_text, ttl=6 if ok else 60)
@@ -4031,8 +3783,6 @@ class SuperLiveRecBot:
             cycle("split_minutes", ["0", "10", "20", "30", "60"], "0")
         elif key == "part":
             cycle("part_mb", ["500", "1000", "1500", "1900"], "1900")
-        elif key == "per":
-            cycle("recs_per_account", ["1", "2", "3", "5"], "1")
         elif key == "poll":
             cycle("poll_interval", ["15", "25", "45", "60"], str(DEFAULT_POLL_INTERVAL))
 
@@ -4069,15 +3819,12 @@ class SuperLiveRecBot:
         return runner
 
     async def run(self) -> None:
+        if not BOT_TOKEN:
+            raise RuntimeError("BOT_TOKEN is missing. Set it as an environment variable before starting the bot.")
         stale = self.db.mark_stale_recordings_interrupted()
         if stale:
             log.info("Marked %d stale recordings as interrupted.", stale)
-        for child in RECORDINGS_DIR.iterdir():
-            try:
-                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+        # Preserve interrupted/failed recordings for recovery; successfully sent MP4 parts are deleted immediately.
         self._register_handlers()
         health_runner = await self._start_health_server()
         await self.bot.start(bot_token=BOT_TOKEN)
