@@ -2182,7 +2182,7 @@ class RecordingManager:
         self.db = db
         self.pool = pool
         self.api = pool.primary
-        self.busy: Dict[int, str] = {}  # account slot -> creator_id
+        self.busy: Dict[int, List[str]] = {}  # account slot -> creator_ids being recorded
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
         # livestream_ids the user stopped manually -> don't auto-restart the same live
@@ -2203,14 +2203,33 @@ class RecordingManager:
     def accounts(self) -> List[SuperLiveClient]:
         return self.pool.usable() or [self.pool.primary]
 
+    def per_account(self) -> int:
+        raw = self.db.get_setting("recs_per_account", "1")
+        return max(1, int(raw)) if raw.isdigit() else 1
+
     def free_account(self) -> Optional[SuperLiveClient]:
+        lim = self.per_account()
+        best = None
         for c in self.accounts():
-            if c.slot not in self.busy:
-                return c
-        return None
+            n = len(self.busy.get(c.slot, []))
+            if n < lim and (best is None or n < len(self.busy.get(best.slot, []))):
+                best = c
+        return best
+
+    def _reserve(self, slot: int, cid: str) -> None:
+        lst = self.busy.setdefault(slot, [])
+        if cid not in lst:
+            lst.append(cid)
+
+    def _release(self, slot: int, cid: str) -> None:
+        lst = self.busy.get(slot, [])
+        if cid in lst:
+            lst.remove(cid)
+        if not lst:
+            self.busy.pop(slot, None)
 
     def max_concurrent(self) -> int:
-        return len(self.accounts())
+        return len(self.accounts()) * self.per_account()
 
     def has_capacity(self) -> bool:
         return self.free_account() is not None
@@ -2246,14 +2265,14 @@ class RecordingManager:
             return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
                            f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
         # Reserve the account, then get a fresh token issued for THIS account
-        self.busy[client.slot] = cid
+        self._reserve(client.slot, cid)
         try:
             fresh = await client.check_creator_and_get_stream(cid)
         except Exception as e:
             fresh = None
             log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
         if not fresh or not fresh.is_live or not fresh.stream_url:
-            self.busy.pop(client.slot, None)
+            self._release(client.slot, cid)
             if not fresh:
                 return False, "⚠️ ارتباط با SuperLive برقرار نشد."
             if not fresh.is_live:
@@ -2265,6 +2284,9 @@ class RecordingManager:
                 if m and m.group(1) not in ("null", '""'):
                     reason = m.group(1).strip('"')
                     break
+            if "private" in reason or "private_livestream" in str(d.get("agora_keys", "")):
+                return False, ("🔒 این لایو الان <b>خصوصی (Private / پولی)</b> شده و سرور فقط به کسایی که "
+                               "پرداخت کردن اجازه ورود میده. وقتی دوباره عمومی بشه میشه ضبطش کرد.")
             return False, (
                 "⚠️ لایو روشنه ولی اطلاعات اتصال (Agora) داده نشد.\n"
                 f"• Retrieve/Enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code>"
@@ -2274,11 +2296,12 @@ class RecordingManager:
             )
         fresh.display_name = fresh.display_name or stream_info.display_name
         stream_info = fresh
+        old_cid = cid
         cid = str(stream_info.creator_id or cid)
+        self._release(client.slot, old_cid)
         if cid in self.active:
-            self.busy.pop(client.slot, None)
             return False, "⏺ همین الان در حال ضبطه."
-        self.busy[client.slot] = cid
+        self._reserve(client.slot, cid)
         _, free_mb, _ = get_disk_stats()
         err = ""
         if free_mb < MIN_FREE_DISK_MB:
@@ -2288,7 +2311,7 @@ class RecordingManager:
         elif not FFMPEG_BIN:
             err = "FFmpeg روی سرور پیدا نشد."
         if err:
-            self.busy.pop(client.slot, None)
+            self._release(client.slot, cid)
             return False, err
 
         cname = stream_info.display_name or stream_info.username or cid
@@ -2434,8 +2457,8 @@ class RecordingManager:
             )
             self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
             self.active.pop(rec.creator_id, None)
-            if rec.client is not None and self.busy.get(rec.client.slot) == rec.creator_id:
-                self.busy.pop(rec.client.slot, None)
+            if rec.client is not None:
+                self._release(rec.client.slot, rec.creator_id)
             shutil.rmtree(work_dir, ignore_errors=True)
             self._changed()
 
@@ -3105,18 +3128,24 @@ class SuperLiveRecBot:
                  "<i>هر اکانت همزمان فقط یه لایو رو میتونه ضبط کنه. برای ضبط همزمان N نفر، N اکانت لازمه.</i>", ""]
         buttons: List[List[Any]] = []
         for slot, c in sorted(self.pool.clients.items()):
-            busy = self.rec_mgr.busy.get(slot)
+            busy_list = self.rec_mgr.busy.get(slot, [])
+            busy = busy_list[0] if busy_list else None
             if not c.has_token():
                 st = "⚪ بدون توکن"
             elif busy:
                 r = self.rec_mgr.active.get(busy)
-                if r:
-                    st = (f"⏺ در حال ضبط <b>{html.escape(short(r.creator_name, 18))}</b>\n"
-                          f"     🎞 لایو: <a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
-                          f"  ·  ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
-                          f"  ·  {'🟢 تصویر میرسه' if r.connected else '🟡 در حال اتصال'}")
-                else:
-                    st = "⏳ در حال آمادهسازی..."
+                parts_txt = []
+                for b in busy_list:
+                    r = self.rec_mgr.active.get(b)
+                    if r:
+                        parts_txt.append(
+                            f"\n     ⏺ <b>{html.escape(short(r.creator_name, 18))}</b> · 🎞 "
+                            f"<a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
+                            f" · ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
+                            f" · {'🟢' if r.connected else '🟡'}")
+                    else:
+                        parts_txt.append("\n     ⏳ در حال آمادهسازی...")
+                st = f"مشغول ({len(busy_list)})" + "".join(parts_txt)
             else:
                 st = "🟢 آزاد"
             lines.append(f"• <b>{html.escape(c.label)}</b>{' (اصلی)' if slot == 0 else ''} — {st}")
@@ -3141,7 +3170,8 @@ class SuperLiveRecBot:
         part = g("part_mb", "1900")
         poll = g("poll_interval", str(DEFAULT_POLL_INTERVAL))
         accs = self.rec_mgr.accounts()
-        conc_txt = f"{len(accs)} (به تعداد اکانتها)"
+        per = self.rec_mgr.per_account()
+        conc_txt = f"{len(accs) * per}  ({len(accs)} اکانت × {per})"
         arch = g("archive_chat_id", "") or "خاموش"
         ttl_txt = "هیچوقت" if ttl == "0" else f"{ttl} ثانیه"
         split_txt = "خاموش" if split == "0" else f"هر {split} دقیقه"
@@ -3165,6 +3195,7 @@ class SuperLiveRecBot:
             [Button.inline(f"🔔 اعلان: {'ON' if notify else 'OFF'}", data="set:notify"), Button.inline(f"🧹 حذف: {ttl_txt}", data="set:ttl")],
             [Button.inline(f"✂️ تکهتکه: {split_txt}", data="set:split"), Button.inline(f"📦 {part}MB", data="set:part")],
             [Button.inline(f"⏱ چک: {poll}s", data="set:poll"), Button.inline(f"👥 اکانتها ({len(accs)})", data="acc")],
+            [Button.inline(f"⚡ ضبط همزمان هر اکانت: {per}", data="set:per")],
             [Button.inline("🏠", data="h")],
         ]
         return text, buttons
@@ -3686,7 +3717,7 @@ class SuperLiveRecBot:
                     await event.edit("🗑 این اکانت حذف بشه؟", buttons=[[Button.inline("✅ بله", data=f"accrm:{parts[1]}"), Button.inline("‹ انصراف", data="acc")]])
                 elif head == "accrm":
                     slot = int(parts[1])
-                    if slot in self.rec_mgr.busy:
+                    if self.rec_mgr.busy.get(slot):
                         await event.answer("این اکانت الان در حال ضبطه", alert=True)
                         return
                     self.pool.remove(slot)
@@ -3768,6 +3799,8 @@ class SuperLiveRecBot:
             cycle("split_minutes", ["0", "10", "20", "30", "60"], "0")
         elif key == "part":
             cycle("part_mb", ["500", "1000", "1500", "1900"], "1900")
+        elif key == "per":
+            cycle("recs_per_account", ["1", "2", "3", "5"], "1")
         elif key == "poll":
             cycle("poll_interval", ["15", "25", "45", "60"], str(DEFAULT_POLL_INTERVAL))
 
