@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperLiveRec Personal Unlimited Pro (v2.1)
+SuperLiveRec Personal Unlimited Pro (v2.0)
 ==========================================
-Personal SuperLive livestream recorder & watchlist bot for Telegram.
-All known bugs fixed. Complete & runnable.
+Personal, unlimited SuperLive livestream recorder & watchlist bot for Telegram,
+inspired by @superliverec_bot and StreamRecorder.io.
+
+Key Features:
+- Unlimited personal watchlist & simultaneous multi-stream recording
+- Telethon MTProto engine: uploads full continuous MP4 files up to 2 GB (no 50 MB Bot API cap!)
+- Dual capture engine:
+    1) Direct HLS / FLV / RTMP via FFmpeg (-c copy, zero quality loss)
+    2) Native Agora RTC capture via agora-python-server-sdk (H.264 + PCM audio muxed to AAC MP4)
+- Automatic 4x3 Contact Sheet preview grid & video cover thumbnail (StreamRecorder-style)
+- Live dashboard, active recording monitor, searchable SQLite archive, and optional Archive Channel backup
+- Disk space guard tailored for VPS / Altare containers (e.g., 6 GiB RAM / 10 GiB Disk)
 """
 
 import asyncio
@@ -34,51 +44,51 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+from aiohttp import web
 from telethon import Button, TelegramClient, events
-from telethon.errors import FloodWaitError
-try:
-    from telethon.errors import MessageNotModifiedError
-except ImportError:
-    from telethon.errors.rpcerrorlist import MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import DocumentAttributeVideo
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION (Override via Environment Variables on Altare / VPS)
 # ==============================================================================
 
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN",
+    "8837565058:AAExoYiFvTB7aq8aZHPENBu_qaWIxlgV6pM",
+).strip()
 
-# Bot token is REQUIRED — no hardcoded fallback.
-BOT_TOKEN = _env("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("8837565058:AAExoYiFvTB7aq8aZHPENBu_qaWIxlgV6pM")
+# Telethon MTProto credentials (needed for 2 GB uploads without 50 MB Bot API limit)
+# You can set your own from https://my.telegram.org via TG_API_ID / TG_API_HASH env vars
+TG_API_ID = int(os.environ.get("TG_API_ID", "2040"))
+TG_API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627").strip()
 
-TG_API_ID = int(_env("TG_API_ID", "2040") or "2040")
-TG_API_HASH = _env("TG_API_HASH", "b18441a1ff607e10a989891a5462e627")
+# Optional: lock bot to your Telegram numeric user ID (0 = auto-bind to first /start user)
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
-OWNER_ID = int(_env("OWNER_ID", "0") or "0")
+# SuperLive Web API & Agora defaults
+SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
+DEFAULT_AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310").strip()
 
-SUPERLIVE_API_BASE = _env("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
-DEFAULT_AGORA_APP_ID = _env("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310")
-
-BASE_DIR = Path(_env("DATA_DIR", "./superliverec_data")).resolve()
+# Storage & Limits (tuned for 6 GiB RAM / 10 GiB Disk)
+BASE_DIR = Path(os.environ.get("DATA_DIR", "./superliverec_data")).resolve()
 RECORDINGS_DIR = BASE_DIR / "recordings"
 DB_PATH = BASE_DIR / "superliverec.db"
 SESSION_PATH = BASE_DIR / "superliverec_bot_session"
 
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-FAILED_DIR = BASE_DIR / "failed_uploads"
-FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SINGLE_FILE_BYTES = int(_env("MAX_FILE_MB", "1900")) * 1024 * 1024
-MIN_FREE_DISK_MB = int(_env("MIN_FREE_DISK_MB", "500"))
-AGORA_INACTIVITY_TIMEOUT = int(_env("AGORA_INACTIVITY_TIMEOUT", "45"))
-VIDEO_STALL_TIMEOUT = int(_env("VIDEO_STALL_TIMEOUT", "12"))
-DEFAULT_POLL_INTERVAL = int(_env("POLL_INTERVAL", "25"))
-DEFAULT_MAX_CONCURRENT = max(1, int(_env("MAX_CONCURRENT_RECORDINGS", "2")))
-MAX_PARALLEL_UPLOADS = int(_env("MAX_PARALLEL_UPLOADS", "3"))
+# Max single file size before rolling over to a new continuous part (Telegram MTProto bot limit = 2000 MB)
+MAX_SINGLE_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "1900")) * 1024 * 1024
+# Minimum free disk space safeguard (MB) so 10 GiB container never hits ENOSPC
+MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", "500"))
+# Inactivity timeout for Agora stream end detection (seconds without frames)
+AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
+# Watchlist check interval (seconds)
+DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
+# Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
+DEFAULT_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "8"))
 
 # ==============================================================================
 # LOGGING
@@ -95,13 +105,14 @@ logging.basicConfig(
 log = logging.getLogger("SuperLiveRec")
 
 # ==============================================================================
-# OPTIONAL DEPENDENCIES
+# OPTIONAL DEPENDENCY DETECTION (FFmpeg & Agora Server SDK)
 # ==============================================================================
 
 def find_ffmpeg() -> Optional[str]:
-    b = shutil.which("ffmpeg")
-    if b:
-        return b
+    """Locate system ffmpeg or bundled imageio-ffmpeg binary."""
+    sys_bin = shutil.which("ffmpeg")
+    if sys_bin:
+        return sys_bin
     try:
         import imageio_ffmpeg  # type: ignore
         return imageio_ffmpeg.get_ffmpeg_exe()
@@ -121,27 +132,33 @@ AGORA_IMPORT_ERROR = ""
 try:
     from agora.rtc.agora_service import AgoraService, AgoraServiceConfig, RTCConnConfig  # type: ignore
     from agora.rtc.agora_base import (  # type: ignore
-        AudioScenarioType, ChannelProfileType, ClientRoleType,
-        VideoStreamType, VideoSubscriptionOptions,
+        AudioScenarioType,
+        ChannelProfileType,
+        ClientRoleType,
+        VideoStreamType,
+        VideoSubscriptionOptions,
     )
     from agora.rtc.audio_frame_observer import IAudioFrameObserver  # type: ignore
     try:
         from agora.rtc.rtc_connection_observer import IRTCConnectionObserver  # type: ignore
     except ImportError:
         IRTCConnectionObserver = object  # type: ignore
+
     try:
         from agora.rtc.video_encoded_frame_observer import IVideoEncodedFrameObserver  # type: ignore
     except ImportError:
         from agora.rtc.video_frame_observer import IVideoEncodedFrameObserver  # type: ignore
+
     AGORA_AVAILABLE = True
-except Exception as _e:
-    AGORA_IMPORT_ERROR = str(_e)
+except Exception as _ag_err:
+    AGORA_IMPORT_ERROR = str(_ag_err)
     IAudioFrameObserver = object  # type: ignore
     IVideoEncodedFrameObserver = object  # type: ignore
     IRTCConnectionObserver = object  # type: ignore
 
+
 # ==============================================================================
-# HELPERS
+# HELPER UTILITIES
 # ==============================================================================
 
 def fmt_bytes(num_bytes: float) -> str:
@@ -156,128 +173,81 @@ def fmt_duration(seconds: float) -> str:
     secs = max(0, int(seconds))
     h, rem = divmod(secs, 3600)
     m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def get_disk_stats(path: Path = BASE_DIR) -> Tuple[float, float, float]:
-    u = shutil.disk_usage(str(path))
+    """Return (used_mb, free_mb, total_mb)."""
+    usage = shutil.disk_usage(str(path))
     mb = 1024 * 1024
-    return u.used / mb, u.free / mb, u.total / mb
+    return usage.used / mb, usage.free / mb, usage.total / mb
 
 
 def get_ram_usage_mb() -> Tuple[float, float]:
+    """Read container/process RAM usage on Linux without external deps."""
+    used_mb, total_mb = 0.0, 0.0
     try:
-        cur = Path("/sys/fs/cgroup/memory.current")
-        mx = Path("/sys/fs/cgroup/memory.max")
-        if cur.exists() and mx.exists():
-            used = int(cur.read_text().strip()) / 1048576
-            raw = mx.read_text().strip()
-            if raw.isdigit():
-                return used, int(raw) / 1048576
+        # Try cgroup v2 first (Docker / Altare containers)
+        cg_cur = Path("/sys/fs/cgroup/memory.current")
+        cg_max = Path("/sys/fs/cgroup/memory.max")
+        if cg_cur.exists() and cg_max.exists():
+            used_mb = int(cg_cur.read_text().strip()) / (1024 * 1024)
+            raw_max = cg_max.read_text().strip()
+            if raw_max.isdigit():
+                total_mb = int(raw_max) / (1024 * 1024)
+                return used_mb, total_mb
     except Exception:
         pass
     try:
-        txt = Path("/proc/meminfo").read_text()
+        meminfo = Path("/proc/meminfo").read_text()
         vals: Dict[str, int] = {}
-        for line in txt.splitlines():
-            p = line.split()
-            if len(p) >= 2:
-                vals[p[0].rstrip(":")] = int(p[1])
-        t = vals.get("MemTotal", 0) / 1024.0
-        a = vals.get("MemAvailable", vals.get("MemFree", 0)) / 1024.0
-        return t - a, t
+        for line in meminfo.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                vals[parts[0].rstrip(":")] = int(parts[1])
+        total_kb = vals.get("MemTotal", 0)
+        avail_kb = vals.get("MemAvailable", vals.get("MemFree", 0))
+        total_mb = total_kb / 1024.0
+        used_mb = (total_kb - avail_kb) / 1024.0
     except Exception:
-        return 0.0, 0.0
+        pass
+    return used_mb, total_mb
 
 
 def extract_creator_identifier(raw_input: str) -> str:
+    """Extract numeric ID or username from a SuperLive ID, @handle, or share URL."""
     text = raw_input.strip()
     if not text:
         return ""
-    m = re.search(r"/livestream/(\d{4,16})", text)
-    if m:
-        return f"ls:{m.group(1)}"
+    # Extract URL if pasted inside a sentence
+    url_match = re.search(r"https?://[^\s]+", text)
+    # Direct livestream page link: https://superlive.chat/livestream/155964343
+    ls_match = re.search(r"/livestream/(\d{4,16})", text)
+    if ls_match:
+        return f"ls:{ls_match.group(1)}"
     if text.lower().startswith("ls:") and text[3:].isdigit():
         return text.lower()
-    um = re.search(r"https?://[^\s]+", text)
-    if um:
-        url = um.group(0)
+    if url_match:
+        url = url_match.group(0)
         parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query)
         for key in ("user_id", "uid", "id", "creator_id", "host_id", "profile_id"):
             if key in qs and qs[key]:
                 return qs[key][0].strip()
-        segs = [s for s in parsed.path.split("/") if s]
-        for s in reversed(segs):
-            if s.isdigit():
-                return s
-        if segs:
-            return segs[-1].lstrip("@").strip()
-    if re.fullmatch(r"\d{4,16}", text):
+        # Check path segments for numeric ID or username
+        segments = [seg for seg in parsed.path.split("/") if seg]
+        for seg in reversed(segments):
+            if seg.isdigit():
+                return seg
+        if segments:
+            return segments[-1].lstrip("@").strip()
+    # Direct numeric ID or handle
+    num_match = re.fullmatch(r"\d{4,16}", text)
+    if num_match:
         return text
     return text.lstrip("@").strip()
-
-
-try:
-    from zoneinfo import ZoneInfo  # type: ignore
-    LOCAL_TZ: Any = ZoneInfo(_env("TZ_NAME", "Asia/Tehran"))
-except Exception:
-    LOCAL_TZ = datetime.timezone.utc
-
-_BG_TASKS: set = set()
-
-
-def bg_task(coro: Any) -> "asyncio.Task":
-    t = asyncio.create_task(coro)
-    _BG_TASKS.add(t)
-    t.add_done_callback(_BG_TASKS.discard)
-    return t
-
-
-def schedule_delete(msg: Any, delay: float) -> None:
-    if msg is None:
-        return
-    async def _d():
-        try:
-            await asyncio.sleep(delay)
-            await msg.delete()
-        except Exception:
-            pass
-    bg_task(_d())
-
-
-def local_now_str(fmt: str = "%Y-%m-%d · %H:%M") -> str:
-    return datetime.datetime.now(LOCAL_TZ).strftime(fmt)
-
-
-def iso_to_local(iso: str, fmt: str = "%m-%d %H:%M") -> str:
-    if not iso:
-        return "-"
-    try:
-        dt = datetime.datetime.fromisoformat(iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(LOCAL_TZ).strftime(fmt)
-    except Exception:
-        return iso[:16].replace("T", " ")
-
-
-def is_h264_keyframe(data: bytes) -> bool:
-    try:
-        n = len(data)
-        i = data.find(b"\x00\x00\x01")
-        checks = 0
-        while 0 <= i < n - 3 and checks < 64:
-            t = data[i + 3] & 0x1F
-            if t in (5, 7):
-                return True
-            if t == 1:
-                return False
-            i = data.find(b"\x00\x00\x01", i + 3)
-            checks += 1
-    except Exception:
-        pass
-    return False
 
 
 def sanitize_filename(name: str) -> str:
@@ -286,30 +256,23 @@ def sanitize_filename(name: str) -> str:
 
 
 def decode_agora_token_007(token: str) -> Dict[str, Any]:
-    """Extract app_id/channel/uid from an Agora AccessToken2 (007...)."""
+    """Extract app_id, channel and uid embedded in an Agora AccessToken2 (007...)."""
     if not isinstance(token, str) or not token.startswith("007"):
         return {}
     try:
         raw = token[3:]
         raw += "=" * (-len(raw) % 4)
         buf = zlib.decompress(base64.b64decode(raw))
-
-        def need(n: int) -> None:
-            if pos + n > len(buf):
-                raise ValueError("token truncated")
-
         pos = 0
 
         def u16() -> int:
             nonlocal pos
-            need(2)
             v = struct.unpack_from("<H", buf, pos)[0]
             pos += 2
             return v
 
         def u32() -> int:
             nonlocal pos
-            need(4)
             v = struct.unpack_from("<I", buf, pos)[0]
             pos += 4
             return v
@@ -317,29 +280,25 @@ def decode_agora_token_007(token: str) -> Dict[str, Any]:
         def rstr() -> bytes:
             nonlocal pos
             n = u16()
-            need(n)
             v = buf[pos:pos + n]
             pos += n
             return v
 
-        rstr()
+        rstr()  # signature
         out: Dict[str, Any] = {"app_id": rstr().decode("utf-8", "ignore")}
         out["issue_ts"] = u32()
         out["expire"] = u32()
-        u32()
-        svc_count = u16()
-        for _ in range(svc_count):
-            if pos + 2 > len(buf):
-                break
+        u32()  # salt
+        for _ in range(u16()):
             stype = u16()
-            priv_count = u16()
-            for _ in range(priv_count):
+            for _ in range(u16()):
                 u16()
                 u32()
-            if stype == 1:
+            if stype == 1:  # RTC service
                 out["channel"] = rstr().decode("utf-8", "ignore")
                 out["uid"] = rstr().decode("utf-8", "ignore")
                 break
+            # Non-RTC services: RTM(2)/Streaming etc. carry one string (user_id) in most versions
             rstr()
         return out
     except Exception as e:
@@ -347,36 +306,31 @@ def decode_agora_token_007(token: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# DATABASE
+# DATABASE LAYER (SQLite — Watchlist, Archive, Settings, SuperLive Session)
 # ==============================================================================
 
 class Database:
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.RLock()
-        self._db: Optional[sqlite3.Connection] = None
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        if self._db is None:
+        # Single persistent connection (the old code leaked one connection per query)
+        if getattr(self, "_db", None) is None:
             self._db = sqlite3.connect(str(self.path), check_same_thread=False)
             self._db.row_factory = sqlite3.Row
         return self._db
 
-    def close(self) -> None:
-        with self._lock:
-            if self._db is not None:
-                try:
-                    self._db.close()
-                except Exception:
-                    pass
-                self._db = None
-
     def _init_db(self) -> None:
-        with self._lock, self._conn() as c:
-            c.executescript(
+        with self._lock, self._conn() as conn:
+            conn.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS watchlist (
                     creator_id TEXT PRIMARY KEY,
                     username TEXT DEFAULT '',
@@ -389,6 +343,7 @@ class Database:
                     total_recordings INTEGER DEFAULT 0,
                     added_at TEXT NOT NULL
                 );
+
                 CREATE TABLE IF NOT EXISTS recordings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     creator_id TEXT NOT NULL,
@@ -405,31 +360,18 @@ class Database:
                     archive_message_id INTEGER DEFAULT 0,
                     notes TEXT DEFAULT ''
                 );
-                CREATE TABLE IF NOT EXISTS clips (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rec_id INTEGER DEFAULT 0,
-                    creator_id TEXT NOT NULL,
-                    creator_name TEXT DEFAULT '',
-                    part_no INTEGER DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    duration_sec INTEGER DEFAULT 0,
-                    size_bytes INTEGER DEFAULT 0,
-                    chat_id INTEGER DEFAULT 0,
-                    msg_id INTEGER DEFAULT 0,
-                    sheet_msg_id INTEGER DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS idx_clips_creator ON clips (creator_id, id);
                 """
             )
 
+    # --- Settings ---
     def get_setting(self, key: str, default: str = "") -> str:
-        with self._lock:
-            row = self._conn().execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
             return row["value"] if row else default
 
     def set_setting(self, key: str, value: str) -> None:
-        with self._lock, self._conn() as c:
-            c.execute(
+        with self._lock, self._conn() as conn:
+            conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, str(value)),
@@ -438,173 +380,188 @@ class Database:
     def get_owner_id(self) -> int:
         if OWNER_ID > 0:
             return OWNER_ID
-        v = self.get_setting("owner_id", "0")
-        return int(v) if v.isdigit() else 0
+        val = self.get_setting("owner_id", "0")
+        return int(val) if val.isdigit() else 0
 
     def set_owner_id(self, uid: int) -> None:
         self.set_setting("owner_id", str(uid))
 
-    def add_watch(self, creator_id: str, username: str = "", display_name: str = "", avatar_url: str = "") -> bool:
+    # --- Watchlist ---
+    def add_watch(
+        self,
+        creator_id: str,
+        username: str = "",
+        display_name: str = "",
+        avatar_url: str = "",
+    ) -> bool:
         now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            row = c.execute("SELECT creator_id FROM watchlist WHERE creator_id = ?", (creator_id,)).fetchone()
-            if row:
-                c.execute(
-                    "UPDATE watchlist SET username = COALESCE(NULLIF(?, ''), username), "
-                    "display_name = COALESCE(NULLIF(?, ''), display_name), "
-                    "avatar_url = COALESCE(NULLIF(?, ''), avatar_url), auto_record = 1 "
-                    "WHERE creator_id = ?",
-                    (username, display_name, avatar_url, creator_id),
+        with self._lock, self._conn() as conn:
+            existing = conn.execute(
+                "SELECT creator_id FROM watchlist WHERE creator_id = ?", (creator_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE watchlist
+                    SET username = CASE WHEN ? != '' THEN ? ELSE username END,
+                        display_name = CASE WHEN ? != '' THEN ? ELSE display_name END,
+                        avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
+                        auto_record = 1
+                    WHERE creator_id = ?
+                    """,
+                    (username, username, display_name, display_name, avatar_url, avatar_url, creator_id),
                 )
                 return False
-            c.execute(
-                "INSERT INTO watchlist (creator_id, username, display_name, avatar_url, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+            conn.execute(
+                """
+                INSERT INTO watchlist (creator_id, username, display_name, avatar_url, added_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
                 (creator_id, username, display_name or username or creator_id, avatar_url, now),
             )
             return True
 
     def remove_watch(self, creator_id: str) -> bool:
-        with self._lock, self._conn() as c:
-            return c.execute("DELETE FROM watchlist WHERE creator_id = ?", (creator_id,)).rowcount > 0
+        with self._lock, self._conn() as conn:
+            cur = conn.execute("DELETE FROM watchlist WHERE creator_id = ?", (creator_id,))
+            return cur.rowcount > 0
 
     def toggle_auto_record(self, creator_id: str) -> Optional[int]:
-        with self._lock, self._conn() as c:
-            row = c.execute("SELECT auto_record FROM watchlist WHERE creator_id = ?", (creator_id,)).fetchone()
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                "SELECT auto_record FROM watchlist WHERE creator_id = ?", (creator_id,)
+            ).fetchone()
             if not row:
                 return None
-            nv = 0 if row["auto_record"] else 1
-            c.execute("UPDATE watchlist SET auto_record = ? WHERE creator_id = ?", (nv, creator_id))
-            return nv
+            new_val = 0 if row["auto_record"] else 1
+            conn.execute(
+                "UPDATE watchlist SET auto_record = ? WHERE creator_id = ?", (new_val, creator_id)
+            )
+            return new_val
 
     def list_watchlist(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            rows = self._conn().execute(
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
                 "SELECT * FROM watchlist ORDER BY (last_status = 'live') DESC, added_at DESC"
             ).fetchall()
             return [dict(r) for r in rows]
 
     def get_watch(self, creator_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            row = self._conn().execute("SELECT * FROM watchlist WHERE creator_id = ?", (creator_id,)).fetchone()
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM watchlist WHERE creator_id = ?", (creator_id,)
+            ).fetchone()
             return dict(row) if row else None
 
-    def update_watch_status(self, creator_id: str, status: str, display_name: str = "", username: str = "",
-                            increment_recordings: bool = False) -> None:
+    def update_watch_status(
+        self,
+        creator_id: str,
+        status: str,
+        display_name: str = "",
+        username: str = "",
+        increment_recordings: bool = False,
+    ) -> None:
         now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            c.execute(
-                "UPDATE watchlist SET last_status = ?, "
-                "last_seen_live = CASE WHEN ? = 'live' THEN ? ELSE last_seen_live END, "
-                "display_name = COALESCE(NULLIF(?, ''), display_name), "
-                "username = COALESCE(NULLIF(?, ''), username), "
-                "total_recordings = total_recordings + ? WHERE creator_id = ?",
-                (status, status, now, display_name, username, 1 if increment_recordings else 0, creator_id),
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE watchlist
+                SET last_status = ?,
+                    last_seen_live = CASE WHEN ? = 'live' THEN ? ELSE last_seen_live END,
+                    display_name = CASE WHEN ? != '' THEN ? ELSE display_name END,
+                    username = CASE WHEN ? != '' THEN ? ELSE username END,
+                    total_recordings = total_recordings + ?
+                WHERE creator_id = ?
+                """,
+                (
+                    status,
+                    status,
+                    now,
+                    display_name,
+                    display_name,
+                    username,
+                    username,
+                    1 if increment_recordings else 0,
+                    creator_id,
+                ),
             )
 
-    def create_recording_record(self, creator_id: str, creator_name: str, livestream_id: str = "") -> int:
+    # --- Recordings Archive ---
+    def create_recording_record(
+        self, creator_id: str, creator_name: str, livestream_id: str = ""
+    ) -> int:
         now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            cur = c.execute(
-                "INSERT INTO recordings (creator_id, creator_name, livestream_id, started_at, status) "
-                "VALUES (?, ?, ?, ?, 'recording')",
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO recordings (creator_id, creator_name, livestream_id, started_at, status)
+                VALUES (?, ?, ?, ?, 'recording')
+                """,
                 (creator_id, creator_name, livestream_id, now),
             )
             return int(cur.lastrowid)
 
-    def finish_recording_record(self, rec_id: int, status: str, duration_sec: int, file_size_bytes: int,
-                                tg_chat_id: int = 0, tg_message_id: int = 0, archive_chat_id: int = 0,
-                                archive_message_id: int = 0, notes: str = "") -> None:
+    def finish_recording_record(
+        self,
+        rec_id: int,
+        status: str,
+        duration_sec: int,
+        file_size_bytes: int,
+        tg_chat_id: int = 0,
+        tg_message_id: int = 0,
+        archive_chat_id: int = 0,
+        archive_message_id: int = 0,
+        notes: str = "",
+    ) -> None:
         now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            c.execute(
-                "UPDATE recordings SET ended_at = ?, duration_sec = ?, file_size_bytes = ?, status = ?, "
-                "tg_chat_id = ?, tg_message_id = ?, archive_chat_id = ?, archive_message_id = ?, notes = ? "
-                "WHERE id = ?",
-                (now, duration_sec, file_size_bytes, status, tg_chat_id, tg_message_id,
-                 archive_chat_id, archive_message_id, notes, rec_id),
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE recordings
+                SET ended_at = ?, duration_sec = ?, file_size_bytes = ?, status = ?,
+                    tg_chat_id = ?, tg_message_id = ?, archive_chat_id = ?, archive_message_id = ?, notes = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    duration_sec,
+                    file_size_bytes,
+                    status,
+                    tg_chat_id,
+                    tg_message_id,
+                    archive_chat_id,
+                    archive_message_id,
+                    notes,
+                    rec_id,
+                ),
             )
 
     def list_recent_recordings(self, limit: int = 15, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._lock:
-            rows = self._conn().execute(
-                "SELECT * FROM recordings ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM recordings ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
 
     def count_recordings(self) -> int:
-        with self._lock:
-            row = self._conn().execute(
-                "SELECT COUNT(*) AS c FROM recordings WHERE status = 'completed'"
-            ).fetchone()
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM recordings WHERE status = 'completed'").fetchone()
             return int(row["c"]) if row else 0
-
-    def add_clip(self, rec_id: int, creator_id: str, creator_name: str, part_no: int,
-                 duration_sec: int, size_bytes: int, chat_id: int, msg_id: int, sheet_msg_id: int = 0) -> None:
-        now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            c.execute(
-                "INSERT INTO clips (rec_id, creator_id, creator_name, part_no, created_at, duration_sec, "
-                "size_bytes, chat_id, msg_id, sheet_msg_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (rec_id, creator_id, creator_name, part_no, now, duration_sec, size_bytes,
-                 chat_id, msg_id, sheet_msg_id),
-            )
-
-    def list_clips(self, creator_id: str = "", limit: int = 8, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._lock:
-            if creator_id:
-                rows = self._conn().execute(
-                    "SELECT * FROM clips WHERE creator_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                    (creator_id, limit, offset),
-                ).fetchall()
-            else:
-                rows = self._conn().execute(
-                    "SELECT * FROM clips ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
-                ).fetchall()
-            return [dict(r) for r in rows]
-
-    def clip_stats(self, creator_id: str = "") -> Tuple[int, int, int]:
-        with self._lock:
-            q = "SELECT COUNT(*) c, COALESCE(SUM(duration_sec),0) d, COALESCE(SUM(size_bytes),0) s FROM clips"
-            if creator_id:
-                row = self._conn().execute(q + " WHERE creator_id = ?", (creator_id,)).fetchone()
-            else:
-                row = self._conn().execute(q).fetchone()
-            return int(row["c"]), int(row["d"]), int(row["s"])
-
-    def get_clip(self, clip_id: int) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            row = self._conn().execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
-            return dict(row) if row else None
-
-    def migrate_watch(self, old_id: str, new_id: str) -> None:
-        if not new_id or old_id == new_id:
-            return
-        with self._lock, self._conn() as c:
-            if c.execute("SELECT 1 FROM watchlist WHERE creator_id = ?", (new_id,)).fetchone():
-                c.execute("DELETE FROM watchlist WHERE creator_id = ?", (old_id,))
-            else:
-                c.execute("UPDATE watchlist SET creator_id = ? WHERE creator_id = ?", (new_id, old_id))
-
-    def increment_recordings(self, creator_id: str) -> None:
-        with self._lock, self._conn() as c:
-            c.execute(
-                "UPDATE watchlist SET total_recordings = total_recordings + 1 WHERE creator_id = ?",
-                (creator_id,),
-            )
 
     def mark_stale_recordings_interrupted(self) -> int:
         now = datetime.datetime.utcnow().isoformat()
-        with self._lock, self._conn() as c:
-            cur = c.execute(
-                "UPDATE recordings SET status = 'interrupted', ended_at = ?, "
-                "notes = 'Server restarted during capture' WHERE status = 'recording'",
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE recordings SET status = 'interrupted', ended_at = ?, notes = 'Server restarted during capture' "
+                "WHERE status = 'recording'",
                 (now,),
             )
             return cur.rowcount
 
+
 # ==============================================================================
-# SUPERLIVE API CLIENT
+# SUPERLIVE API CLIENT (Fixed disc_data bug + Robust Stream Discovery)
 # ==============================================================================
 
 @dataclass
@@ -615,105 +572,56 @@ class CreatorStreamInfo:
     avatar_url: str = ""
     is_live: bool = False
     livestream_id: str = ""
-    stream_url: str = ""
+    stream_url: str = ""  # Either http(s)/rtmp URL or agora://<app_id>/<channel>?token=...&uid=...
     title: str = ""
     viewers: int = 0
     raw_debug: Dict[str, Any] = field(default_factory=dict)
 
 
-class AccountPool:
+class SuperLiveClient:
     def __init__(self, db: Database):
         self.db = db
-        raw = db.get_setting("account_slots", "0")
-        slots = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()} | {0})
-        self.clients: Dict[int, "SuperLiveClient"] = {n: SuperLiveClient(db, n) for n in slots}
-
-    def _save(self) -> None:
-        self.db.set_setting("account_slots", ",".join(str(n) for n in sorted(self.clients)))
-
-    @property
-    def primary(self) -> "SuperLiveClient":
-        return self.clients[0]
-
-    def add(self, token: str, device_id: str = "", label: str = "") -> "SuperLiveClient":
-        n = 1
-        while n in self.clients:
-            n += 1
-        c = SuperLiveClient(self.db, n)
-        c.set_credentials(token, device_id)
-        if label:
-            c.label = label
-            self.db.set_setting(c._k("superlive_label"), label)
-        self.clients[n] = c
-        self._save()
-        return c
-
-    def remove(self, slot: int) -> bool:
-        if slot == 0 or slot not in self.clients:
-            return False
-        c = self.clients.pop(slot)
-        c.wipe()
-        self._save()
-        bg_task(c.close())
-        return True
-
-    def usable(self) -> List["SuperLiveClient"]:
-        return [c for _, c in sorted(self.clients.items()) if c.has_token()]
-
-    async def close(self) -> None:
-        for c in self.clients.values():
-            await c.close()
-
-
-class SuperLiveClient:
-    def __init__(self, db: Database, slot: int = 0):
-        self.db = db
-        self.slot = slot
         self._session: Optional[aiohttp.ClientSession] = None
-        env_tok = _env("SUPERLIVE_TOKEN") if slot == 0 else ""
-        env_dev = _env("SUPERLIVE_DEVICE_ID") if slot == 0 else ""
-        self._token: str = env_tok or db.get_setting(self._k("superlive_token"), "")
-        self._device_id: str = env_dev or db.get_setting(self._k("superlive_device_id"), "") or uuid.uuid4().hex
-        self._auth_scheme: str = db.get_setting(self._k("superlive_auth_scheme"), "Token")
+        env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip()
+        env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip()
+        self._token: str = env_tok or db.get_setting("superlive_token", "")
+        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
+        self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
         self._rtc_id: str = (
-            (_env("SUPERLIVE_RTC_ID") if slot == 0 else "")
-            or db.get_setting(self._k("superlive_rtc_id"), "")
+            os.environ.get("SUPERLIVE_RTC_ID", "").strip()
+            or db.get_setting("superlive_rtc_id", "")
             or str(random.randint(1000000000, 4200000000))
         )
-        if not db.get_setting(self._k("superlive_device_id"), ""):
-            db.set_setting(self._k("superlive_device_id"), self._device_id)
-        if not db.get_setting(self._k("superlive_rtc_id"), ""):
-            db.set_setting(self._k("superlive_rtc_id"), self._rtc_id)
-        self.label: str = db.get_setting(self._k("superlive_label"), "") or f"اکانت {slot + 1}"
-
-    def _k(self, key: str) -> str:
-        return key if self.slot == 0 else f"acc{self.slot}_{key}"
-
-    def has_token(self) -> bool:
-        return bool(self._token)
-
-    def wipe(self) -> None:
-        for k in ("superlive_token", "superlive_device_id", "superlive_auth_scheme",
-                  "superlive_rtc_id", "superlive_label"):
-            self.db.set_setting(self._k(k), "")
+        if not db.get_setting("superlive_device_id", ""):
+            db.set_setting("superlive_device_id", self._device_id)
+        if not db.get_setting("superlive_rtc_id", ""):
+            db.set_setting("superlive_rtc_id", self._rtc_id)
 
     def _client_params(self, source_url: str = "https://superlive.chat/") -> Dict[str, Any]:
         return {
-            "os_type": "web", "app_build": "5.25.23", "app": "superlive",
-            "build_code": "1526-2991979-prod", "app_language": "en",
-            "device_language": "en", "device_preferred_languages": ["en-US", "en"],
-            "source_url": source_url, "session_source_url": "https://superlive.chat/",
-            "referrer": "", "incognito": False, "rtc_id": self._rtc_id,
-            "web_type": 1, "display_density": "2.75",
-            "display_resolution_width": 393, "display_resolution_height": 873,
+            "os_type": "web",
+            "app_build": "5.25.23",
+            "app": "superlive",
+            "build_code": "1526-2991979-prod",
+            "app_language": "en",
+            "device_language": "en",
+            "device_preferred_languages": ["en-US", "en"],
+            "source_url": source_url,
+            "session_source_url": "https://superlive.chat/",
+            "referrer": "",
+            "incognito": False,
+            "rtc_id": self._rtc_id,
+            "web_type": 1,
+            "display_density": "2.75",
+            "display_resolution_width": 393,
+            "display_resolution_height": 873,
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=25),
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
-            )
+            timeout = aiohttp.ClientTimeout(total=25)
+            jar = aiohttp.CookieJar(unsafe=True)
+            self._session = aiohttp.ClientSession(timeout=timeout, cookie_jar=jar)
         return self._session
 
     async def close(self) -> None:
@@ -721,30 +629,36 @@ class SuperLiveClient:
             await self._session.close()
 
     def _headers(self) -> Dict[str, str]:
-        h = {
-            "User-Agent": ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"),
-            "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/json", "Device-Id": self._device_id,
-            "Origin": "https://superlive.chat", "Referer": "https://superlive.chat/",
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/json",
+            "Device-Id": self._device_id,
+            "Origin": "https://superlive.chat",
+            "Referer": "https://superlive.chat/",
         }
         if self._token:
-            h["Authorization"] = f"{self._auth_scheme} {self._token}"
-        return h
+            headers["Authorization"] = f"{self._auth_scheme} {self._token}"
+        return headers
 
     def set_credentials(self, token: str, device_id: str = "") -> None:
         self._token = token.strip()
-        self.db.set_setting(self._k("superlive_token"), self._token)
+        self.db.set_setting("superlive_token", self._token)
         if device_id.strip():
             self._device_id = device_id.strip()
-            self.db.set_setting(self._k("superlive_device_id"), self._device_id)
+            self.db.set_setting("superlive_device_id", self._device_id)
 
     async def _post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
         body = dict(payload or {})
-        body.setdefault("client_params", self._client_params())
+        if "client_params" not in body:
+            body["client_params"] = self._client_params()
+        sess = await self._get_session()
         try:
-            sess = await self._get_session()
             async with sess.post(url, json=body, headers=self._headers()) as resp:
                 text = await resp.text()
                 try:
@@ -760,8 +674,8 @@ class SuperLiveClient:
 
     async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
+        sess = await self._get_session()
         try:
-            sess = await self._get_session()
             async with sess.get(url, params=params or {}, headers=self._headers()) as resp:
                 text = await resp.text()
                 try:
@@ -775,26 +689,30 @@ class SuperLiveClient:
         except Exception as e:
             return {"_http_status": 0, "_error": str(e)}
 
-    async def _request_smart(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _request_smart(
+        self, endpoint: str, payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Try POST JSON first; auto-switch Token/Bearer on 401/403 and GET on 404/405."""
         res = await self._post(endpoint, payload)
         status = res.get("_http_status", 0)
         if status in (401, 403) and self._token:
-            alt = "Bearer" if self._auth_scheme == "Token" else "Token"
-            prev = self._auth_scheme
-            self._auth_scheme = alt
+            alt_scheme = "Bearer" if self._auth_scheme == "Token" else "Token"
+            prev_scheme = self._auth_scheme
+            self._auth_scheme = alt_scheme
             retry = await self._post(endpoint, payload)
             if retry.get("_http_status", 0) in (200, 201):
-                self.db.set_setting(self._k("superlive_auth_scheme"), alt)
+                self.db.set_setting("superlive_auth_scheme", alt_scheme)
                 return retry
-            self._auth_scheme = prev
+            self._auth_scheme = prev_scheme
         if status in (404, 405):
-            gr = await self._get(endpoint, payload)
-            if gr.get("_http_status", 0) in (200, 201):
-                return gr
+            get_res = await self._get(endpoint, payload)
+            if get_res.get("_http_status", 0) in (200, 201):
+                return get_res
         return res
 
     @staticmethod
-    def _deep_find_keys(obj: Any, keys: Tuple[str, ...]) -> Dict[str, Any]:
+    def _deep_find_keys(obj: Any, target_keys: Tuple[str, ...]) -> Dict[str, Any]:
+        """Recursively collect first non-empty values for any matching keys."""
         found: Dict[str, Any] = {}
         stack: List[Any] = [obj]
         seen = 0
@@ -804,14 +722,14 @@ class SuperLiveClient:
             if isinstance(cur, dict):
                 for k, v in cur.items():
                     kl = str(k).lower()
-                    if kl in keys and kl not in found and v not in (None, "", [], {}):
+                    if kl in target_keys and kl not in found and v not in (None, "", [], {}):
                         found[kl] = v
                     if isinstance(v, (dict, list)):
                         stack.append(v)
             elif isinstance(cur, list):
-                for it in cur[:50]:
-                    if isinstance(it, (dict, list)):
-                        stack.append(it)
+                for item in cur[:50]:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
         return found
 
     async def ensure_initialized(self, force: bool = False) -> Dict[str, Any]:
@@ -822,19 +740,110 @@ class SuperLiveClient:
             {"device_id": self._device_id, "platform": "web", "language": "en"},
         )
         found = self._deep_find_keys(data, ("token", "access_token", "auth_token", "jwt", "session_token"))
-        token = found.get("access_token") or found.get("token") or found.get("auth_token") \
-            or found.get("jwt") or found.get("session_token")
+        token = (
+            found.get("access_token")
+            or found.get("token")
+            or found.get("auth_token")
+            or found.get("jwt")
+            or found.get("session_token")
+        )
         if token:
             self._token = str(token)
-            self.db.set_setting(self._k("superlive_token"), self._token)
+            self.db.set_setting("superlive_token", self._token)
         return data
 
+    async def email_signin(self, email: str, password: str) -> Tuple[bool, str]:
+        data = await self._post(
+            "signup/email_signin",
+            {"email": email, "password": password, "device_id": self._device_id},
+        )
+        found = self._deep_find_keys(data, ("token", "access_token", "auth_token", "jwt"))
+        token = found.get("access_token") or found.get("token") or found.get("auth_token") or found.get("jwt")
+        if token:
+            self._token = str(token)
+            self.db.set_setting("superlive_token", self._token)
+            return True, "ورود به اکانت SuperLive با موفقیت انجام شد."
+        err = data.get("message") or data.get("error") or data.get("_error") or f"HTTP {data.get('_http_status')}"
+        return False, f"خطا در ورود: {err}"
+
     @staticmethod
-    def _extract_avatar(u: Dict[str, Any]) -> str:
-        img = u.get("profile_image") or u.get("avatar")
+    def _extract_avatar(user_obj: Dict[str, Any]) -> str:
+        img = user_obj.get("profile_image") or user_obj.get("avatar")
         if isinstance(img, dict):
             return str(img.get("url") or img.get("thumbnail_url") or "")
         return str(img or "")
+
+    async def _search_by_shared_id(self, ident: str) -> Dict[str, Any]:
+        """Resolve a SuperLive public shared_id (e.g. 59534891) into the full user object with real user_id."""
+        for payload in (
+            {"shared_id": str(ident)},
+            {"search_text": str(ident)},
+            {"query": str(ident), "keyword": str(ident)},
+        ):
+            res = await self._request_smart("user/profile_share_search", payload)
+            if res.get("_http_status") not in (200, 201):
+                continue
+            u = self._extract_user_dict(res)
+            if u and (u.get("user_id") or u.get("id")):
+                return u
+            for list_key in ("users", "items", "results", "data"):
+                arr = res.get(list_key)
+                if isinstance(arr, list):
+                    for cand in arr:
+                        if not isinstance(cand, dict):
+                            continue
+                        sub = cand.get("user") if isinstance(cand.get("user"), dict) else cand
+                        if str(sub.get("shared_id") or "") == str(ident) or str(sub.get("user_id") or "") == str(ident):
+                            return sub
+                    if arr and isinstance(arr[0], dict):
+                        sub0 = arr[0].get("user") if isinstance(arr[0].get("user"), dict) else arr[0]
+                        if sub0.get("user_id") or sub0.get("id"):
+                            return sub0
+        return {}
+
+    async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
+        """Resolve any SuperLive user_id, public shared_id, username, or URL into (real_user_id, username, display_name, avatar)."""
+        await self.ensure_initialized()
+        ident = extract_creator_identifier(raw_query)
+        if not ident:
+            return "", "", "", ""
+
+        # 0) Livestream link -> ask SuperLive who owns this livestream
+        if ident.startswith("ls:"):
+            ls_id = ident[3:]
+            ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
+            owner = self._deep_find_keys(ret, ("livestream_owner_id",)).get("livestream_owner_id")
+            u = ret.get("user") if isinstance(ret.get("user"), dict) else {}
+            if not u:
+                lsobj = ret.get("livestream") if isinstance(ret.get("livestream"), dict) else {}
+                u = lsobj.get("user") if isinstance(lsobj.get("user"), dict) else {}
+            cid = str(owner or u.get("user_id") or u.get("id") or "")
+            if cid:
+                uname = str(u.get("username") or u.get("shared_id") or "")
+                dname = str(u.get("name") or uname or cid)
+                return cid, uname, dname, self._extract_avatar(u) if u else ""
+            log.warning("Could not resolve livestream %s owner: %s", ls_id, json.dumps(ret, ensure_ascii=False)[:300])
+            return "", "", "", ""
+
+        # 1) Try direct users/profile (in case ident is already internal user_id)
+        if ident.isdigit():
+            prof = await self._request_smart("users/profile", {"user_id": str(ident)})
+            user_obj = self._extract_user_dict(prof)
+            if user_obj and not prof.get("error"):
+                cid = str(user_obj.get("user_id") or user_obj.get("id") or ident)
+                uname = str(user_obj.get("username") or user_obj.get("shared_id") or "")
+                dname = str(user_obj.get("name") or user_obj.get("nickname") or uname or cid)
+                return cid, uname, dname, self._extract_avatar(user_obj)
+
+        # 2) Resolve via profile_share_search (translates public shared_id like 59534891 -> internal user_id)
+        found_u = await self._search_by_shared_id(ident)
+        if found_u:
+            cid = str(found_u.get("user_id") or found_u.get("id") or ident)
+            uname = str(found_u.get("username") or found_u.get("shared_id") or "")
+            dname = str(found_u.get("name") or found_u.get("nickname") or uname or cid)
+            return cid, uname, dname, self._extract_avatar(found_u)
+
+        return ident, "", ident, ""
 
     @staticmethod
     def _extract_user_dict(payload: Any) -> Dict[str, Any]:
@@ -856,100 +865,60 @@ class SuperLiveClient:
     def _extract_direct_stream_url(obj: Any) -> str:
         if not isinstance(obj, dict):
             return ""
-        skip = {"profile_image", "avatar", "thumbnail", "cover", "image",
-                "badge", "badges", "gift", "gifts", "icon", "icons", "banner"}
-        img_mark = ("cdn.spl-live.com/pp/", "/pp/", "/avatar", "/thumbnail",
-                    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", "_s", "_b")
-        for k in ("hls_url", "flv_url", "stream_url", "play_url", "rtmp_url",
-                  "m3u8_url", "pull_url", "playback_url"):
+        skip_parent_keys = {
+            "profile_image", "avatar", "thumbnail", "cover", "image",
+            "badge", "badges", "gift", "gifts", "icon", "icons", "banner",
+        }
+        image_markers = (
+            "cdn.spl-live.com/pp/", "/pp/", "/avatar", "/thumbnail",
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", "_s", "_b",
+        )
+        for k in (
+            "hls_url",
+            "flv_url",
+            "stream_url",
+            "play_url",
+            "rtmp_url",
+            "m3u8_url",
+            "pull_url",
+            "playback_url",
+        ):
             v = obj.get(k)
             if isinstance(v, str):
                 vl = v.lower()
-                if any(m in vl for m in img_mark):
+                if any(m in vl for m in image_markers):
                     continue
-                if (vl.startswith(("rtmp://", "rtmps://", "agora://"))
-                        or (vl.startswith(("http://", "https://"))
-                            and any(e in vl for e in (".m3u8", ".flv")))):
+                if (
+                    vl.startswith("rtmp://")
+                    or vl.startswith("rtmps://")
+                    or vl.startswith("agora://")
+                    or (vl.startswith(("http://", "https://")) and any(ext in vl for ext in (".m3u8", ".flv")))
+                ):
                     return v
         for k, v in obj.items():
-            if str(k).lower() in skip:
+            if str(k).lower() in skip_parent_keys:
                 continue
             if isinstance(v, dict):
-                r = SuperLiveClient._extract_direct_stream_url(v)
-                if r:
-                    return r
+                found = SuperLiveClient._extract_direct_stream_url(v)
+                if found:
+                    return found
         return ""
 
-    async def _search_by_shared_id(self, ident: str) -> Dict[str, Any]:
-        for payload in ({"shared_id": str(ident)}, {"search_text": str(ident)},
-                        {"query": str(ident), "keyword": str(ident)}):
-            res = await self._request_smart("user/profile_share_search", payload)
-            if res.get("_http_status") not in (200, 201):
-                continue
-            u = self._extract_user_dict(res)
-            if u and (u.get("user_id") or u.get("id")):
-                return u
-            for lk in ("users", "items", "results", "data"):
-                arr = res.get(lk)
-                if isinstance(arr, list):
-                    for cand in arr:
-                        if not isinstance(cand, dict):
-                            continue
-                        sub = cand.get("user") if isinstance(cand.get("user"), dict) else cand
-                        if str(sub.get("shared_id") or "") == str(ident) \
-                                or str(sub.get("user_id") or "") == str(ident):
-                            return sub
-                    if arr and isinstance(arr[0], dict):
-                        s0 = arr[0].get("user") if isinstance(arr[0].get("user"), dict) else arr[0]
-                        if s0.get("user_id") or s0.get("id"):
-                            return s0
-        return {}
-
-    async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
-        await self.ensure_initialized()
-        ident = extract_creator_identifier(raw_query)
-        if not ident:
-            return "", "", "", ""
-
-        if ident.startswith("ls:"):
-            ls_id = ident[3:]
-            ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
-            owner = self._deep_find_keys(ret, ("livestream_owner_id",)).get("livestream_owner_id")
-            u = ret.get("user") if isinstance(ret.get("user"), dict) else {}
-            if not u:
-                lo = ret.get("livestream") if isinstance(ret.get("livestream"), dict) else {}
-                u = lo.get("user") if isinstance(lo.get("user"), dict) else {}
-            cid = str(owner or u.get("user_id") or u.get("id") or "")
-            if cid:
-                un = str(u.get("username") or u.get("shared_id") or "")
-                dn = str(u.get("name") or un or cid)
-                return cid, un, dn, self._extract_avatar(u) if u else ""
-            return "", "", "", ""
-
-        if ident.isdigit():
-            prof = await self._request_smart("users/profile", {"user_id": str(ident)})
-            uo = self._extract_user_dict(prof)
-            if uo and not prof.get("error"):
-                cid = str(uo.get("user_id") or uo.get("id") or ident)
-                un = str(uo.get("username") or uo.get("shared_id") or "")
-                dn = str(uo.get("name") or uo.get("nickname") or un or cid)
-                return cid, un, dn, self._extract_avatar(uo)
-
-        fu = await self._search_by_shared_id(ident)
-        if fu:
-            cid = str(fu.get("user_id") or fu.get("id") or ident)
-            un = str(fu.get("username") or fu.get("shared_id") or "")
-            dn = str(fu.get("name") or fu.get("nickname") or un or cid)
-            return cid, un, dn, self._extract_avatar(fu)
-
-        return ident, "", ident, ""
-
-    def _build_agora_uri(self, payload: Dict[str, Any], ls_id: str = "",
-                         debug_out: Optional[Dict[str, Any]] = None) -> str:
+    def _build_agora_uri(
+        self,
+        payload: Dict[str, Any],
+        ls_id: str = "",
+        debug_out: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Construct agora://<app_id>/<channel>?token=<tok>&uid=<uid>&ls_id=<ls_id>
+        Safely distinguishes Agora RTC (video/audio) tokens from RTM (chat) tokens,
+        and extracts the embedded 32-hex App ID from 006... tokens automatically.
+        """
         flat: Dict[str, Any] = {}
         rtc_tokens: List[Tuple[str, str]] = []
         any_tokens: List[Tuple[str, str]] = []
-        summary: List[str] = []
+        agora_key_summary: List[str] = []
 
         stack: List[Tuple[str, Any]] = [("", payload)]
         while stack:
@@ -957,13 +926,13 @@ class SuperLiveClient:
             if isinstance(cur, dict):
                 for k, v in cur.items():
                     kl = str(k).lower()
-                    fk = f"{prefix}.{k}" if prefix else str(k)
+                    full_k = f"{prefix}.{k}" if prefix else str(k)
                     if isinstance(v, (dict, list)):
-                        stack.append((fk, v))
+                        stack.append((full_k, v))
                     else:
                         if any(w in kl for w in ("agora", "rtc", "rtm", "channel", "token", "stream", "uid")):
-                            pv = f"len={len(v)}:{v[:6]}.." if isinstance(v, str) and len(v) > 24 else str(v)
-                            summary.append(f"{k}={pv}")
+                            v_preview = f"len={len(v)}:{v[:6]}.." if isinstance(v, str) and len(v) > 24 else str(v)
+                            agora_key_summary.append(f"{k}={v_preview}")
                         if isinstance(v, str) and len(v) >= 50 and v.startswith(("006", "007")):
                             if "rtm" not in kl and "chat" not in kl and "msg" not in kl:
                                 rtc_tokens.append((kl, v))
@@ -971,27 +940,43 @@ class SuperLiveClient:
                         if kl not in flat and v not in (None, ""):
                             flat[kl] = v
             elif isinstance(cur, list):
-                for idx, it in enumerate(cur[:40]):
-                    if isinstance(it, (dict, list)):
-                        stack.append((f"{prefix}[{idx}]", it))
-                    elif isinstance(it, str) and len(it) >= 50 and it.startswith(("006", "007")):
-                        any_tokens.append((prefix.lower(), it))
+                for idx, item in enumerate(cur[:40]):
+                    if isinstance(item, (dict, list)):
+                        stack.append((f"{prefix}[{idx}]", item))
+                    elif isinstance(item, str) and len(item) >= 50 and item.startswith(("006", "007")):
+                        any_tokens.append((prefix.lower(), item))
 
         if debug_out is not None:
-            debug_out["agora_keys"] = ", ".join(summary[:18])
+            debug_out["agora_keys"] = ", ".join(agora_key_summary[:18])
 
+        # Prefer explicit RTC/livestream channel keys (avoid chat/rtm channels)
         channel = (
-            flat.get("agora_channel_name") or flat.get("agora_channel")
-            or flat.get("rtc_channel_name") or flat.get("rtc_channel")
-            or flat.get("channel_name") or flat.get("channel_id")
-            or flat.get("channel") or ls_id
+            flat.get("agora_channel_name")
+            or flat.get("agora_channel")
+            or flat.get("rtc_channel_name")
+            or flat.get("rtc_channel")
+            or flat.get("channel_name")
+            or flat.get("channel_id")
+            or flat.get("channel")
+            or ls_id
         )
+
+        # Pick RTC token (strictly preferring non-RTM tokens)
         token = ""
-        for pk in ("agora_channel_token", "agora_token", "agora_rtc_token", "rtc_token",
-                   "viewer_token", "audience_token", "subscriber_token", "channel_token", "stream_token"):
-            v = flat.get(pk)
-            if isinstance(v, str) and len(v) >= 30:
-                token = v
+        for pref_k in (
+            "agora_channel_token",
+            "agora_token",
+            "agora_rtc_token",
+            "rtc_token",
+            "viewer_token",
+            "audience_token",
+            "subscriber_token",
+            "channel_token",
+            "stream_token",
+        ):
+            val = flat.get(pref_k)
+            if isinstance(val, str) and len(val) >= 30:
+                token = val
                 break
         if not token and rtc_tokens:
             token = rtc_tokens[0][1]
@@ -1003,82 +988,108 @@ class SuperLiveClient:
                     token = v
                     break
 
+        # Auto-extract exact 32-hex Agora App ID from 006... tokens if present
         app_id = flat.get("agora_app_id") or flat.get("app_id") or DEFAULT_AGORA_APP_ID
         if isinstance(token, str) and token.startswith("006") and len(token) >= 35:
-            cand = token[3:35]
-            if re.fullmatch(r"[0-9a-fA-F]{32}", cand):
-                app_id = cand
+            cand_app = token[3:35]
+            if re.fullmatch(r"[0-9a-fA-F]{32}", cand_app):
+                app_id = cand_app
 
-        explicit_uid = (flat.get("agora_id") or flat.get("agora_uid") or flat.get("agora_user_id")
-                        or flat.get("rtc_uid") or flat.get("viewer_uid") or flat.get("rtc_id") or "")
+        # Build prioritized candidate UIDs (explicit API uid, self._rtc_id, "0")
+        explicit_uid = (
+            flat.get("agora_id")
+            or flat.get("agora_uid")
+            or flat.get("agora_user_id")
+            or flat.get("rtc_uid")
+            or flat.get("viewer_uid")
+            or flat.get("rtc_id")
+            or ""
+        )
 
-        ti = decode_agora_token_007(token)
+        # AccessToken2 (007) embeds the exact app_id / channel / uid it was issued for -> trust it
+        tok_info = decode_agora_token_007(token)
         if debug_out is not None:
-            debug_out["token_info"] = str({k: v for k, v in ti.items()})
-        if ti.get("app_id") and re.fullmatch(r"[0-9a-fA-F]{32}", str(ti["app_id"])):
-            app_id = ti["app_id"]
-        if ti.get("channel"):
-            channel = ti["channel"]
-        if "uid" in ti:
-            explicit_uid = ti["uid"] or explicit_uid
+            debug_out["token_info"] = str({k: v for k, v in tok_info.items()})
+        if tok_info.get("app_id") and re.fullmatch(r"[0-9a-fA-F]{32}", str(tok_info["app_id"])):
+            app_id = tok_info["app_id"]
+        if tok_info.get("channel"):
+            channel = tok_info["channel"]
+        if "uid" in tok_info:
+            # empty uid in token = any uid accepted
+            explicit_uid = tok_info["uid"] or explicit_uid
 
-        uids: List[str] = []
+        uid_list: List[str] = []
         for u in (str(explicit_uid), str(self._rtc_id), "0"):
             u = u.strip()
-            if u and u not in uids:
-                uids.append(u)
+            if u and u not in uid_list:
+                uid_list.append(u)
 
-        alt = [t for _, t in rtc_tokens if t != token]
+        # Also store any alternate non-RTM token just in case
+        alt_tokens = [t for _, t in rtc_tokens if t != token]
 
         if channel and (token or str(channel) != str(ls_id)):
-            qs = {
-                "token": str(token), "uid": uids[0] if uids else "0",
-                "uids": ",".join(uids), "ls_id": str(ls_id or channel),
+            qs_dict = {
+                "token": str(token),
+                "uid": uid_list[0] if uid_list else "0",
+                "uids": ",".join(uid_list),
+                "ls_id": str(ls_id or channel),
             }
-            if alt:
-                qs["alt_token"] = alt[0]
-            return f"agora://{app_id}/{channel}?{urllib.parse.urlencode(qs)}"
+            if alt_tokens:
+                qs_dict["alt_token"] = alt_tokens[0]
+            qs = urllib.parse.urlencode(qs_dict)
+            return f"agora://{app_id}/{channel}?{qs}"
         return ""
 
     async def fetch_discover_map(self, max_pages: int = 4) -> Tuple[Dict[str, Dict[str, Any]], int, str]:
+        """Fetch paginated /discover ONCE and index live streams by user_id, shared_id, and username."""
         await self.ensure_initialized()
         live_map: Dict[str, Dict[str, Any]] = {}
         first_http = 0
         first_sample = ""
         cursor: Any = None
         for page_idx in range(max_pages):
-            dd = await self._request_smart("discover", {"next": cursor, "type": 0})
+            disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
             if page_idx == 0:
-                first_http = int(dd.get("_http_status") or 0)
-                first_sample = json.dumps(dd, ensure_ascii=False)[:700]
-            if not isinstance(dd, dict):
+                first_http = int(disc_data.get("_http_status") or 0)
+                first_sample = json.dumps(disc_data, ensure_ascii=False)[:700]
+            if not isinstance(disc_data, dict):
                 break
-            items = (
-                dd.get("items") or dd.get("livestreams") or dd.get("streams")
-                or (dd.get("data") or {}).get("items")
-                or (dd.get("data") or {}).get("livestreams")
-                or (dd.get("data") if isinstance(dd.get("data"), list) else [])
+            streams_list = (
+                disc_data.get("items")
+                or disc_data.get("livestreams")
+                or disc_data.get("streams")
+                or (disc_data.get("data") or {}).get("items")
+                or (disc_data.get("data") or {}).get("livestreams")
+                or (disc_data.get("data") if isinstance(disc_data.get("data"), list) else [])
                 or []
             )
-            for it in items:
-                if not isinstance(it, dict):
+            for item in streams_list:
+                if not isinstance(item, dict):
                     continue
-                host = it.get("user") or it.get("host") or it.get("broadcaster") or it
-                for kv in (host.get("user_id"), host.get("id"), host.get("shared_id"),
-                           host.get("short_id"), it.get("user_id"), it.get("shared_id"),
-                           str(host.get("username") or "").lower()):
-                    if kv:
-                        live_map[str(kv)] = it
-            cursor = dd.get("next")
+                host = item.get("user") or item.get("host") or item.get("broadcaster") or item
+                for key_val in (
+                    host.get("user_id"),
+                    host.get("id"),
+                    host.get("shared_id"),
+                    host.get("short_id"),
+                    item.get("user_id"),
+                    item.get("shared_id"),
+                    str(host.get("username") or "").lower(),
+                ):
+                    if key_val:
+                        live_map[str(key_val)] = item
+            cursor = disc_data.get("next")
             if not cursor:
                 break
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self, creator_id: str,
-        discover_map: Optional[Dict[str, Dict[str, Any]]] = None,
-        light: bool = False,
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> CreatorStreamInfo:
+        """
+        Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
+        Uses recursive field inspection + safe discover fallback + detailed raw_debug for /debug.
+        """
         init_res = await self.ensure_initialized()
         info = CreatorStreamInfo(creator_id=str(creator_id))
         info.raw_debug["init_status"] = init_res.get("_http_status", "cached")
@@ -1090,36 +1101,35 @@ class SuperLiveClient:
         prof_resp: Dict[str, Any] = {}
         user_obj: Dict[str, Any] = {}
 
+        # 0) Fast path: check pre-fetched discover_map first (avoids 100x API spam!)
         if discover_map is not None:
-            mi = discover_map.get(target_uid) or discover_map.get(target_uid.lower())
-            if mi:
-                host = mi.get("user") or mi.get("host") or mi.get("broadcaster") or mi
-                ls_id = str(host.get("livestream_id") or mi.get("livestream_id") or mi.get("id") or "")
+            matched_item = discover_map.get(target_uid) or discover_map.get(target_uid.lower())
+            if matched_item:
+                host = matched_item.get("user") or matched_item.get("host") or matched_item.get("broadcaster") or matched_item
+                ls_id = str(host.get("livestream_id") or matched_item.get("livestream_id") or matched_item.get("id") or "")
                 real_uid = str(host.get("user_id") or host.get("id") or target_uid)
                 info.creator_id = real_uid
                 info.username = str(host.get("username") or host.get("shared_id") or "")
                 info.display_name = str(host.get("name") or host.get("nickname") or info.username or real_uid)
                 info.avatar_url = self._extract_avatar(host)
-                info.title = str(mi.get("title") or "")
+                info.title = str(matched_item.get("title") or "")
                 is_live_flag = bool(ls_id)
                 info.raw_debug["discover_cache_hit"] = True
         cache_ls_id = ls_id
         cache_name = info.display_name
-        if info.creator_id and info.creator_id != target_uid:
-            target_uid = info.creator_id
 
+        # 1) Query user profile only if not already matched in discover_map
         prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
             await self.ensure_initialized(force=True)
             prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
 
+        # If SuperLive says "There is no user found with given id" (code 9), creator_id is a public shared_id!
         err_obj = prof_resp.get("error") if isinstance(prof_resp.get("error"), dict) else {}
-        if prof_resp.get("_http_status") == 400 and (
-            err_obj.get("code") == 9 or "no user" in str(err_obj.get("message", "")).lower()
-        ):
-            ru = await self._search_by_shared_id(target_uid)
-            if ru and (ru.get("user_id") or ru.get("id")):
-                target_uid = str(ru.get("user_id") or ru.get("id"))
+        if prof_resp.get("_http_status") == 400 and (err_obj.get("code") == 9 or "no user" in str(err_obj.get("message", "")).lower()):
+            resolved_u = await self._search_by_shared_id(target_uid)
+            if resolved_u and (resolved_u.get("user_id") or resolved_u.get("id")):
+                target_uid = str(resolved_u.get("user_id") or resolved_u.get("id"))
                 info.creator_id = target_uid
                 info.raw_debug["resolved_from_shared_id"] = f"{creator_id} -> {target_uid}"
                 prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1128,6 +1138,7 @@ class SuperLiveClient:
         info.raw_debug["profile_sample"] = json.dumps(prof_resp, ensure_ascii=False)[:900]
 
         user_obj = self._extract_user_dict(prof_resp)
+        # SuperLive may ignore user_id and return the logged-in account's own profile -> discard it
         if user_obj and str(user_obj.get("user_id") or "") not in ("", target_uid, str(creator_id)) \
                 and str(user_obj.get("shared_id") or "") != str(creator_id):
             info.raw_debug["profile_mismatch"] = f"got {user_obj.get('user_id')} for {target_uid}"
@@ -1138,60 +1149,99 @@ class SuperLiveClient:
             info.display_name = str(user_obj.get("name") or user_obj.get("nickname") or info.username or target_uid)
             info.avatar_url = self._extract_avatar(user_obj)
 
-        deep = self._deep_find_keys(prof_resp, (
-            "livestream_id", "live_id", "stream_id", "broadcast_id", "room_id",
-            "channel_name", "agora_channel", "is_live", "is_streaming", "live_status",
-            "online_status", "livestream", "current_livestream", "active_livestream",
-        ))
-        ls_id = str(deep.get("livestream_id") or deep.get("live_id") or deep.get("stream_id")
-                    or deep.get("broadcast_id") or deep.get("room_id") or cache_ls_id or "")
-        for nk in ("livestream", "current_livestream", "active_livestream"):
-            nested = deep.get(nk)
+        # Recursive search inside ENTIRE profile response for livestream identifiers
+        deep = self._deep_find_keys(
+            prof_resp,
+            (
+                "livestream_id",
+                "live_id",
+                "stream_id",
+                "broadcast_id",
+                "room_id",
+                "channel_name",
+                "agora_channel",
+                "is_live",
+                "is_streaming",
+                "live_status",
+                "online_status",
+                "livestream",
+                "current_livestream",
+                "active_livestream",
+            ),
+        )
+        ls_id = str(
+            deep.get("livestream_id")
+            or deep.get("live_id")
+            or deep.get("stream_id")
+            or deep.get("broadcast_id")
+            or deep.get("room_id")
+            or cache_ls_id
+            or ""
+        )
+        for nested_key in ("livestream", "current_livestream", "active_livestream"):
+            nested = deep.get(nested_key)
             if not ls_id and isinstance(nested, dict):
                 ls_id = str(nested.get("id") or nested.get("livestream_id") or nested.get("live_id") or "")
 
         is_live_flag = bool(
-            deep.get("is_live") or deep.get("is_streaming")
-            or deep.get("live_status") in (1, True, "live", "online", "LIVE", "ONLINE") or ls_id
+            deep.get("is_live")
+            or deep.get("is_streaming")
+            or deep.get("live_status") in (1, True, "live", "online", "LIVE", "ONLINE")
+            or ls_id
         )
 
+        # 2) Safe discover fallback ONLY when profile didn't expose livestream_id (supports pagination + shared_id!)
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(8):
+            for page_idx in range(4):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
                     info.raw_debug["discover_sample"] = json.dumps(disc_data, ensure_ascii=False)[:700]
                 if not isinstance(disc_data, dict):
                     break
-                items = (
-                    disc_data.get("items") or disc_data.get("livestreams") or disc_data.get("streams")
+                streams_list = (
+                    disc_data.get("items")
+                    or disc_data.get("livestreams")
+                    or disc_data.get("streams")
                     or (disc_data.get("data") or {}).get("items")
                     or (disc_data.get("data") or {}).get("livestreams")
                     or (disc_data.get("data") if isinstance(disc_data.get("data"), list) else [])
                     or []
                 )
                 matched = False
-                for it in items:
-                    if not isinstance(it, dict):
+                for item in streams_list:
+                    if not isinstance(item, dict):
                         continue
-                    host = it.get("user") or it.get("host") or it.get("broadcaster") or it
-                    ids = {str(host.get("id") or ""), str(host.get("user_id") or ""),
-                           str(host.get("shared_id") or ""), str(host.get("short_id") or ""),
-                           str(it.get("user_id") or ""), str(it.get("shared_id") or ""),
-                           str(it.get("host_id") or "")}
-                    names = {str(host.get("username") or "").lower(),
-                             str(host.get("unique_id") or "").lower()}
+                    host = item.get("user") or item.get("host") or item.get("broadcaster") or item
+                    ids = {
+                        str(host.get("id") or ""),
+                        str(host.get("user_id") or ""),
+                        str(host.get("shared_id") or ""),
+                        str(host.get("short_id") or ""),
+                        str(item.get("user_id") or ""),
+                        str(item.get("shared_id") or ""),
+                        str(item.get("host_id") or ""),
+                    }
+                    names = {
+                        str(host.get("username") or "").lower(),
+                        str(host.get("unique_id") or "").lower(),
+                    }
                     if str(creator_id) in ids or target_uid in ids or str(creator_id).lower() in names:
-                        ls_id = str(host.get("livestream_id") or it.get("livestream_id")
-                                    or it.get("id") or it.get("live_id") or "")
+                        ls_id = str(
+                            host.get("livestream_id")
+                            or item.get("livestream_id")
+                            or item.get("id")
+                            or item.get("live_id")
+                            or ""
+                        )
                         real_uid = str(host.get("user_id") or host.get("id") or "")
                         if real_uid:
                             info.creator_id = real_uid
                         is_live_flag = bool(ls_id)
-                        info.title = str(it.get("title") or "")
-                        vc = it.get("viewer_count") or it.get("viewers") or 0
+                        info.title = str(item.get("title") or "")
+                        vc = item.get("viewer_count") or item.get("viewers") or 0
                         info.viewers = int(vc) if str(vc).isdigit() else 0
                         if not info.display_name:
                             info.display_name = str(host.get("name") or host.get("username") or creator_id)
@@ -1206,16 +1256,17 @@ class SuperLiveClient:
         info.livestream_id = ls_id
         info.is_live = is_live_flag and bool(ls_id)
 
-        if not info.is_live or light:
+        if not info.is_live:
             return info
 
+        # 3) Retrieve livestream details & enter room for Agora/HLS credentials
         ls_str = str(ls_id)
         ret_resp = await self._request_smart("livestream/retrieve", {"livestream_id": ls_str})
         ent_resp = await self._request_smart("livestream/enter", {"livestream_id": ls_str})
 
         info.raw_debug["retrieve_http"] = ret_resp.get("_http_status")
-        slim = {k: v for k, v in ret_resp.items() if k not in ("user", "target_bar", "top_gifters", "gifts")}
-        info.raw_debug["retrieve_sample"] = json.dumps(slim, ensure_ascii=False)[:1100]
+        slim_ret = {k: v for k, v in ret_resp.items() if k not in ("user", "target_bar", "top_gifters", "gifts")}
+        info.raw_debug["retrieve_sample"] = json.dumps(slim_ret, ensure_ascii=False)[:1100]
         info.raw_debug["enter_http"] = ent_resp.get("_http_status")
         info.raw_debug["enter_sample"] = json.dumps(ent_resp, ensure_ascii=False)[:700]
 
@@ -1231,124 +1282,222 @@ class SuperLiveClient:
             if ru.get("user_id"):
                 info.creator_id = str(ru["user_id"])
 
-        for cr in (ent_resp, ret_resp, prof_resp, user_obj):
-            if not isinstance(cr, dict):
+        for candidate_resp in (ent_resp, ret_resp, prof_resp, user_obj):
+            if not isinstance(candidate_resp, dict):
                 continue
             if not info.title:
-                info.title = str(cr.get("title")
-                                 or (cr.get("livestream") or {}).get("title") or "")
+                info.title = str(
+                    candidate_resp.get("title")
+                    or (candidate_resp.get("livestream") or {}).get("title")
+                    or ""
+                )
             if not info.viewers:
-                vc = cr.get("viewer_count") or (cr.get("livestream") or {}).get("viewer_count") or 0
+                vc = (
+                    candidate_resp.get("viewer_count")
+                    or (candidate_resp.get("livestream") or {}).get("viewer_count")
+                    or 0
+                )
                 if str(vc).isdigit():
                     info.viewers = int(vc)
-            direct = self._extract_direct_stream_url(cr)
+
+            direct = self._extract_direct_stream_url(candidate_resp)
             if direct:
                 info.stream_url = direct
                 break
 
         if not info.stream_url:
             merged = {"retrieve": ret_resp, "enter": ent_resp, "profile": prof_resp}
-            uri = self._build_agora_uri(merged, ls_id=ls_id, debug_out=info.raw_debug)
-            if uri:
-                info.stream_url = uri
+            agora_uri = self._build_agora_uri(merged, ls_id=ls_id, debug_out=info.raw_debug)
+            if agora_uri:
+                info.stream_url = agora_uri
 
         return info
 
 # ==============================================================================
-# MEDIA PROCESSING
+# MEDIA PROCESSING: FFMPEG MUXING (H.264 + PCM -> MP4), PROBE & CONTACT SHEET
 # ==============================================================================
 
 def probe_video_metadata(video_path: Path) -> Tuple[int, int, int]:
+    """Return (duration_seconds, width, height) using ffprobe or ffmpeg fallback."""
     duration, width, height = 0, 720, 1280
     if FFPROBE_BIN:
         try:
-            cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
-                   "-show_entries", "stream=width,height:format=duration",
-                   "-of", "json", str(video_path)]
+            cmd = [
+                FFPROBE_BIN,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "json",
+                str(video_path),
+            ]
             out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=15)
-            data = json.loads(out.decode("utf-8", "ignore"))
+            data = json.loads(out.decode("utf-8", errors="ignore"))
             streams = data.get("streams") or []
             if streams:
                 width = int(streams[0].get("width") or width)
                 height = int(streams[0].get("height") or height)
-            ds = (data.get("format") or {}).get("duration")
-            if ds:
-                duration = int(float(ds))
+            dur_str = (data.get("format") or {}).get("duration")
+            if dur_str:
+                duration = int(float(dur_str))
             return duration, width, height
         except Exception:
             pass
     if FFMPEG_BIN:
         try:
-            res = subprocess.run([FFMPEG_BIN, "-i", str(video_path)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-            se = res.stderr.decode("utf-8", "ignore")
-            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", se)
-            if m:
-                duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(float(m.group(3)))
-            m2 = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", se)
-            if m2:
-                width, height = int(m2.group(1)), int(m2.group(2))
+            res = subprocess.run(
+                [FFMPEG_BIN, "-i", str(video_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+            stderr = res.stderr.decode("utf-8", errors="ignore")
+            m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+            if m_dur:
+                duration = int(m_dur.group(1)) * 3600 + int(m_dur.group(2)) * 60 + int(float(m_dur.group(3)))
+            m_dim = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", stderr)
+            if m_dim:
+                width, height = int(m_dim.group(1)), int(m_dim.group(2))
         except Exception:
             pass
     return duration, width, height
 
 
-def build_mux_command(ffmpeg_bin: str, h264: Path, pcm: Optional[Path], out: Path,
-                      fps: float = 25.0, sample_rate: int = 48000, channels: int = 1) -> List[str]:
-    sf = max(10.0, min(60.0, float(fps or 25.0)))
-    has_v = h264.exists() and h264.stat().st_size > 1024
-    has_a = bool(pcm and pcm.exists() and pcm.stat().st_size > 1024)
+def build_mux_command(
+    ffmpeg_bin: str,
+    h264_path: Path,
+    pcm_path: Optional[Path],
+    output_mp4: Path,
+    fps: float = 25.0,
+    sample_rate: int = 48000,
+    channels: int = 1,
+) -> List[str]:
+    """
+    Build the FFmpeg command to mux raw H.264 video + raw PCM s16le audio into a playable MP4.
+    Solves the silent-video bug by properly including and AAC-encoding the PCM audio stream.
+    """
+    safe_fps = max(10.0, min(60.0, float(fps or 25.0)))
+    has_video = h264_path.exists() and h264_path.stat().st_size > 1024
+    has_audio = bool(pcm_path and pcm_path.exists() and pcm_path.stat().st_size > 1024)
 
-    if has_v and has_a and pcm is not None:
-        return [ffmpeg_bin, "-y", "-fflags", "+genpts", "-r", f"{sf:.2f}", "-f", "h264",
-                "-i", str(h264), "-f", "s16le", "-ar", str(sample_rate), "-ac", str(channels),
-                "-i", str(pcm), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k", "-af", "aresample=async=1",
-                "-movflags", "+faststart", str(out)]
-    if has_v:
-        return [ffmpeg_bin, "-y", "-fflags", "+genpts", "-r", f"{sf:.2f}", "-f", "h264",
-                "-i", str(h264), "-c:v", "copy", "-movflags", "+faststart", str(out)]
-    if has_a and pcm is not None:
-        return [ffmpeg_bin, "-y", "-f", "s16le", "-ar", str(sample_rate), "-ac", str(channels),
-                "-i", str(pcm), "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", str(out)]
+    if has_video and has_audio and pcm_path is not None:
+        return [
+            ffmpeg_bin,
+            "-y",
+            "-fflags", "+genpts",
+            "-r", f"{safe_fps:.2f}",
+            "-f", "h264",
+            "-i", str(h264_path),
+            "-f", "s16le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-i", str(pcm_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(output_mp4),
+        ]
+    if has_video:
+        return [
+            ffmpeg_bin,
+            "-y",
+            "-fflags", "+genpts",
+            "-r", f"{safe_fps:.2f}",
+            "-f", "h264",
+            "-i", str(h264_path),
+            "-c:v", "copy",
+            "-movflags", "+faststart",
+            str(output_mp4),
+        ]
+    if has_audio and pcm_path is not None:
+        return [
+            ffmpeg_bin,
+            "-y",
+            "-f", "s16le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-i", str(pcm_path),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_mp4),
+        ]
     return []
 
 
-def generate_thumbnail_and_contact_sheet(video_path: Path, thumb_path: Path, sheet_path: Path,
-                                         duration_sec: int, make_sheet: bool = True
-                                         ) -> Tuple[Optional[Path], Optional[Path]]:
+def generate_thumbnail_and_contact_sheet(
+    video_path: Path,
+    thumb_path: Path,
+    sheet_path: Path,
+    duration_sec: int,
+    make_sheet: bool = True,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Generate a JPEG video cover thumbnail and a 4x3 StreamRecorder-style contact sheet."""
     if not FFMPEG_BIN or not video_path.exists():
         return None, None
+
     out_thumb: Optional[Path] = None
     out_sheet: Optional[Path] = None
-    seek = min(max(1, duration_sec // 5), 10)
+
+    # 1) Cover thumbnail (Telegram video preview)
+    seek_sec = min(max(1, duration_sec // 5), 10)
     try:
-        subprocess.run([FFMPEG_BIN, "-y", "-ss", str(seek), "-i", str(video_path),
-                        "-vframes", "1", "-vf", "scale=320:-2", "-q:v", "4", str(thumb_path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
+        subprocess.run(
+            [
+                FFMPEG_BIN, "-y",
+                "-ss", str(seek_sec),
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "4",
+                str(thumb_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
         if thumb_path.exists() and thumb_path.stat().st_size > 500:
             out_thumb = thumb_path
     except Exception:
         pass
-    if make_sheet and duration_sec >= 3:
+
+    # 2) 4x3 Contact Sheet (12 preview frames across the full stream)
+    if make_sheet and duration_sec >= 15:
         try:
             fps_val = max(0.0005, 12.0 / max(12.0, float(duration_sec)))
             vf = f"fps={fps_val:.6f},scale=320:-2,tile=4x3:padding=4:margin=4:color=0x111111"
-            subprocess.run([FFMPEG_BIN, "-y", "-i", str(video_path), "-vf", vf,
-                            "-frames:v", "1", "-q:v", "3", str(sheet_path)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, check=False)
+            subprocess.run(
+                [
+                    FFMPEG_BIN, "-y",
+                    "-i", str(video_path),
+                    "-vf", vf,
+                    "-frames:v", "1",
+                    "-q:v", "3",
+                    str(sheet_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+                check=False,
+            )
             if sheet_path.exists() and sheet_path.stat().st_size > 1000:
                 out_sheet = sheet_path
         except Exception:
             pass
+
     return out_thumb, out_sheet
 
+
 # ==============================================================================
-# AGORA SINGLETON & RECEIVER
+# AGORA SINGLETON SERVICE & DUAL-TRACK (H.264 + PCM) RECEIVER
 # ==============================================================================
 
 class AgoraServiceManager:
+    """Process-wide singleton for AgoraService so multiple streams record concurrently safely."""
     _lock = threading.Lock()
     _service: Any = None
     _app_id: str = ""
@@ -1378,6 +1527,8 @@ class _VideoEncodedObserver(IVideoEncodedFrameObserver):  # type: ignore
         self.receiver = receiver
 
     def on_encoded_video_frame(self, *args: Any, **kwargs: Any) -> int:
+        # SDK versions differ: (uid, buf, len, info) or (observer, uid, buf, len, info).
+        # Find the bytes-like buffer and the int length that follows it, whatever the order.
         try:
             buf = kwargs.get("image_buffer")
             length = kwargs.get("length")
@@ -1385,7 +1536,7 @@ class _VideoEncodedObserver(IVideoEncodedFrameObserver):  # type: ignore
                 vals = list(args)
                 for i, a in enumerate(vals):
                     if isinstance(a, (bytes, bytearray, memoryview)) or (
-                        hasattr(a, "__len__") and not isinstance(a, str) and len(a) > 16
+                        hasattr(a, "__len__") and not isinstance(a, str) and hasattr(a, "__getitem__") and len(a) > 16
                     ):
                         buf = a
                         nxt = vals[i + 1] if i + 1 < len(vals) else None
@@ -1407,14 +1558,14 @@ class _AudioPcmObserver(IAudioFrameObserver):  # type: ignore
         self.receiver = receiver
 
     def on_playback_audio_frame_before_mixing(self, *args: Any, **kwargs: Any) -> int:
-        af = kwargs.get("audio_frame")
-        if af is None:
+        audio_frame = kwargs.get("audio_frame")
+        if audio_frame is None:
             for a in args:
                 if hasattr(a, "buffer"):
-                    af = a
+                    audio_frame = a
                     break
-        if af is not None:
-            self.receiver.handle_audio_frame(af)
+        if audio_frame is not None:
+            self.receiver.handle_audio_frame(audio_frame)
         return 1
 
     def on_playback_audio_frame(self, *args: Any, **kwargs: Any) -> int:
@@ -1426,33 +1577,32 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
         super().__init__()
         self.receiver = receiver
 
-    def on_connected(self, *a, **k):
+    def on_connected(self, *args: Any, **kwargs: Any) -> None:
         self.receiver.conn_events.append("connected")
 
-    def on_disconnected(self, *a, **k):
-        r = a[-1] if a else k.get("reason", "?")
-        self.receiver.conn_events.append(f"disconn({r})")
-        self.receiver.event_times.append((time.time(), "drop"))
+    def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
+        reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.conn_events.append(f"disconn({reason})")
 
-    def on_connecting(self, *a, **k):
+    def on_connecting(self, *args: Any, **kwargs: Any) -> None:
         self.receiver.conn_events.append("connecting")
 
-    def on_user_joined(self, *a, **k):
-        u = a[-1] if a else k.get("user_id", "?")
-        self.receiver.conn_events.append(f"joined({u})")
+    def on_user_joined(self, *args: Any, **kwargs: Any) -> None:
+        uid = args[-1] if args else kwargs.get("user_id", "?")
+        self.receiver.conn_events.append(f"joined({uid})")
 
-    def on_connection_failure(self, *a, **k):
-        r = a[-1] if a else k.get("reason", "?")
-        self.receiver.conn_events.append(f"fail({r})")
-        self.receiver.event_times.append((time.time(), "drop"))
+    def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
+        reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.conn_events.append(f"fail({reason})")
 
 
 class AgoraStreamReceiver:
+    """Captures raw H.264 video AND raw PCM audio from an Agora RTC channel."""
     def __init__(self, agora_uri: str, h264_path: Path, pcm_path: Path):
-        p = urllib.parse.urlparse(agora_uri)
-        qs = urllib.parse.parse_qs(p.query)
-        self.app_id = p.netloc or DEFAULT_AGORA_APP_ID
-        self.channel_name = p.path.lstrip("/")
+        parsed = urllib.parse.urlparse(agora_uri)
+        qs = urllib.parse.parse_qs(parsed.query)
+        self.app_id = parsed.netloc or DEFAULT_AGORA_APP_ID
+        self.channel_name = parsed.path.lstrip("/")
         self.token = (qs.get("token") or [""])[0]
         self.alt_token = (qs.get("alt_token") or [""])[0]
         self.uid = (qs.get("uid") or ["0"])[0]
@@ -1480,35 +1630,18 @@ class AgoraStreamReceiver:
         self.connect_rc: Any = None
         self.diag_flags: str = ""
         self.cb_error: str = ""
-        self.seg_video_frames = 0
-        self.seg_audio_frames = 0
-        self.seg_bytes = 0
-        self.seg_started_at = time.time()
-        self._need_keyframe = True
-        self.last_video_at = 0.0
-        self.event_times: List[Tuple[float, str]] = []
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
             return
         try:
-            data = bytes(image_buffer[:length]) if not isinstance(image_buffer, (bytes, bytearray)) \
-                else bytes(image_buffer[:length])
+            data = bytes(image_buffer[:length]) if not isinstance(image_buffer, (bytes, bytearray)) else image_buffer[:length]
             with self._io_lock:
-                if self._closed:
-                    return
-                self.last_frame_at = time.time()
-                if self._need_keyframe:
-                    if not is_h264_keyframe(data):
-                        return
-                    self._need_keyframe = False
-                    self.seg_started_at = time.time()
-                self.last_video_at = time.time()
-                self._h264_fh.write(data)
-                self.video_frames += 1
-                self.seg_video_frames += 1
-                self.bytes_written += len(data)
-                self.seg_bytes += len(data)
+                if not self._closed:
+                    self._h264_fh.write(data)
+                    self.video_frames += 1
+                    self.bytes_written += len(data)
+                    self.last_frame_at = time.time()
         except Exception as e:
             if not self.cb_error:
                 self.cb_error = f"video_write:{e}"
@@ -1528,155 +1661,141 @@ class AgoraStreamReceiver:
                 self.channels = int(ch)
             data = bytes(buf) if not isinstance(buf, (bytes, bytearray)) else buf
             with self._io_lock:
-                if self._closed:
-                    return
-                if self._need_keyframe or time.time() - self.last_video_at > 3.0:
-                    return
-                self._pcm_fh.write(data)
-                self.audio_frames += 1
-                self.seg_audio_frames += 1
-                self.bytes_written += len(data)
-                self.seg_bytes += len(data)
+                if not self._closed:
+                    self._pcm_fh.write(data)
+                    self.audio_frames += 1
+                    self.bytes_written += len(data)
+                    self.last_frame_at = time.time()
         except Exception:
             pass
-
-    def rotate(self, new_h264: Path, new_pcm: Path) -> Dict[str, Any]:
-        with self._io_lock:
-            old = {
-                "h264": self.h264_path, "pcm": self.pcm_path,
-                "video_frames": self.seg_video_frames, "audio_frames": self.seg_audio_frames,
-                "elapsed": max(1.0, time.time() - self.seg_started_at),
-                "sample_rate": self.sample_rate, "channels": self.channels,
-            }
-            for fh in (self._h264_fh, self._pcm_fh):
-                try:
-                    fh.flush()
-                    fh.close()
-                except Exception:
-                    pass
-            self.h264_path, self.pcm_path = new_h264, new_pcm
-            self._h264_fh = open(new_h264, "wb")
-            self._pcm_fh = open(new_pcm, "wb")
-            self.seg_video_frames = self.seg_audio_frames = self.seg_bytes = 0
-            self.seg_started_at = time.time()
-            self._need_keyframe = True
-        return old
-
-    def segment_snapshot(self) -> Dict[str, Any]:
-        with self._io_lock:
-            return {
-                "h264": self.h264_path, "pcm": self.pcm_path,
-                "video_frames": self.seg_video_frames, "audio_frames": self.seg_audio_frames,
-                "elapsed": max(1.0, time.time() - self.seg_started_at),
-                "sample_rate": self.sample_rate, "channels": self.channels,
-            }
 
     @staticmethod
     def _build_publish_config(svc: Any) -> Any:
-        import agora.rtc.agora_service as _svc  # type: ignore
-        import agora.rtc.agora_base as _base  # type: ignore
+        """Build the publish_config object required by agora-python-server-sdk 2.3/2.4+."""
+        import agora.rtc.agora_service as _ag_svc  # type: ignore
+        import agora.rtc.agora_base as _ag_base  # type: ignore
+
         pub_cls = None
+        # 1) Check type annotation on create_rtc_connection
         try:
             sig = inspect.signature(svc.create_rtc_connection)
-            prm = sig.parameters.get("publish_config")
-            if prm and prm.annotation not in (inspect.Parameter.empty, Any, None):
-                ann = prm.annotation
+            param = sig.parameters.get("publish_config")
+            if param and param.annotation not in (inspect.Parameter.empty, Any, None):
+                ann = param.annotation
                 if isinstance(ann, type):
                     pub_cls = ann
                 elif isinstance(ann, str):
-                    pub_cls = getattr(_svc, ann, None) or getattr(_base, ann, None)
+                    pub_cls = getattr(_ag_svc, ann, None) or getattr(_ag_base, ann, None)
         except Exception:
             pass
+
+        # 2) Fallback: search known class names across agora_service / agora_base / rtc_connection
         if pub_cls is None:
-            mods = [_svc, _base]
+            mods = [_ag_svc, _ag_base]
             try:
-                import agora.rtc.rtc_connection as _conn  # type: ignore
-                mods.append(_conn)
+                import agora.rtc.rtc_connection as _ag_conn  # type: ignore
+                mods.append(_ag_conn)
             except Exception:
                 pass
             for mod in mods:
-                for cn in ("RTCConnPublishConfig", "PublishConfig", "PublishConfigure"):
-                    cand = getattr(mod, cn, None)
+                for cname in ("RTCConnPublishConfig", "PublishConfig", "PublishConfigure"):
+                    cand = getattr(mod, cname, None)
                     if isinstance(cand, type):
                         pub_cls = cand
                         break
                 if pub_cls is not None:
                     break
+
         if pub_cls is None:
             return None
-        cfg = pub_cls()
-        for a in ("is_publish_audio", "is_publish_video", "publish_audio", "publish_video"):
-            if hasattr(cfg, a):
-                setattr(cfg, a, False)
-        if hasattr(cfg, "audio_scenario"):
+
+        pub_cfg = pub_cls()
+        # Audience recorder: do not publish outbound audio/video
+        for attr in ("is_publish_audio", "is_publish_video", "publish_audio", "publish_video"):
+            if hasattr(pub_cfg, attr):
+                setattr(pub_cfg, attr, False)
+        if hasattr(pub_cfg, "audio_scenario"):
             try:
-                cfg.audio_scenario = AudioScenarioType.AUDIO_SCENARIO_CHORUS
+                pub_cfg.audio_scenario = AudioScenarioType.AUDIO_SCENARIO_CHORUS
             except Exception:
                 pass
-        return cfg
+        return pub_cfg
 
     def connect(self) -> None:
         svc = AgoraServiceManager.get_service(self.app_id)
-        cc = RTCConnConfig(
+        conn_cfg = RTCConnConfig(
             client_role_type=ClientRoleType.CLIENT_ROLE_AUDIENCE,
             channel_profile=ChannelProfileType.CHANNEL_PROFILE_LIVE_BROADCASTING,
         )
-        for a, v in (("auto_subscribe_audio", 1), ("auto_subscribe_video", 1),
-                     ("enable_audio_recording_or_playout", 1)):
-            if hasattr(cc, a):
+        for attr, val in (
+            ("auto_subscribe_audio", 1),
+            ("auto_subscribe_video", 1),
+            ("enable_audio_recording_or_playout", 1),
+        ):
+            if hasattr(conn_cfg, attr):
                 try:
-                    setattr(cc, a, v)
+                    setattr(conn_cfg, attr, val)
                 except Exception:
                     pass
-        params = inspect.signature(svc.create_rtc_connection).parameters
-        if len(params) >= 2:
-            self._conn = svc.create_rtc_connection(cc, self._build_publish_config(svc))
+        # Support both SDK 2.2 (1 arg) and SDK 2.3/2.4+ (2 args: conn_cfg, publish_config)
+        sig_params = inspect.signature(svc.create_rtc_connection).parameters
+        if len(sig_params) >= 2:
+            pub_cfg = self._build_publish_config(svc)
+            self._conn = svc.create_rtc_connection(conn_cfg, pub_cfg)
         else:
-            self._conn = svc.create_rtc_connection(cc)
+            self._conn = svc.create_rtc_connection(conn_cfg)
 
         self._video_obs = _VideoEncodedObserver(self)
         self._audio_obs = _AudioPcmObserver(self)
 
-        lu = self._conn.get_local_user() if hasattr(self._conn, "get_local_user") else None
-        if lu is not None:
-            if hasattr(lu, "set_user_role"):
-                lu.set_user_role(ClientRoleType.CLIENT_ROLE_AUDIENCE)
-            if hasattr(lu, "subscribe_all_audio"):
-                lu.subscribe_all_audio()
-            if hasattr(lu, "subscribe_all_video"):
+        local_user = self._conn.get_local_user() if hasattr(self._conn, "get_local_user") else None
+        if local_user is not None:
+            if hasattr(local_user, "set_user_role"):
+                local_user.set_user_role(ClientRoleType.CLIENT_ROLE_AUDIENCE)
+            if hasattr(local_user, "subscribe_all_audio"):
+                local_user.subscribe_all_audio()
+            if hasattr(local_user, "subscribe_all_video"):
                 try:
-                    so = VideoSubscriptionOptions(
-                        type=VideoStreamType.VIDEO_STREAM_HIGH, encoded_frame_only=1)
+                    sub_opts = VideoSubscriptionOptions(
+                        type=VideoStreamType.VIDEO_STREAM_HIGH,
+                        encoded_frame_only=1,
+                    )
                 except TypeError:
-                    so = VideoSubscriptionOptions()
-                    if hasattr(so, "type"):
-                        so.type = VideoStreamType.VIDEO_STREAM_HIGH
-                    if hasattr(so, "encoded_frame_only"):
-                        so.encoded_frame_only = 1
-                    elif hasattr(so, "encodedFrameOnly"):
-                        so.encodedFrameOnly = 1
-                lu.subscribe_all_video(so)
-            if hasattr(lu, "set_playback_audio_frame_before_mixing_parameters"):
-                lu.set_playback_audio_frame_before_mixing_parameters(self.channels, self.sample_rate)
-            if hasattr(lu, "register_video_encoded_frame_observer"):
-                lu.register_video_encoded_frame_observer(self._video_obs)
-            elif hasattr(lu, "set_encoded_video_frame_observer"):
-                lu.set_encoded_video_frame_observer(self._video_obs)
+                    sub_opts = VideoSubscriptionOptions()
+                    if hasattr(sub_opts, "type"):
+                        sub_opts.type = VideoStreamType.VIDEO_STREAM_HIGH
+                    if hasattr(sub_opts, "encoded_frame_only"):
+                        sub_opts.encoded_frame_only = 1
+                    elif hasattr(sub_opts, "encodedFrameOnly"):
+                        sub_opts.encodedFrameOnly = 1
+                local_user.subscribe_all_video(sub_opts)
+
+            if hasattr(local_user, "set_playback_audio_frame_before_mixing_parameters"):
+                local_user.set_playback_audio_frame_before_mixing_parameters(self.channels, self.sample_rate)
+
+            # Register video encoded frame observer (supports both 2.2 and 2.4 method names)
+            if hasattr(local_user, "register_video_encoded_frame_observer"):
+                local_user.register_video_encoded_frame_observer(self._video_obs)
+            elif hasattr(local_user, "set_encoded_video_frame_observer"):
+                local_user.set_encoded_video_frame_observer(self._video_obs)
             elif hasattr(self._conn, "register_video_encoded_frame_observer"):
                 self._conn.register_video_encoded_frame_observer(self._video_obs)
             elif hasattr(self._conn, "set_encoded_video_frame_observer"):
                 self._conn.set_encoded_video_frame_observer(self._video_obs)
 
-            reg = (getattr(lu, "register_audio_frame_observer", None)
-                   or getattr(self._conn, "register_audio_frame_observer", None))
-            if reg is not None:
-                n = len(inspect.signature(reg).parameters)
-                if n >= 3:
-                    reg(self._audio_obs, 0, None)
-                elif n == 2:
-                    reg(self._audio_obs, 0)
+            # Register audio frame observer (SDK 2.4+ requires enable_vad and vad_configure)
+            reg_fn = (
+                getattr(local_user, "register_audio_frame_observer", None)
+                or getattr(self._conn, "register_audio_frame_observer", None)
+            )
+            if reg_fn is not None:
+                n_params = len(inspect.signature(reg_fn).parameters)
+                if n_params >= 3:
+                    reg_fn(self._audio_obs, 0, None)
+                elif n_params == 2:
+                    reg_fn(self._audio_obs, 0)
                 else:
-                    reg(self._audio_obs)
+                    reg_fn(self._audio_obs)
         else:
             if hasattr(self._conn, "subscribe_all_audio"):
                 try:
@@ -1685,25 +1804,25 @@ class AgoraStreamReceiver:
                     pass
             if hasattr(self._conn, "subscribe_all_video"):
                 try:
-                    so = VideoSubscriptionOptions()
-                    if hasattr(so, "type"):
-                        so.type = VideoStreamType.VIDEO_STREAM_HIGH
-                    if hasattr(so, "encoded_frame_only"):
-                        so.encoded_frame_only = 1
-                    elif hasattr(so, "encodedFrameOnly"):
-                        so.encodedFrameOnly = 1
-                    self._conn.subscribe_all_video(so)
+                    sub_opts = VideoSubscriptionOptions()
+                    if hasattr(sub_opts, "type"):
+                        sub_opts.type = VideoStreamType.VIDEO_STREAM_HIGH
+                    if hasattr(sub_opts, "encoded_frame_only"):
+                        sub_opts.encoded_frame_only = 1
+                    elif hasattr(sub_opts, "encodedFrameOnly"):
+                        sub_opts.encodedFrameOnly = 1
+                    self._conn.subscribe_all_video(sub_opts)
                 except Exception:
                     pass
-            reg = getattr(self._conn, "register_audio_frame_observer", None)
-            if reg is not None:
-                n = len(inspect.signature(reg).parameters)
-                if n >= 3:
-                    reg(self._audio_obs, 0, None)
-                elif n == 2:
-                    reg(self._audio_obs, 0)
+            reg_fn = getattr(self._conn, "register_audio_frame_observer", None)
+            if reg_fn is not None:
+                n_params = len(inspect.signature(reg_fn).parameters)
+                if n_params >= 3:
+                    reg_fn(self._audio_obs, 0, None)
+                elif n_params == 2:
+                    reg_fn(self._audio_obs, 0)
                 else:
-                    reg(self._audio_obs)
+                    reg_fn(self._audio_obs)
             if hasattr(self._conn, "register_video_encoded_frame_observer"):
                 self._conn.register_video_encoded_frame_observer(self._video_obs)
             elif hasattr(self._conn, "set_encoded_video_frame_observer"):
@@ -1717,22 +1836,32 @@ class AgoraStreamReceiver:
                 self.conn_events.append(f"obs_err:{e}")
 
         v_methods = [m for m in dir(self._conn) if "video" in m.lower() or "subscrib" in m.lower()][:6]
-        self.diag_flags = f"lu={lu is not None},vm={v_methods}"
+        self.diag_flags = f"lu={local_user is not None},vm={v_methods}"
         self.connect_rc = self._conn.connect(self.token, self.channel_name, str(self.uid))
         self.started_at = time.time()
         self.last_frame_at = time.time()
+
+    def estimated_fps(self) -> float:
+        elapsed = max(1.0, self.last_frame_at - self.started_at)
+        if self.video_frames < 10:
+            return 25.0
+        return max(12.0, min(60.0, self.video_frames / elapsed))
 
     def close(self) -> None:
         with self._io_lock:
             if self._closed:
                 return
             self._closed = True
-            for fh in (self._h264_fh, self._pcm_fh):
-                try:
-                    fh.flush()
-                    fh.close()
-                except Exception:
-                    pass
+            try:
+                self._h264_fh.flush()
+                self._h264_fh.close()
+            except Exception:
+                pass
+            try:
+                self._pcm_fh.flush()
+                self._pcm_fh.close()
+            except Exception:
+                pass
         if self._conn is not None:
             try:
                 self._conn.disconnect()
@@ -1741,8 +1870,9 @@ class AgoraStreamReceiver:
                 pass
             self._conn = None
 
+
 # ==============================================================================
-# RECORDING MANAGER
+# RECORDING MANAGER (Unlimited Multi-Stream, Auto-Upload up to 2 GB via Telethon)
 # ==============================================================================
 
 @dataclass
@@ -1753,427 +1883,280 @@ class ActiveRecording:
     stream_url: str
     db_rec_id: int
     chat_id: int
-    triggered_by: str = "watchlist"
     started_at: float = field(default_factory=time.time)
-    seg_started_at: float = field(default_factory=time.time)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    split_event: asyncio.Event = field(default_factory=asyncio.Event)
-    status_text: str = "در حال اتصال..."
+    status_text: str = "در حال ضبط..."
     bytes_written: int = 0
     part_number: int = 1
     task: Optional[asyncio.Task] = None
     agora_diag: str = ""
-    manual_stop: bool = False
-    uploads_pending: int = 0
-    upload_status: str = ""
-    uploaded_parts: int = 0
-    uploaded_duration: int = 0
-    uploaded_bytes: int = 0
-    connected: bool = False
-    client: Any = None
 
 
 class RecordingManager:
-    def __init__(self, bot: TelegramClient, db: Database, pool: AccountPool):
+    def __init__(self, bot: TelegramClient, db: Database, api: SuperLiveClient):
         self.bot = bot
         self.db = db
-        self.pool = pool
-        self.api = pool.primary
-        self.busy: Dict[int, str] = {}
+        self.api = api
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
-        self.manually_stopped_ls: Dict[str, str] = {}
-        self._upload_sem = asyncio.Semaphore(MAX_PARALLEL_UPLOADS)
-        self._start_lock = asyncio.Lock()
-        self.on_change: Any = None
 
-    def _changed(self) -> None:
-        if self.on_change:
-            try:
-                self.on_change()
-            except Exception:
-                log.debug("on_change failed", exc_info=True)
+    def max_concurrent(self) -> int:
+        raw = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
+        return int(raw) if raw.isdigit() else DEFAULT_MAX_CONCURRENT
 
     def is_recording(self, creator_id: str) -> bool:
         return str(creator_id) in self.active
 
-    def accounts(self) -> List[SuperLiveClient]:
-        return self.pool.usable() or [self.pool.primary]
-
-    def free_account(self) -> Optional[SuperLiveClient]:
-        if len(self.active) >= self.max_concurrent():
-            return None
-        for c in self.accounts():
-            if c.has_token() and c.slot not in self.busy:
-                return c
-        return None
-
-    def max_concurrent(self) -> int:
-        return min(len(self.accounts()), DEFAULT_MAX_CONCURRENT)
-
-    def has_capacity(self) -> bool:
-        return self.free_account() is not None
-
-    def split_seconds(self) -> int:
-        raw = self.db.get_setting("split_minutes", "0")
-        return int(raw) * 60 if raw.isdigit() else 0
-
-    def part_cap_bytes(self) -> int:
-        raw = self.db.get_setting("part_mb", str(MAX_SINGLE_FILE_BYTES // (1024 * 1024)))
-        mb = int(raw) if raw.isdigit() else 1900
-        return max(50, min(1950, mb)) * 1024 * 1024
-
-    def notify_ttl(self) -> int:
-        raw = self.db.get_setting("notify_ttl", "60")
-        return int(raw) if raw.isdigit() else 60
-
-    async def start_recording(self, info: CreatorStreamInfo, chat_id: int,
-                              triggered_by: str = "watchlist") -> Tuple[bool, str]:
-        cid = str(info.creator_id)
+    async def start_recording(
+        self,
+        stream_info: CreatorStreamInfo,
+        chat_id: int,
+        triggered_by: str = "watchlist",
+    ) -> Tuple[bool, str]:
+        cid = str(stream_info.creator_id)
         if cid in self.active:
-            return False, f"⏺ <b>{html.escape(info.display_name or cid)}</b> همین الان در حال ضبطه."
+            return False, f"استریم <b>{html.escape(stream_info.display_name or cid)}</b> همین الان در حال ضبط هست."
         if triggered_by == "watchlist":
-            if time.time() < self._fail_cooldown.get(cid, 0.0):
+            cd_until = self._fail_cooldown.get(cid, 0.0)
+            if time.time() < cd_until:
                 return False, "cooldown"
-            if info.livestream_id and self.manually_stopped_ls.get(cid) == info.livestream_id:
-                return False, "manually stopped"
-        else:
-            self.manually_stopped_ls.pop(cid, None)
 
-        async with self._start_lock:
-            client = self.free_account()
-            if client is None:
-                return False, (f"⚠️ همه {self.max_concurrent()} اکانت مشغول ضبطن. "
-                               f"از ⚙️ تنظیمات › 👥 اکانت‌ها یه اکانت دیگه اضافه کن.")
-            self.busy[client.slot] = cid
+        limit = self.max_concurrent()
+        if limit > 0 and len(self.active) >= limit:
+            return False, f"سقف ضبط هم‌زمان ({limit} استریم) پر شده. از /settings می‌تونی بیشترش کنی یا 0 (نامحدود) بذاری."
 
-        try:
-            try:
-                fresh = await client.check_creator_and_get_stream(cid)
-            except Exception as e:
-                fresh = None
-                log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
-            if not fresh or not fresh.is_live or not fresh.stream_url:
-                if not fresh:
-                    return False, "⚠️ ارتباط با SuperLive برقرار نشد."
-                if not fresh.is_live:
-                    return False, "⚫ این استریمر الان لایو نیست."
-                d = fresh.raw_debug
-                reason = ""
-                for k in ("enter_sample", "retrieve_sample"):
-                    m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get(k, "")))
-                    if m and m.group(1) not in ("null", '""'):
-                        reason = m.group(1).strip('"')
-                        break
-                if "private" in reason:
-                    return False, ("🔒 این لایو الان <b>خصوصی</b> شده و سرور فقط به کسایی که "
-                                   "پرداخت کردن اجازه ورود میده.")
-                return False, (
-                    "⚠️ لایو روشنه ولی اطلاعات اتصال (Agora) داده نشد.\n"
-                    f"• Retrieve/Enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code>"
-                    + (f"\n• دلیل سرور: <code>{html.escape(reason)}</code>" if reason else "")
-                    + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
-                    + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
-                )
-            fresh.display_name = fresh.display_name or info.display_name
-            info = fresh
-            cid = str(info.creator_id or cid)
-            if cid in self.active:
-                return False, "⏺ همین الان در حال ضبطه."
-            self.busy[client.slot] = cid
+        _, free_mb, _ = get_disk_stats()
+        if free_mb < MIN_FREE_DISK_MB:
+            return False, f"فضای خالی دیسک کمه ({free_mb:.0f} MB). برای جلوگیری از کرش سرور، ضبط جدید متوقف شد."
 
-            _, free_mb, _ = get_disk_stats()
-            err = ""
-            if free_mb < MIN_FREE_DISK_MB:
-                err = f"💽 فضای خالی دیسک کمه ({free_mb:.0f} MB)؛ ضبط جدید شروع نشد."
-            elif info.stream_url.startswith("agora://") and not AGORA_AVAILABLE:
-                err = "پکیج agora-python-server-sdk روی سرور نصب نیست."
-            elif not FFMPEG_BIN:
-                err = "FFmpeg روی سرور پیدا نشد."
-            if err:
-                return False, err
+        if not stream_info.stream_url:
+            return False, "لینک استریم یا اطلاعات کانال Agora برای این لایو پیدا نشد."
 
-            cname = info.display_name or info.username or cid
-            db_rec_id = self.db.create_recording_record(cid, cname, info.livestream_id)
-            rec = ActiveRecording(
-                creator_id=cid, creator_name=cname,
-                livestream_id=info.livestream_id, stream_url=info.stream_url,
-                db_rec_id=db_rec_id, chat_id=chat_id, triggered_by=triggered_by,
-            )
-            rec.client = client
-            self.active[cid] = rec
-            rec.task = asyncio.create_task(self._run_recording_lifecycle(rec))
-            self._changed()
-            return True, f"⏺ ضبط <b>{html.escape(cname)}</b> با {html.escape(client.label)} شروع شد."
-        finally:
-            # Release account if recording never registered (error path or race)
-            if self.busy.get(client.slot) == cid and cid not in self.active:
-                self.busy.pop(client.slot, None)
+        if stream_info.stream_url.startswith("agora://") and not AGORA_AVAILABLE:
+            return False, f"این لایو از نوع Agora هست ولی پکیج `agora-python-server-sdk` روی سرور نصب نیست."
+
+        if not FFMPEG_BIN:
+            return False, "ابزار FFmpeg روی سرور پیدا نشد (پکیج `imageio-ffmpeg` رو نصب کن)."
+
+        cname = stream_info.display_name or stream_info.username or cid
+        db_rec_id = self.db.create_recording_record(cid, cname, stream_info.livestream_id)
+        rec = ActiveRecording(
+            creator_id=cid,
+            creator_name=cname,
+            livestream_id=stream_info.livestream_id,
+            stream_url=stream_info.stream_url,
+            db_rec_id=db_rec_id,
+            chat_id=chat_id,
+        )
+        self.active[cid] = rec
+        rec.task = asyncio.create_task(self._run_recording_lifecycle(rec, triggered_by))
+        return True, f"🔴 ضبط لایو <b>{html.escape(cname)}</b> (ID: <code>{cid}</code>) شروع شد!"
 
     async def stop_recording(self, creator_id: str) -> bool:
         rec = self.active.get(str(creator_id))
         if not rec:
             return False
-        rec.manual_stop = True
-        if rec.livestream_id:
-            self.manually_stopped_ls[rec.creator_id] = rec.livestream_id
-        rec.status_text = "در حال پایان ضبط و ارسال..."
+        rec.status_text = "در حال توقف و آماده‌سازی فایل..."
         rec.stop_event.set()
-        self._changed()
-        return True
-
-    async def split_recording(self, creator_id: str) -> bool:
-        rec = self.active.get(str(creator_id))
-        if not rec:
-            return False
-        rec.split_event.set()
         return True
 
     async def stop_all(self) -> int:
-        n = 0
+        count = 0
         for rec in list(self.active.values()):
             rec.stop_event.set()
-            n += 1
-        return n
+            count += 1
+        return count
 
-    async def _run_recording_lifecycle(self, rec: ActiveRecording) -> None:
+    async def _run_recording_lifecycle(self, rec: ActiveRecording, triggered_by: str) -> None:
+        notify_on = self.db.get_setting("notify_live", "1") == "1"
+        status_msg = None
+        if notify_on:
+            try:
+                badge = "👀 واچ‌لیست" if triggered_by == "watchlist" else "🎬 ضبط دستی"
+                status_msg = await self.bot.send_message(
+                    rec.chat_id,
+                    (
+                        f"🔴 <b>شروع ضبط لایو ({badge})</b>\n"
+                        f"👤 استریمر: <b>{html.escape(rec.creator_name)}</b> (<code>{rec.creator_id}</code>)\n"
+                        f"📡 پروتکل: <code>{'Agora RTC' if rec.stream_url.startswith('agora://') else 'HLS/FFmpeg'}</code>\n"
+                        f"⏳ وضعیت: در حال ضبط پیوسته (تا سقف 2GB بدون تکه‌تکه شدن)..."
+                    ),
+                    parse_mode="html",
+                    buttons=[[Button.inline("⏹ توقف و ارسال همین الان", data=f"stop:{rec.creator_id}")]],
+                )
+            except Exception as e:
+                log.warning("Failed sending start notice: %s", e)
+
         work_dir = RECORDINGS_DIR / f"{sanitize_filename(rec.creator_name)}_{rec.creator_id}_{int(rec.started_at)}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        upload_lock = asyncio.Lock()
-        upload_tasks: set = set()
-        upload_failures: List[str] = []
         final_status = "completed"
+        total_duration = 0
+        total_size = 0
+        last_msg_id = 0
+        last_arch_chat = 0
+        last_arch_msg = 0
         notes = ""
 
-        def enqueue(coro_factory: Any) -> None:
-            rec.uploads_pending += 1
-
-            async def _job() -> None:
-                try:
-                    async with upload_lock:
-                        await coro_factory()
-                except Exception as e:
-                    upload_failures.append(str(e)[:250])
-                    log.exception("Upload job failed for %s: %s", rec.creator_id, e)
-                finally:
-                    rec.uploads_pending -= 1
-                    self._changed()
-
-            t = asyncio.create_task(_job())
-            upload_tasks.add(t)
-            t.add_done_callback(upload_tasks.discard)
-
         try:
-            restarts = 0
             while not rec.stop_event.is_set():
-                parts_before = rec.part_number
-                try:
-                    if rec.stream_url.startswith("agora://"):
-                        await self._agora_session(rec, work_dir, enqueue)
-                    else:
-                        await self._ffmpeg_session(rec, work_dir, enqueue)
-                except Exception as e:
-                    log.exception("Session error for %s: %s", rec.creator_id, e)
-                if rec.stop_event.is_set():
-                    break
-                if rec.part_number > parts_before:
-                    restarts = 0
-                try:
-                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id)
-                except Exception:
-                    info = None
-                if info and info.is_live and info.stream_url and restarts < 10:
-                    restarts += 1
-                    rec.stream_url = info.stream_url
-                    rec.livestream_id = info.livestream_id or rec.livestream_id
-                    rec.status_text = f"اتصال مجدد ({restarts})..."
-                    log.info("Reconnecting %s (attempt %d)", rec.creator_id, restarts)
-                    await asyncio.sleep(min(10, 2 + restarts))
-                    continue
-                break
-        except Exception as e:
-            final_status = "error"
-            notes = str(e)[:300]
-            self._fail_cooldown[rec.creator_id] = time.time() + 180.0
-            log.exception("Recording failed for %s", rec.creator_id)
-        finally:
-            try:
-                rec.status_text = "در حال ارسال پارت‌های باقیمانده..."
-                self._changed()
-            except Exception:
-                pass
+                part_mp4 = work_dir / f"{sanitize_filename(rec.creator_name)}_part{rec.part_number}.mp4"
+                if rec.stream_url.startswith("agora://"):
+                    captured_ok, reached_size_cap = await self._capture_agora_part(rec, work_dir, part_mp4)
+                else:
+                    captured_ok, reached_size_cap = await self._capture_ffmpeg_part(rec, part_mp4)
 
-            try:
-                while upload_tasks:
-                    await asyncio.gather(*list(upload_tasks), return_exceptions=True)
-            except Exception as e:
-                log.warning("Awaiting uploads failed: %s", e)
+                if captured_ok and part_mp4.exists() and part_mp4.stat().st_size > 10_000:
+                    dur, _, _ = await asyncio.to_thread(probe_video_metadata, part_mp4)
+                    fsize = part_mp4.stat().st_size
+                    total_duration += dur
+                    total_size += fsize
+                    msg_id, arch_chat, arch_msg = await self._upload_part_to_telegram(
+                        rec, part_mp4, dur, status_msg
+                    )
+                    last_msg_id = msg_id or last_msg_id
+                    last_arch_chat = arch_chat or last_arch_chat
+                    last_arch_msg = arch_msg or last_arch_msg
 
-            try:
-                if rec.uploaded_parts == 0 and final_status == "completed":
-                    final_status = "empty"
-                    self._fail_cooldown[rec.creator_id] = time.time() + 180.0
-                    notes = rec.agora_diag or "no data"
-                    log.info("Empty recording for %s (%s): %s",
-                             rec.creator_id, rec.triggered_by, notes)
-                    if rec.triggered_by == "manual" and not rec.manual_stop:
+                    # Cleanup uploaded part immediately if auto_delete enabled (protects 10 GiB disk)
+                    if self.db.get_setting("auto_delete", "1") == "1":
                         try:
-                            m = await self.bot.send_message(
-                                rec.chat_id,
-                                f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).",
-                                parse_mode="html",
-                            )
-                            schedule_delete(m, 15)
+                            part_mp4.unlink(missing_ok=True)
                         except Exception:
                             pass
-                elif rec.uploaded_parts > 0:
-                    try:
-                        self.db.increment_recordings(rec.creator_id)
-                    except Exception:
-                        pass
-                    try:
-                        m = await self.bot.send_message(
-                            rec.chat_id,
-                            f"✅ ضبط <b>{html.escape(rec.creator_name)}</b> تموم شد · "
-                            f"{rec.uploaded_parts} پارت · {fmt_duration(rec.uploaded_duration)} · "
-                            f"{fmt_bytes(rec.uploaded_bytes)}",
-                            parse_mode="html",
-                        )
-                        schedule_delete(m, self.notify_ttl())
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.warning("Post-lifecycle notification failed: %s", e)
 
-            try:
-                if upload_failures:
-                    final_status = "upload_failed" if rec.uploaded_parts == 0 else "partial_upload"
-                    notes = (notes + " | " if notes else "") + \
-                        "Upload failed; local files retained: " + "; ".join(upload_failures[:3])
-                    log.error("Retaining local files after upload failure: %s", work_dir)
-            except Exception:
-                pass
+                if reached_size_cap and not rec.stop_event.is_set():
+                    rec.part_number += 1
+                    continue
+                break
 
+            if total_size == 0:
+                final_status = "empty"
+                self._fail_cooldown[rec.creator_id] = time.time() + 180.0
+                notes = "هیچ فریم ویدیویی/صوتی دریافت نشد (ممکن است لایو بسته شده یا خصوصی باشد)."
+                await self.bot.send_message(
+                    rec.chat_id,
+                    (
+                        f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> تمام شد ولی دیتایی دریافت نشد.\n"
+                        f"📊 جزئیات فنی: <code>{html.escape(rec.status_text)}</code>"
+                    ),
+                    parse_mode="html",
+                )
+        except Exception as e:
+            final_status = "error"
+            self._fail_cooldown[rec.creator_id] = time.time() + 180.0
+            notes = str(e)[:300]
+            log.exception("Recording failed for %s", rec.creator_id)
             try:
-                self.db.finish_recording_record(
-                    rec.db_rec_id, status=final_status,
-                    duration_sec=rec.uploaded_duration, file_size_bytes=rec.uploaded_bytes,
-                    tg_chat_id=rec.chat_id, notes=notes,
+                await self.bot.send_message(
+                    rec.chat_id,
+                    f"❌ خطا در ضبط <b>{html.escape(rec.creator_name)}</b>:\n<code>{html.escape(str(e)[:300])}</code>",
+                    parse_mode="html",
                 )
             except Exception:
-                log.exception("Failed to finalize recording record")
-
-            try:
-                self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
-            except Exception:
                 pass
-
-            try:
-                self.active.pop(rec.creator_id, None)
-            except Exception:
-                pass
-            try:
-                if rec.client is not None and self.busy.get(rec.client.slot) == rec.creator_id:
-                    self.busy.pop(rec.client.slot, None)
-            except Exception:
-                pass
-            try:
-                if not upload_failures:
-                    shutil.rmtree(work_dir, ignore_errors=True)
-            except Exception:
-                pass
-            self._changed()
-
-    def _should_split(self, rec: ActiveRecording, seg_bytes: int) -> bool:
-        if rec.split_event.is_set():
-            rec.split_event.clear()
-            return True
-        if seg_bytes >= self.part_cap_bytes():
-            return True
-        sp = self.split_seconds()
-        if sp > 0 and time.time() - rec.seg_started_at >= sp:
-            return True
-        return False
-
-    async def _ffmpeg_session(self, rec: ActiveRecording, work_dir: Path, enqueue: Any) -> None:
-        while True:
-            part_no = rec.part_number
-            out = work_dir / f"{sanitize_filename(rec.creator_name)}_part{part_no}.mp4"
-            cmd = [FFMPEG_BIN or "ffmpeg", "-y", "-loglevel", "error"]
-            if rec.stream_url.lower().startswith(("http://", "https://")):
-                cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-            cmd += ["-i", rec.stream_url, "-c", "copy",
-                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(out)]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        finally:
+            self.db.finish_recording_record(
+                rec.db_rec_id,
+                status=final_status,
+                duration_sec=total_duration,
+                file_size_bytes=total_size,
+                tg_chat_id=rec.chat_id,
+                tg_message_id=last_msg_id,
+                archive_chat_id=last_arch_chat,
+                archive_message_id=last_arch_msg,
+                notes=notes,
             )
-            rec.seg_started_at = time.time()
-            rec.connected = True
-            rec.status_text = "در حال ضبط"
-            self._changed()
-            split = False
-            try:
-                while proc.returncode is None:
-                    if rec.stop_event.is_set():
-                        break
-                    sz = out.stat().st_size if out.exists() else 0
+            if final_status == "completed":
+                self.db.update_watch_status(
+                    rec.creator_id,
+                    "offline",
+                    display_name=rec.creator_name,
+                    increment_recordings=True,
+                )
+            self.active.pop(rec.creator_id, None)
+            if self.db.get_setting("auto_delete", "1") == "1" and final_status != "error":
+                shutil.rmtree(work_dir, ignore_errors=True)
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+    async def _capture_ffmpeg_part(self, rec: ActiveRecording, output_mp4: Path) -> Tuple[bool, bool]:
+        """Record HLS/FLV/RTMP directly with FFmpeg (-c copy, no re-encoding)."""
+        cmd = [FFMPEG_BIN or "ffmpeg", "-y"]
+        if rec.stream_url.lower().startswith(("http://", "https://")):
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        cmd += [
+            "-i", rec.stream_url,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(output_mp4),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=open(output_mp4.with_suffix(".ffmpeg.log"), "wb"),
+        )
+        reached_size_cap = False
+        try:
+            while proc.returncode is None:
+                if rec.stop_event.is_set():
+                    break
+                if output_mp4.exists():
+                    sz = output_mp4.stat().st_size
                     rec.bytes_written = sz
-                    if self._should_split(rec, sz):
-                        split = True
+                    if sz >= MAX_SINGLE_FILE_BYTES:
+                        reached_size_cap = True
                         break
-                    _, free_mb, _ = get_disk_stats()
-                    if free_mb < MIN_FREE_DISK_MB:
-                        rec.stop_event.set()
-                        break
+                _, free_mb, _ = get_disk_stats()
+                if free_mb < MIN_FREE_DISK_MB:
+                    log.warning("Disk low (%.0f MB free) - finalizing %s", free_mb, rec.creator_id)
+                    rec.stop_event.set()
+                    break
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            if proc.returncode is None:
+                try:
+                    if proc.stdin:
+                        proc.stdin.write(b"q\n")
+                        await proc.stdin.drain()
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except Exception:
+                    proc.terminate()
                     try:
-                        await asyncio.wait_for(proc.wait(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        pass
-            finally:
-                if proc.returncode is None:
-                    try:
-                        if proc.stdin:
-                            proc.stdin.write(b"q\n")
-                            await proc.stdin.drain()
-                        await asyncio.wait_for(proc.wait(), timeout=10.0)
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except Exception:
-                        try:
-                            proc.terminate()
-                            await asyncio.wait_for(proc.wait(), timeout=5.0)
-                        except Exception:
-                            proc.kill()
-            if out.exists() and out.stat().st_size > 10_000:
-                enqueue(lambda p=out, n=part_no: self._upload_job(rec, p, n))
-                rec.part_number += 1
-            if split and not rec.stop_event.is_set():
-                continue
-            return
+                        proc.kill()
+        return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
 
-    async def _agora_session(self, rec: ActiveRecording, work_dir: Path, enqueue: Any) -> None:
-        def seg_paths(n: int) -> Tuple[Path, Path]:
-            return work_dir / f"raw_p{n}.h264", work_dir / f"raw_p{n}.pcm"
-
-        h264_file, pcm_file = seg_paths(rec.part_number)
+    async def _capture_agora_part(
+        self, rec: ActiveRecording, work_dir: Path, output_mp4: Path
+    ) -> Tuple[bool, bool]:
+        """Record Agora RTC stream (H.264 video + PCM audio) and mux cleanly into MP4."""
+        h264_file = work_dir / f"raw_p{rec.part_number}.h264"
+        pcm_file = work_dir / f"raw_p{rec.part_number}.pcm"
         receiver = AgoraStreamReceiver(rec.stream_url, h264_file, pcm_file)
+        reached_size_cap = False
 
+        # Try candidate UIDs / tokens quickly if Agora returns fail(8) (INVALID_TOKEN / UID mismatch)
         attempts: List[Tuple[str, str]] = [(receiver.token, u) for u in receiver.uid_candidates]
         if receiver.alt_token:
             attempts.extend((receiver.alt_token, u) for u in receiver.uid_candidates)
 
         connected_ok = False
-        last_attempt = False
-        for idx, (tok, uid) in enumerate(attempts):
+        for idx, (tok_try, uid_try) in enumerate(attempts):
             if rec.stop_event.is_set():
                 break
-            receiver.token = tok
-            receiver.uid = uid
+            receiver.token = tok_try
+            receiver.uid = uid_try
             receiver.conn_events.clear()
-            try:
-                await asyncio.to_thread(receiver.connect)
-            except Exception as e:
-                log.warning("Agora connect error (attempt %d): %s", idx, e)
-                continue
+            await asyncio.to_thread(receiver.connect)
+            # Wait up to 4.5s for connected or fail(8)
             for _ in range(9):
                 await asyncio.sleep(0.5)
                 if "connected" in receiver.conn_events or receiver.video_frames > 0 or receiver.audio_frames > 0:
@@ -2181,10 +2164,9 @@ class RecordingManager:
                     break
                 if any(ev.startswith("fail(") or ev.startswith("disconn(") for ev in receiver.conn_events):
                     break
-            last_attempt = idx == len(attempts) - 1
-            if connected_ok or last_attempt:
+            if connected_ok or idx == len(attempts) - 1:
                 break
-            # Clean disconnect between attempts
+            # Disconnect failed attempt cleanly before trying next UID/token
             if receiver._conn is not None:
                 try:
                     await asyncio.to_thread(receiver._conn.disconnect)
@@ -2193,212 +2175,210 @@ class RecordingManager:
                     pass
                 receiver._conn = None
 
-        rec.connected = connected_ok
-        rec.status_text = "در حال ضبط" if connected_ok else "اتصال ناموفق"
-        rec.seg_started_at = time.time()
-        self._changed()
-        session_start = time.time()
-        receiver.event_times.clear()
         try:
             while not rec.stop_event.is_set():
-                await asyncio.sleep(1.0)
-                if connected_ok and receiver.event_times:
-                    log.warning("Agora drop for %s: %s", rec.creator_id, receiver.conn_events[-3:])
-                    rec.status_text = "اتصال قطع شد، اتصال مجدد..."
+                await asyncio.sleep(2.0)
+                rec.bytes_written = receiver.bytes_written
+
+                # Fast-exit if Agora rejected all token/UID candidates
+                if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
                     break
-                if not connected_ok:
-                    log.warning("Agora never connected for %s: %s",
-                                rec.creator_id, receiver.conn_events[-4:])
-                    rec.status_text = "اتصال برقرار نشد"
+                # Auto-stop when broadcaster stops sending frames
+                idle = time.time() - receiver.last_frame_at
+                if idle >= AGORA_INACTIVITY_TIMEOUT:
+                    log.info("Agora stream %s inactive for %.0fs, finishing.", rec.creator_id, idle)
                     break
-                if receiver.video_frames == 0 and time.time() - session_start >= 25:
-                    log.warning("No video for %s after 25s: %s",
-                                rec.creator_id, receiver.conn_events[-4:])
-                    rec.status_text = "تصویری دریافت نشد"
+
+                # Roll over before hitting Telegram's 2 GB MTProto cap
+                if receiver.bytes_written >= MAX_SINGLE_FILE_BYTES:
+                    reached_size_cap = True
                     break
-                ref = receiver.last_video_at or session_start
-                if connected_ok and time.time() - ref >= VIDEO_STALL_TIMEOUT:
-                    log.warning("Video stalled for %s (%.0fs), reconnecting",
-                                rec.creator_id, time.time() - ref)
-                    rec.status_text = "تصویر قطع شد، اتصال مجدد..."
-                    break
-                rec.bytes_written = receiver.seg_bytes
-                if receiver.seg_video_frames == 1:
-                    rec.seg_started_at = receiver.seg_started_at
+
+                # Disk safety guard
                 _, free_mb, _ = get_disk_stats()
                 if free_mb < MIN_FREE_DISK_MB:
+                    log.warning("Low disk (%.0f MB free), finalizing Agora stream %s", free_mb, rec.creator_id)
                     rec.stop_event.set()
                     break
-                if self._should_split(rec, receiver.seg_bytes) and receiver.seg_video_frames > 0:
-                    part_no = rec.part_number
-                    rec.part_number += 1
-                    nh, npcm = seg_paths(rec.part_number)
-                    old = await asyncio.to_thread(receiver.rotate, nh, npcm)
-                    rec.seg_started_at = time.time()
-                    rec.bytes_written = 0
-                    enqueue(lambda o=old, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
-                    self._changed()
         finally:
-            last_seg = receiver.segment_snapshot()
-            try:
-                await asyncio.to_thread(receiver.close)
-            except Exception:
-                pass
+            fps = receiver.estimated_fps()
+            sr = receiver.sample_rate
+            ch = receiver.channels
+            await asyncio.to_thread(receiver.close)
 
-        rec.agora_diag = (
+        rec.status_text = (
             f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
-            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, "
-            f"cb_err={receiver.cb_error or '-'}"
+            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, tok={len(receiver.token)}, "
+            f"{receiver.diag_flags}, h264={h264_file.stat().st_size if h264_file.exists() else 0}B, "
+            f"pcm={pcm_file.stat().st_size if pcm_file.exists() else 0}B, cb_err={receiver.cb_error or '-'}"
         )
-        log.info("Agora session ended for %s: %s", rec.creator_id, rec.agora_diag)
-        if last_seg.get("video_frames", 0) > 0:
-            part_no = rec.part_number
-            rec.part_number += 1
-            enqueue(lambda o=last_seg, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
-        else:
-            for k in ("h264", "pcm"):
-                try:
-                    Path(last_seg.get(k)).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        rec.agora_diag = rec.status_text
+        log.info("Agora capture ended for %s: %s", rec.creator_id, rec.status_text)
+        mux_cmd = build_mux_command(
+            FFMPEG_BIN or "ffmpeg",
+            h264_file,
+            pcm_file,
+            output_mp4,
+            fps=fps,
+            sample_rate=sr,
+            channels=ch,
+        )
+        if not mux_cmd:
+            return False, False
+        if receiver.video_frames == 0:
+            log.warning("No video frames for %s; skipping mux. %s", rec.creator_id, rec.status_text)
+            h264_file.unlink(missing_ok=True)
+            pcm_file.unlink(missing_ok=True)
+            return False, False
 
-    async def _mux_and_upload(self, rec: ActiveRecording, seg: Dict[str, Any],
-                              work_dir: Path, part_no: int) -> None:
-        h264: Path = seg["h264"]
-        pcm: Path = seg["pcm"]
-        out = work_dir / f"{sanitize_filename(rec.creator_name)}_part{part_no}.mp4"
-        fps = seg["video_frames"] / max(1.0, seg["elapsed"])
-        rec.upload_status = f"پارت {part_no}: آماده‌سازی فایل..."
-        cmd = build_mux_command(FFMPEG_BIN or "ffmpeg", h264, pcm, out, fps=fps,
-                                sample_rate=seg["sample_rate"], channels=seg["channels"])
-        mux_ok = False
-        if cmd:
+        proc = await asyncio.create_subprocess_exec(
+            *mux_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_bytes = await proc.communicate()
+        if proc.returncode != 0:
+            log.error("FFmpeg mux error: %s", stderr_bytes.decode("utf-8", errors="ignore")[-400:])
+
+        # Clean up raw intermediate streams right away to save disk
+        h264_file.unlink(missing_ok=True)
+        pcm_file.unlink(missing_ok=True)
+
+        return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
+
+    async def _upload_part_to_telegram(
+        self,
+        rec: ActiveRecording,
+        mp4_path: Path,
+        duration_sec: int,
+        status_msg: Any,
+    ) -> Tuple[int, int, int]:
+        """Upload up to 2 GB MP4 via Telethon MTProto with progress, cover thumb & contact sheet."""
+        rec.status_text = "در حال آپلود به تلگرام..."
+        fsize = mp4_path.stat().st_size
+        _, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
+
+        make_sheet = self.db.get_setting("contact_sheet", "1") == "1"
+        thumb_path = mp4_path.with_suffix(".thumb.jpg")
+        sheet_path = mp4_path.with_suffix(".sheet.jpg")
+        thumb_file, sheet_file = await asyncio.to_thread(
+            generate_thumbnail_and_contact_sheet,
+            mp4_path,
+            thumb_path,
+            sheet_path,
+            duration_sec,
+            make_sheet,
+        )
+
+        # Send Contact Sheet preview first (just like @superliverec_bot)
+        if sheet_file and sheet_file.exists():
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-                _, err = await proc.communicate()
-                if proc.returncode == 0 and out.exists() and out.stat().st_size > 10_000:
-                    mux_ok = True
-                else:
-                    log.error("Mux error for %s part %d: %s",
-                              rec.creator_id, part_no,
-                              (err or b"").decode("utf-8", "ignore")[-400:])
+                await self.bot.send_file(
+                    rec.chat_id,
+                    str(sheet_file),
+                    caption=(
+                        f"🖼 <b>پیش‌نمایش ضبط (Contact Sheet)</b>\n"
+                        f"👤 {html.escape(rec.creator_name)} (<code>{rec.creator_id}</code>)\n"
+                        f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>"
+                    ),
+                    parse_mode="html",
+                )
             except Exception as e:
-                log.error("Mux exception for %s part %d: %s", rec.creator_id, part_no, e)
+                log.warning("Contact sheet upload failed: %s", e)
 
-        if mux_ok:
-            # Only delete raw files AFTER successful mux
-            h264.unlink(missing_ok=True)
-            pcm.unlink(missing_ok=True)
-            await self._upload_job(rec, out, part_no)
-        else:
-            # Keep raw files for recovery
-            log.error("Retaining raw H264/PCM for %s part %d (mux failed)", rec.creator_id, part_no)
-            rec.upload_status = f"پارت {part_no}: mux ناموفق (فایل خام نگه داشته شد)"
+        # Throttled progress callback
+        last_update = [0.0]
 
-    async def _upload_job(self, rec: ActiveRecording, mp4_path: Path, part_no: int) -> None:
-        async with self._upload_sem:
-            dur, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
-            fsize = mp4_path.stat().st_size
-            thumb_path = mp4_path.with_suffix(".thumb.jpg")
-            sheet_path = mp4_path.with_suffix(".sheet.jpg")
-            thumb_file, sheet_file = await asyncio.to_thread(
-                generate_thumbnail_and_contact_sheet, mp4_path, thumb_path, sheet_path, dur, True)
-            if not sheet_file and thumb_file:
-                sheet_file = thumb_file
-
-            caption = (
-                f"🎬 <b>{html.escape(rec.creator_name)}</b>  ·  پارت {part_no}\n"
-                f"⏱ <code>{fmt_duration(dur)}</code>   💾 <code>{fmt_bytes(fsize)}</code>   "
-                f"📐 <code>{width}×{height}</code>\n"
-                f"📅 {local_now_str()}   🆔 <code>{rec.creator_id}</code>\n"
-                f"#u{rec.creator_id}"
-            )
-            last_update = [0.0]
-
-            async def progress_cb(current: int, total: int) -> None:
-                now = time.time()
-                if now - last_update[0] >= 3.0 or current == total:
-                    last_update[0] = now
-                    rec.upload_status = f"پارت {part_no}: آپلود {current * 100 / max(1, total):.0f}%"
-
-            sheet_msg = None
-            if sheet_file and sheet_file.exists():
+        async def progress_cb(current: int, total: int) -> None:
+            now = time.time()
+            if status_msg and (now - last_update[0] >= 5.0 or current == total):
+                last_update[0] = now
+                pct = (current / max(1, total)) * 100.0
                 try:
-                    sheet_msg = await self.bot.send_file(
-                        rec.chat_id, str(sheet_file),
-                        caption=f"🖼 پیش‌نمایش · <b>{html.escape(rec.creator_name)}</b> · پارت {part_no}",
-                        parse_mode="html")
-                except Exception as e:
-                    log.warning("Preview upload failed: %s", e)
-
-            attrs = [DocumentAttributeVideo(duration=max(1, dur), w=width, h=height, supports_streaming=True)]
-            sent = None
-            for attempt in range(5):
-                try:
-                    sent = await self.bot.send_file(
-                        rec.chat_id, str(mp4_path), caption=caption, parse_mode="html",
-                        thumb=str(thumb_file) if thumb_file else None, attributes=attrs,
-                        supports_streaming=True, progress_callback=progress_cb,
-                        reply_to=sheet_msg.id if sheet_msg else None)
-                    break
-                except FloodWaitError as fw:
-                    await asyncio.sleep(int(getattr(fw, "seconds", 10)) + 2)
-                except Exception as e:
-                    log.warning("Upload error %s part %d (try %d): %s",
-                                rec.creator_id, part_no, attempt + 1, e)
-                    await asyncio.sleep(5 * (attempt + 1))
-
-            thumb_path.unlink(missing_ok=True)
-            sheet_path.unlink(missing_ok=True)
-
-            if sent is None:
-                dest = FAILED_DIR / mp4_path.name
-                try:
-                    shutil.move(str(mp4_path), str(dest))
-                except Exception:
-                    dest = mp4_path
-                rec.upload_status = f"پارت {part_no}: آپلود ناموفق"
-                try:
-                    await self.bot.send_message(
-                        rec.chat_id,
-                        f"❌ آپلود پارت {part_no} از <b>{html.escape(rec.creator_name)}</b> ناموفق بود.\n"
-                        f"فایل روی سرور نگه داشته شد: <code>{html.escape(str(dest))}</code>",
-                        parse_mode="html")
+                    await status_msg.edit(
+                        f"⬆️ <b>در حال آپلود ویدیو به تلگرام...</b>\n"
+                        f"👤 {html.escape(rec.creator_name)} (پارت {rec.part_number})\n"
+                        f"📊 پیشرفت: <code>{pct:.1f}%</code> ({fmt_bytes(current)} / {fmt_bytes(total)})",
+                        parse_mode="html",
+                    )
                 except Exception:
                     pass
-                raise RuntimeError(f"Telegram upload failed for part {part_no}; retained at {dest}")
 
-            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
-                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
-            mp4_path.unlink(missing_ok=True)
-            rec.uploaded_parts += 1
-            rec.uploaded_duration += dur
-            rec.uploaded_bytes += fsize
-            rec.upload_status = f"پارت {part_no}: ارسال شد ✅"
+        date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        part_label = f" | پارت {rec.part_number}" if rec.part_number > 1 else ""
+        caption = (
+            f"🎬 <b>{html.escape(rec.creator_name)}</b>{part_label}\n"
+            f"🆔 آیدی: <code>{rec.creator_id}</code>\n"
+            f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>\n"
+            f"📐 کیفیت: <code>{width}x{height}</code> | 📅 {date_str}"
+        )
+        if rec.agora_diag:
+            caption += f"\n🛠 <code>{html.escape(rec.agora_diag[:400])}</code>"
 
-            arch_raw = self.db.get_setting("archive_chat_id", "")
-            if arch_raw:
-                try:
-                    msgs = [m for m in (sheet_msg, sent) if m]
-                    await self.bot.forward_messages(int(arch_raw), msgs)
-                except Exception as e:
-                    log.warning("Archive forward failed: %s", e)
+        attrs = [
+            DocumentAttributeVideo(
+                duration=max(1, duration_sec),
+                w=width,
+                h=height,
+                supports_streaming=True,
+            )
+        ]
+
+        sent = None
+        for attempt in range(3):
+            try:
+                sent = await self.bot.send_file(
+                    rec.chat_id,
+                    str(mp4_path),
+                    caption=caption,
+                    parse_mode="html",
+                    thumb=str(thumb_file) if thumb_file else None,
+                    attributes=attrs,
+                    supports_streaming=True,
+                    progress_callback=progress_cb,
+                )
+                break
+            except FloodWaitError as fw:
+                wait_s = int(getattr(fw, "seconds", 10)) + 2
+                log.warning("FloodWait %ss while uploading %s (attempt %d)", wait_s, rec.creator_id, attempt + 1)
+                await asyncio.sleep(wait_s)
+            except Exception as e:
+                log.warning("Upload error for %s (attempt %d): %s", rec.creator_id, attempt + 1, e)
+                await asyncio.sleep(5 * (attempt + 1))
+        if sent is None:
+            raise RuntimeError(f"آپلود ناموفق بود؛ فایل روی دیسک نگه داشته شد: {mp4_path}")
+
+        # Optional: Forward to user's private Archive Channel
+        arch_chat_raw = self.db.get_setting("archive_chat_id", "")
+        arch_chat_id = 0
+        arch_msg_id = 0
+        if arch_chat_raw:
+            try:
+                arch_chat_id = int(arch_chat_raw)
+                fwd = await self.bot.forward_messages(arch_chat_id, sent)
+                if isinstance(fwd, list) and fwd:
+                    arch_msg_id = fwd[0].id
+                elif hasattr(fwd, "id"):
+                    arch_msg_id = fwd.id
+            except Exception as e:
+                log.warning("Failed forwarding to archive channel %s: %s", arch_chat_raw, e)
+
+        thumb_path.unlink(missing_ok=True)
+        sheet_path.unlink(missing_ok=True)
+        return getattr(sent, "id", 0), arch_chat_id, arch_msg_id
+
 
 # ==============================================================================
-# WATCHLIST MONITOR
+# BACKGROUND WATCHLIST MONITOR LOOP
 # ==============================================================================
 
 class WatchlistMonitor:
-    def __init__(self, db: Database, api: SuperLiveClient, rec_mgr: RecordingManager,
-                 bot: TelegramClient):
+    def __init__(self, db: Database, api: SuperLiveClient, rec_mgr: RecordingManager):
         self.db = db
         self.api = api
         self.rec_mgr = rec_mgr
-        self.bot = bot
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        self._notified_ls: Dict[str, str] = {}
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -2408,101 +2388,48 @@ class WatchlistMonitor:
         self._stop.set()
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except Exception:
-                pass
-
-    async def _announce_live(self, owner_id: int, info: CreatorStreamInfo, started: bool) -> None:
-        key = info.livestream_id or "live"
-        if self._notified_ls.get(info.creator_id) == key:
-            return
-        if not started and not info.stream_url:
-            # Probe joinability with a reserved free account (avoids disrupting active recordings)
-            probe = None
-            async with self.rec_mgr._start_lock:
-                probe = self.rec_mgr.free_account()
-                if probe is not None:
-                    self.rec_mgr.busy[probe.slot] = "__probe__"
-            if probe is not None:
-                try:
-                    full = await probe.check_creator_and_get_stream(info.creator_id)
-                    if not full.stream_url:
-                        return
-                except Exception:
-                    return
-                finally:
-                    if self.rec_mgr.busy.get(probe.slot) == "__probe__":
-                        self.rec_mgr.busy.pop(probe.slot, None)
-        self._notified_ls[info.creator_id] = key
-        if self.db.get_setting("notify_live", "1") != "1":
-            return
-        row = [Button.inline("👤 صفحه", data=f"p:{info.creator_id}:0")]
-        if not started:
-            row.insert(0, Button.inline("🎬 ضبط فوری", data=f"qr:{info.creator_id}"))
-        try:
-            m = await self.bot.send_message(
-                owner_id,
-                f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
-                + (" · ⏺ ضبط خودکار شروع شد" if started else ""),
-                parse_mode="html", buttons=[row])
-            ttl = self.rec_mgr.notify_ttl()
-            if ttl > 0:
-                schedule_delete(m, ttl)
-        except Exception as e:
-            log.warning("Live notice failed: %s", e)
 
     async def _loop(self) -> None:
         log.info("Watchlist monitor started.")
         while not self._stop.is_set():
             try:
-                interval = int(self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
-                               or DEFAULT_POLL_INTERVAL)
+                interval = int(self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL)))
                 interval = max(10, min(300, interval))
                 owner_id = self.db.get_owner_id()
-                items = self.db.list_watchlist() if owner_id else []
-                discover_map: Optional[Dict[str, Dict[str, Any]]] = None
-                if items:
-                    try:
-                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=8)
-                    except Exception as e:
-                        log.warning("Batch discover fetch failed: %s", e)
-                for item in items:
-                    if self._stop.is_set():
-                        break
-                    cid = item["creator_id"]
-                    if self.rec_mgr.is_recording(cid):
-                        continue
-                    try:
-                        info = await self.api.check_creator_and_get_stream(
-                            cid, discover_map=discover_map, light=True)
-                        if info.creator_id and info.creator_id != cid and info.creator_id.isdigit():
-                            log.info("Watchlist id %s -> real user_id %s", cid, info.creator_id)
-                            self.db.migrate_watch(cid, info.creator_id)
-                            if self.rec_mgr.is_recording(info.creator_id):
-                                continue
-                            cid = info.creator_id
-                        if info.is_live:
-                            self.db.update_watch_status(cid, "live",
-                                                        display_name=info.display_name,
-                                                        username=info.username)
-                            started = False
-                            if item["auto_record"] and self.rec_mgr.has_capacity():
+                if owner_id:
+                    items = self.db.list_watchlist()
+                    discover_map: Optional[Dict[str, Dict[str, Any]]] = None
+                    if items:
+                        try:
+                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=4)
+                        except Exception as e:
+                            log.warning("Batch discover fetch failed: %s", e)
+                    for item in items:
+                        if self._stop.is_set():
+                            break
+                        cid = item["creator_id"]
+                        if not item["auto_record"] or self.rec_mgr.is_recording(cid):
+                            continue
+                        try:
+                            info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
+                            if info.is_live:
+                                self.db.update_watch_status(
+                                    cid, "live", display_name=info.display_name, username=info.username
+                                )
                                 ok, msg = await self.rec_mgr.start_recording(
-                                    info, chat_id=owner_id, triggered_by="watchlist")
-                                started = ok
-                                if not ok:
-                                    log.debug("Skip auto-record %s: %s", cid, msg)
-                            await self._announce_live(owner_id, info, started)
-                        else:
-                            self._notified_ls.pop(cid, None)
-                            self.rec_mgr.manually_stopped_ls.pop(cid, None)
-                            self.db.update_watch_status(cid, "offline",
-                                                        display_name=info.display_name,
-                                                        username=info.username)
-                    except Exception as e:
-                        log.warning("Poll error for creator %s: %s", cid, e)
-                    await asyncio.sleep(0.8)
+                                    info, chat_id=owner_id, triggered_by="watchlist"
+                                )
+                                if ok:
+                                    log.info("Auto-started recording for %s", cid)
+                                else:
+                                    log.debug("Skipped auto-record for %s: %s", cid, msg)
+                            else:
+                                self.db.update_watch_status(
+                                    cid, "offline", display_name=info.display_name, username=info.username
+                                )
+                        except Exception as e:
+                            log.warning("Poll error for creator %s: %s", cid, e)
+                        await asyncio.sleep(1.2)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
@@ -2510,55 +2437,19 @@ class WatchlistMonitor:
                 log.exception("Watchlist loop error: %s", e)
                 await asyncio.sleep(15)
 
+
 # ==============================================================================
-# BOT UI
+# TELEGRAM BOT UI & HANDLERS (Telethon MTProto)
 # ==============================================================================
-
-KB_WATCH = "📋 واچ‌لیست"
-KB_ACTIVE = "⏺ در حال ضبط"
-KB_ADD = "➕ افزودن استریمر"
-KB_REC = "🎬 ضبط فوری"
-KB_ARCHIVE = "📚 آرشیو"
-KB_SETTINGS = "⚙️ تنظیمات"
-KB_HOME = "🏠 داشبورد"
-KB_ALL = {KB_WATCH, KB_ACTIVE, KB_ADD, KB_REC, KB_ARCHIVE, KB_SETTINGS, KB_HOME}
-SEP = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-
-
-def main_keyboard() -> Any:
-    from telethon.tl.types import KeyboardButton, KeyboardButtonRow, ReplyKeyboardMarkup
-    rows = [[KB_WATCH, KB_ACTIVE], [KB_ADD, KB_REC],
-            [KB_ARCHIVE, KB_SETTINGS], [KB_HOME]]
-    trows = [KeyboardButtonRow([KeyboardButton(t) for t in r]) for r in rows]
-    kw: Dict[str, Any] = {"rows": trows, "resize": True}
-    try:
-        params = inspect.signature(ReplyKeyboardMarkup.__init__).parameters
-        if "persistent" in params:
-            kw["persistent"] = True
-        if "placeholder" in params:
-            kw["placeholder"] = "آیدی یا لینک رو بفرست…"
-    except Exception:
-        pass
-    return ReplyKeyboardMarkup(**kw)
-
-
-def short(name: str, n: int = 18) -> str:
-    name = (name or "").strip()
-    return name if len(name) <= n else name[: n - 1] + "…"
-
 
 class SuperLiveRecBot:
     def __init__(self):
         self.db = Database(DB_PATH)
-        self.pool = AccountPool(self.db)
-        self.api = self.pool.primary
+        self.api = SuperLiveClient(self.db)
         self.bot = TelegramClient(str(SESSION_PATH), TG_API_ID, TG_API_HASH)
-        self.rec_mgr = RecordingManager(self.bot, self.db, self.pool)
-        self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr, self.bot)
+        self.rec_mgr = RecordingManager(self.bot, self.db, self.api)
+        self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr)
         self._awaiting_input: Dict[int, str] = {}
-        self._panel: Dict[int, Any] = {}
-        self._panel_view: Dict[int, Tuple[str, tuple]] = {}
-        self._panel_last: Dict[int, str] = {}
 
     def _is_owner(self, user_id: int) -> bool:
         owner = self.db.get_owner_id()
@@ -2567,626 +2458,597 @@ class SuperLiveRecBot:
             return True
         return user_id == owner
 
-    def _status_icon(self, cid: str, last_status: str) -> str:
-        if self.rec_mgr.is_recording(cid):
-            return "⏺"
-        return "🔴" if last_status == "live" else "⚫"
-
-    # --------------------------------------------------------------- views
-    def render(self, view: str, *args: Any) -> Tuple[str, List[List[Any]]]:
-        return getattr(self, f"_v_{view}")(*args)
-
-    def _v_home(self) -> Tuple[str, List[List[Any]]]:
+    def _dashboard_text_and_buttons(self) -> Tuple[str, List[List[Any]]]:
         wl = self.db.list_watchlist()
         live_cnt = sum(1 for x in wl if x["last_status"] == "live")
-        active = list(self.rec_mgr.active.values())
-        cnt, dur, size = self.db.clip_stats()
-        _, free_mb, total_mb = get_disk_stats()
+        active_cnt = len(self.rec_mgr.active)
+        total_recs = self.db.count_recordings()
+        used_mb, free_mb, total_mb = get_disk_stats()
         ram_used, ram_total = get_ram_usage_mb()
-        ram = f"{ram_used/1024:.1f}/{ram_total/1024:.1f} GB" if ram_total else f"{ram_used:.0f} MB"
-        lines = [
-            "🎥 <b>SuperLive Recorder</b>",
-            SEP,
-            f"⏺ در حال ضبط: <b>{len(active)}</b>",
-            f"👀 واچ‌لیست: <b>{len(wl)}</b>   ·   🔴 آنلاین: <b>{live_cnt}</b>",
-            f"📚 آرشیو: <b>{cnt}</b> ویدیو   ·   <b>{fmt_duration(dur)}</b>   ·   <b>{fmt_bytes(size)}</b>",
-            SEP,
-            f"💽 دیسک آزاد: <code>{free_mb/1024:.1f}/{total_mb/1024:.1f} GB</code>   "
-            f"🧠 رم: <code>{ram}</code>",
-            f"⚙️ Agora {'✅' if AGORA_AVAILABLE else '❌'}   ·   "
-            f"FFmpeg {'✅' if FFMPEG_BIN else '❌'}",
-        ]
-        if active:
-            lines.append(SEP)
-            for r in active[:6]:
-                lines.append(f"⏺ <b>{html.escape(short(r.creator_name, 22))}</b> · "
-                             f"<code>{fmt_duration(time.time() - r.started_at)}</code>")
-        lines.append("\n<i>آیدی، لینک پروفایل یا لینک لایو رو هر وقت خواستی همینجا بفرست.</i>")
+
+        agora_badge = "✅ آماده" if AGORA_AVAILABLE else "❌ نصب نیست"
+        ffmpeg_badge = "✅ آماده" if FFMPEG_BIN else "❌ نصب نیست"
+        ram_line = f"{ram_used:.0f} / {ram_total:.0f} MB" if ram_total > 0 else f"{ram_used:.0f} MB"
+
+        text = (
+            "🎥 <b>SuperLiveRec Personal Unlimited</b>\n"
+            "<i>الهام‌گرفته از @superliverec_bot و StreamRecorder.io — بدون محدودیت تعداد</i>\n\n"
+            f"🔴 در حال ضبط الان: <b>{active_cnt}</b> استریم\n"
+            f"👀 واچ‌لیست: <b>{len(wl)}</b> نفر (آنلاین: <b>{live_cnt}</b>)\n"
+            f"📚 آرشیو ضبط‌شده‌ها: <b>{total_recs}</b> ویدیو\n"
+            f"⬆️ سقف آپلود هر فایل: <b>تا 2 گیگابایت</b> (MTProto)\n\n"
+            f"🖥 <b>وضعیت سرور:</b>\n"
+            f"• رم: <code>{ram_line}</code> | دیسک خالی: <code>{free_mb/1024:.2f} / {total_mb/1024:.1f} GB</code>\n"
+            f"• موتور Agora: {agora_badge} | FFmpeg: {ffmpeg_badge}\n\n"
+            "💡 برای شروع کافیه آیدی عددی یا لینک پروفایل SuperLive رو همینجا بفرستی یا از دکمه‌ها استفاده کنی:"
+        )
         buttons = [
-            [Button.inline(f"📋 واچ‌لیست ({len(wl)})", data="w:0"),
-             Button.inline(f"⏺ ضبط‌ها ({len(active)})", data="a")],
-            [Button.inline("📚 آرشیو", data="ar:0"),
-             Button.inline("⚙️ تنظیمات", data="s")],
-            [Button.inline("🔄 بروزرسانی", data="h")],
+            [
+                Button.inline("➕ افزودن به واچ‌لیست", data="act:add_watch"),
+                Button.inline("🎬 ضبط فوری (Rec)", data="act:manual_rec"),
+            ],
+            [
+                Button.inline(f"📋 واچ‌لیست ({len(wl)})", data="page:watchlist:0"),
+                Button.inline(f"🔴 در حال ضبط ({active_cnt})", data="page:active"),
+            ],
+            [
+                Button.inline("📚 آرشیو ویدیوها", data="page:archive:0"),
+                Button.inline("⚙️ تنظیمات", data="page:settings"),
+            ],
+            [Button.inline("🔄 بروزرسانی داشبورد", data="page:home")],
         ]
-        return "\n".join(lines), buttons
+        return text, buttons
 
-    def _v_watchlist(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
-        items = self.db.list_watchlist()
-        items.sort(key=lambda x: (0 if self.rec_mgr.is_recording(x["creator_id"])
-                                   else (1 if x["last_status"] == "live" else 2)))
-        per = 8
-        pages = max(1, (len(items) + per - 1) // per)
-        page = max(0, min(page, pages - 1))
-        chunk = items[page * per:(page + 1) * per]
-        rec_n = sum(1 for x in items if self.rec_mgr.is_recording(x["creator_id"]))
-        live_n = sum(1 for x in items if x["last_status"] == "live")
-        lines = [
-            f"📋 <b>واچ‌لیست</b>  ·  {len(items)} نفر",
-            f"⏺ {rec_n} در حال ضبط   🔴 {live_n} آنلاین   ⚫ {len(items)-live_n} آفلاین",
-            SEP,
-        ]
-        if not chunk:
-            lines.append("هنوز کسی اضافه نشده. از «➕ افزودن استریمر» استفاده کن.")
-        else:
-            lines.append("<i>روی هر نفر بزن تا جزئیات و ضبط‌هاش رو ببینی.</i>")
-        buttons: List[List[Any]] = []
-        for it in chunk:
-            cid = it["creator_id"]
-            icon = self._status_icon(cid, it["last_status"])
-            extra = ""
-            r = self.rec_mgr.active.get(cid)
-            if r:
-                extra = f" · {fmt_duration(time.time() - r.started_at)}"
-            auto = "" if it["auto_record"] else " ⏸"
-            buttons.append([Button.inline(
-                f"{icon} {short(it['display_name'] or cid)}{extra}{auto}",
-                data=f"p:{cid}:0")])
-        nav: List[Any] = []
-        if page > 0:
-            nav.append(Button.inline("‹ قبلی", data=f"w:{page-1}"))
-        if pages > 1:
-            nav.append(Button.inline(f"{page+1}/{pages}", data=f"w:{page}"))
-        if page < pages - 1:
-            nav.append(Button.inline("بعدی ›", data=f"w:{page+1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([Button.inline("➕ افزودن", data="add"),
-                        Button.inline("🔄", data=f"w:{page}"),
-                        Button.inline("🏠", data="h")])
-        return "\n".join(lines), buttons
-
-    def _v_active(self) -> Tuple[str, List[List[Any]]]:
-        active = list(self.rec_mgr.active.values())
-        lines = [f"⏺ <b>در حال ضبط</b> · {len(active)}", SEP]
-        buttons: List[List[Any]] = []
-        if not active:
-            lines.append("هیچ ضبطی فعال نیست.")
-        for r in active:
-            dur = fmt_duration(time.time() - r.started_at)
-            lines.append(
-                f"⏺ <b>{html.escape(short(r.creator_name, 22))}</b>\n"
-                f"   ⏱ {dur} · 💾 {fmt_bytes(r.bytes_written)} · پارت {r.part_number}\n"
-                f"   {html.escape(r.status_text)}"
-                + (f"\n   📤 {html.escape(r.upload_status)}" if r.upload_status else "")
-            )
-            buttons.append([Button.inline(f"👤 {short(r.creator_name, 18)} · {dur}",
-                                          data=f"p:{r.creator_id}:0")])
-        buttons.append([Button.inline("🛑 توقف همه", data="sa"),
-                        Button.inline("🔄", data="a"),
-                        Button.inline("🏠", data="h")])
-        return "\n".join(lines), buttons
-
-    def _v_person(self, cid: str, page: int = 0) -> Tuple[str, List[List[Any]]]:
-        w = self.db.get_watch(cid) or {}
-        r = self.rec_mgr.active.get(cid)
-        name = w.get("display_name") or (r.creator_name if r else "") or cid
-        cnt, dur, size = self.db.clip_stats(cid)
-        if r:
-            st = "⏺ در حال ضبط"
-        elif w.get("last_status") == "live":
-            st = "🔴 آنلاین"
-        else:
-            st = "⚫ آفلاین"
-        lines = [
-            f"👤 <b>{html.escape(name)}</b>",
-            f"🆔 <code>{cid}</code>"
-            + (f"   @{html.escape(w['username'])}" if w.get("username") else ""),
-            SEP,
-            f"📡 وضعیت: {st}",
-        ]
-        if w:
-            lines.append(f"🤖 ضبط خودکار: {'✅ روشن' if w.get('auto_record') else '⏸ خاموش'}")
-            if w.get("last_seen_live"):
-                lines.append(f"🕘 آخرین لایو: <code>{iso_to_local(w['last_seen_live'])}</code>")
-        else:
-            lines.append("<i>این استریمر توی واچ‌لیست نیست.</i>")
-        if r:
-            lines += [
-                SEP,
-                f"⏱ کل ضبط: <code>{fmt_duration(time.time() - r.started_at)}</code>",
-                f"📦 پارت فعلی: <code>{fmt_duration(time.time() - r.seg_started_at)}</code>",
-                f"💾 حجم پارت: <code>{fmt_bytes(r.bytes_written)}</code>",
-                f"📤 پارت‌های ارسالی: {r.uploaded_parts}",
-            ]
-            if r.upload_status:
-                lines.append(f"📶 {html.escape(r.upload_status)}")
-        if cnt:
-            lines += [SEP, f"📚 آرشیو: {cnt} ویدیو · {fmt_duration(dur)} · {fmt_bytes(size)}"]
-        buttons: List[List[Any]] = []
-        if r:
-            buttons.append([
-                Button.inline("⏹ توقف", data=f"st:{cid}"),
-                Button.inline("✂️ تقسیم الان", data=f"sp:{cid}"),
-            ])
-        else:
-            buttons.append([Button.inline("🎬 ضبط فوری", data=f"qr:{cid}")])
-        if w:
-            buttons.append([
-                Button.inline("🤖 خاموش کردن ضبط خودکار" if w.get("auto_record")
-                              else "✅ روشن کردن ضبط خودکار", data=f"ar2:{cid}"),
-                Button.inline("🗑 حذف", data=f"rm:{cid}"),
-            ])
-        buttons.append([
-            Button.inline("🔄 بروزرسانی", data=f"p:{cid}:{page}"),
-            Button.inline("📋 واچ‌لیست", data="w:0"),
-            Button.inline("🏠", data="h"),
-        ])
-        return "\n".join(lines), buttons
-
-    def _v_archive(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
-        per = 8
-        total = self.db.count_recordings()
-        recs = self.db.list_recent_recordings(limit=per, offset=page * per)
-        cnt, dur, size = self.db.clip_stats()
-        lines = [
-            f"📚 <b>آرشیو</b>",
-            f"{cnt} کلیپ · {fmt_duration(dur)} · {fmt_bytes(size)}",
-            SEP,
-        ]
-        if not recs:
-            lines.append("هنوز ضبطی آرشیو نشده.")
-        buttons: List[List[Any]] = []
-        icons = {"completed": "✅", "interrupted": "⚠️", "empty": "🕳",
-                 "upload_failed": "❌", "partial_upload": "⚠️",
-                 "recording": "⏺", "error": "❌"}
-        for r in recs:
-            icon = icons.get(r["status"], "•")
-            lines.append(
-                f"{icon} {html.escape(short(r['creator_name'] or r['creator_id'], 22))} · "
-                f"{fmt_duration(r['duration_sec'])} · {fmt_bytes(r['file_size_bytes'])}"
-            )
-            buttons.append([Button.inline(
-                f"{icon} {short(r['creator_name'] or r['creator_id'], 18)} · "
-                f"{fmt_duration(r['duration_sec'])}",
-                data=f"p:{r['creator_id']}:0")])
-        nav: List[Any] = []
-        if page > 0:
-            nav.append(Button.inline("‹", data=f"ar:{page-1}"))
-        if total > (page + 1) * per:
-            nav.append(Button.inline("›", data=f"ar:{page+1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([Button.inline("🔄", data=f"ar:{page}"), Button.inline("🏠", data="h")])
-        return "\n".join(lines), buttons
-
-    def _v_settings(self) -> Tuple[str, List[List[Any]]]:
-        split_m = int(self.db.get_setting("split_minutes", "0") or 0)
-        part_mb = self.rec_mgr.part_cap_bytes() // (1024 * 1024)
-        poll = self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
-        max_c = self.rec_mgr.max_concurrent()
-        nttl = self.db.get_setting("notify_ttl", "60")
-        arch = self.db.get_setting("archive_chat_id", "")
-        lines = [
-            "⚙️ <b>تنظیمات</b>",
-            SEP,
-            f"⏱ تقسیم خودکار: {split_m} دقیقه" if split_m > 0 else "⏱ تقسیم خودکار: خاموش",
-            f"💾 سقف هر پارت: {part_mb} MB",
-            f"🔄 بازه چک واچ‌لیست: {poll} ثانیه",
-            f"👥 حداکثر ضبط همزمان: {max_c}",
-            f"🕘 خودحذفی اعلان‌ها: {nttl} ثانیه",
-            f"📦 کانال آرشیو: {arch or 'تنظیم نشده'}",
-            f"👥 اکانت‌ها: {len(self.pool.clients)} (فعال: {len(self.pool.usable())})",
-            SEP,
-            "روی هر گزینه بزن تا تغییر کنی.",
-        ]
-        buttons = [
-            [Button.inline("⏱ تقسیم خودکار", data="sett:split_minutes"),
-             Button.inline("💾 سقف پارت", data="sett:part_mb")],
-            [Button.inline("🔄 بازه چک", data="sett:poll_interval"),
-             Button.inline("🕘 خودحذفی", data="sett:notify_ttl")],
-            [Button.inline("📦 کانال آرشیو", data="sett:archive_chat_id"),
-             Button.inline("👥 اکانت‌ها", data="acc")],
-            [Button.inline("🔄 بروزرسانی", data="s"), Button.inline("🏠", data="h")],
-        ]
-        return "\n".join(lines), buttons
-
-    def _v_accounts(self) -> Tuple[str, List[List[Any]]]:
-        lines = ["👥 <b>اکانت‌های SuperLive</b>", SEP]
-        buttons: List[List[Any]] = []
-        for slot, c in sorted(self.pool.clients.items()):
-            status = "🟢 آماده" if c.has_token() else "⚪ بدون توکن"
-            busy = "⏺ مشغول" if slot in self.rec_mgr.busy else "💤 آزاد"
-            lines.append(f"<b>{slot}</b>. {html.escape(c.label)} · {status} · {busy}")
-            if slot > 0:
-                buttons.append([Button.inline(f"🗑 حذف اکانت {slot}", data=f"accrm:{slot}")])
-        buttons.append([Button.inline("➕ افزودن اکانت", data="accadd"),
-                        Button.inline("🔄", data="acc"),
-                        Button.inline("🏠", data="h")])
-        return "\n".join(lines), buttons
-
-    # --------------------------------------------------------------- panel
-    async def _refresh_panel(self, chat_id: int) -> None:
-        vi = self._panel_view.get(chat_id)
-        msg = self._panel.get(chat_id)
-        if not vi or msg is None:
-            return
-        view, args = vi
-        try:
-            text, buttons = self.render(view, *args)
-        except Exception as e:
-            log.warning("Render failed for %s/%s: %s", chat_id, view, e)
-            return
-        if text == self._panel_last.get(chat_id):
-            return
-        try:
-            await msg.edit(text, buttons=buttons, parse_mode="html")
-            self._panel_last[chat_id] = text
-        except MessageNotModifiedError:
-            self._panel_last[chat_id] = text
-        except Exception as e:
-            log.debug("Panel edit failed: %s", e)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            self._panel.pop(chat_id, None)
-
-    async def _refresh_all_panels(self) -> None:
-        for chat_id in list(self._panel.keys()):
-            try:
-                await self._refresh_panel(chat_id)
-            except Exception:
-                pass
-
-    def _request_panel_refresh(self) -> None:
-        try:
-            bg_task(self._refresh_all_panels())
-        except RuntimeError:
-            pass
-
-    async def _show_panel(self, event: Any, view: str, *args: Any) -> None:
-        chat_id = getattr(event, "chat_id", None) or event
-        try:
-            text, buttons = self.render(view, *args)
-        except Exception as e:
-            log.exception("Render failed: %s", e)
-            return
-        self._panel_view[chat_id] = (view, args)
-        self._panel_last[chat_id] = text
-        msg = self._panel.get(chat_id)
-        if msg is not None:
-            try:
-                await msg.edit(text, buttons=buttons, parse_mode="html")
-                return
-            except MessageNotModifiedError:
-                return
-            except Exception:
-                pass
-        try:
-            msg = await self.bot.send_message(chat_id, text, buttons=buttons, parse_mode="html")
-            self._panel[chat_id] = msg
-        except Exception as e:
-            log.warning("send_panel failed: %s", e)
-
-    # --------------------------------------------------------------- handlers
     def _register_handlers(self) -> None:
-        bot = self.bot
+        @self.bot.on(events.NewMessage(pattern=r"^/(start|menu)(@\w+)?(\s.*)?$"))
+        async def cmd_start(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                await event.reply("⛔ این ربات شخصی هست و فقط برای مالک سرور فعاله.")
+                return
+            self._awaiting_input.pop(event.sender_id, None)
+            text, buttons = self._dashboard_text_and_buttons()
+            await event.reply(text, parse_mode="html", buttons=buttons)
 
-        @bot.on(events.NewMessage(pattern=r"^/start"))
-        async def cmd_start(ev):
-            if not self._is_owner(ev.sender_id):
+        @self.bot.on(events.NewMessage(pattern=r"^/watch(?:\s+(.+))?$"))
+        async def cmd_watch(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
                 return
-            await ev.respond(
-                "👋 به <b>SuperLive Recorder</b> خوش اومدی!\n"
-                "از منوی پایین یا دکمه‌های زیر استفاده کن.",
-                parse_mode="html", buttons=main_keyboard())
-            await self._show_panel(ev, "home")
+            arg = (event.pattern_match.group(1) or "").strip()
+            if not arg:
+                self._awaiting_input[event.sender_id] = "watch"
+                await event.reply("➕ آیدی عددی، یوزرنیم یا لینک پروفایل SuperLive رو بفرست تا به واچ‌لیست اضافه بشه:")
+                return
+            await self._handle_add_watch(event, arg)
 
-        @bot.on(events.NewMessage(pattern=r"^/debug"))
-        async def cmd_debug(ev):
-            if not self._is_owner(ev.sender_id):
+        @self.bot.on(events.NewMessage(pattern=r"^/unwatch\s+(.+)$"))
+        async def cmd_unwatch(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
                 return
-            parts = (ev.message.text or "").split(maxsplit=1)
-            if len(parts) < 2:
-                await ev.respond("Usage: <code>/debug &lt;id-or-url&gt;</code>", parse_mode="html")
-                return
-            target = parts[1].strip()
-            await ev.respond("🔎 در حال دیباگ...")
-            try:
-                cid, _, _, _ = await self.api.resolve_creator(target)
-                info = await self.api.check_creator_and_get_stream(cid)
-                dbg = json.dumps(info.raw_debug, ensure_ascii=False, indent=2)
-                msg = (f"<b>Debug</b> for <code>{html.escape(cid)}</code>\n"
-                       f"live={info.is_live} ls={info.livestream_id}\n"
-                       f"url={(info.stream_url or '-')[:80]}\n"
-                       f"<pre>{html.escape(dbg[:3000])}</pre>")
-                await ev.respond(msg, parse_mode="html")
-            except Exception as e:
-                await ev.respond(f"❌ {e}")
+            cid = extract_creator_identifier(event.pattern_match.group(1))
+            if self.db.remove_watch(cid):
+                await event.reply(f"🗑 استریمر <code>{html.escape(cid)}</code> از واچ‌لیست حذف شد.", parse_mode="html")
+            else:
+                await event.reply("این آیدی توی واچ‌لیست پیدا نشد.")
 
-        @bot.on(events.CallbackQuery)
-        async def on_cb(ev):
-            if not self._is_owner(ev.sender_id):
-                await ev.answer("⛔️", alert=False)
+        @self.bot.on(events.NewMessage(pattern=r"^/rec(?:\s+(.+))?$"))
+        async def cmd_rec(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
                 return
+            arg = (event.pattern_match.group(1) or "").strip()
+            if not arg:
+                self._awaiting_input[event.sender_id] = "rec"
+                await event.reply("🎬 آیدی یا لینک استریمر SuperLive رو بفرست تا فوری ضبطش شروع بشه:")
+                return
+            await self._handle_manual_rec(event, arg)
+
+        @self.bot.on(events.NewMessage(pattern=r"^/stop(?:\s+(.+))?$"))
+        async def cmd_stop(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            arg = (event.pattern_match.group(1) or "").strip().lower()
+            if arg == "all":
+                cnt = await self.rec_mgr.stop_all()
+                await event.reply(f"⏹ دستور توقف برای {cnt} ضبط فعال ارسال شد (فایل‌ها پس از آماده‌سازی ارسال می‌شن).")
+                return
+            if not arg:
+                await self._send_active_view(event)
+                return
+            cid = extract_creator_identifier(arg)
+            if await self.rec_mgr.stop_recording(cid):
+                await event.reply(f"⏹ ضبط <code>{html.escape(cid)}</code> در حال توقف و ارسال ویدیوست...", parse_mode="html")
+            else:
+                await event.reply("این استریمر الان در حال ضبط نیست.")
+
+        @self.bot.on(events.NewMessage(pattern=r"^/watchlist$"))
+        async def cmd_watchlist(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            await self._send_watchlist_view(event, page=0)
+
+        @self.bot.on(events.NewMessage(pattern=r"^/active$"))
+        async def cmd_active(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            await self._send_active_view(event)
+
+        @self.bot.on(events.NewMessage(pattern=r"^/(archive|history)$"))
+        async def cmd_archive(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            await self._send_archive_view(event, page=0)
+
+        @self.bot.on(events.NewMessage(pattern=r"^/check\s+(.+)$"))
+        async def cmd_check(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            raw = event.pattern_match.group(1).strip()
+            msg = await event.reply("🔍 در حال بررسی وضعیت استریمر...")
+            cid, uname, dname, _ = await self.api.resolve_creator(raw)
+            if not cid:
+                await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+                return
+            info = await self.api.check_creator_and_get_stream(cid)
+            status = "🔴 آنلاین (LIVE)" if info.is_live else "⚫ آفلاین"
+            proto = "Agora RTC" if info.stream_url.startswith("agora://") else ("HLS/Direct" if info.stream_url else "نامشخص")
+            await msg.edit(
+                f"🔎 <b>نتیجه بررسی استریمر</b>\n\n"
+                f"👤 نام: <b>{html.escape(info.display_name or dname or cid)}</b>\n"
+                f"🆔 آیدی: <code>{html.escape(info.creator_id)}</code>\n"
+                f"📡 وضعیت: {status}\n"
+                f"🎞 آیدی لایو: <code>{html.escape(info.livestream_id or '-')}</code>\n"
+                f"⚙️ پروتکل دریافت: <code>{proto}</code>",
+                parse_mode="html",
+                buttons=[
+                    [
+                        Button.inline("➕ افزودن به واچ‌لیست", data=f"qwatch:{info.creator_id}"),
+                        Button.inline("🎬 ضبط فوری", data=f"qrec:{info.creator_id}"),
+                    ]
+                ],
+            )
+
+        @self.bot.on(events.NewMessage(pattern=r"^/debug\s+(.+)$"))
+        async def cmd_debug(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            raw = event.pattern_match.group(1).strip()
+            msg = await event.reply("🛠 در حال دریافت پاسخ خام سرور SuperLive...")
+            cid, _, _, _ = await self.api.resolve_creator(raw)
+            if not cid:
+                await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+                return
+            info = await self.api.check_creator_and_get_stream(cid)
+            d = info.raw_debug
+            report = (
+                f"🛠 <b>گزارش دیباگ API برای <code>{html.escape(info.creator_id)}</code></b>\n"
+                f"• Init: <code>{d.get('init_status')}</code> | Token: <code>{d.get('has_token')}</code>\n"
+                f"• Profile HTTP: <code>{d.get('profile_http')}</code>\n"
+                f"• Discover HTTP: <code>{d.get('discover_http', '-')}</code>\n"
+                f"• Retrieve/Enter HTTP: <code>{d.get('retrieve_http', '-')} / {d.get('enter_http', '-')}</code>\n"
+                f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n"
+                f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n"
+                f"• Token Info: <code>{html.escape(str(d.get('token_info', '-')))}</code>\n"
+                f"• Agora Keys: <code>{html.escape(str(d.get('agora_keys', '-'))[:600])}</code>\n\n"
+                f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
+                f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
+            )
+            await msg.edit(report[:4000], parse_mode="html")
+
+        @self.bot.on(events.NewMessage(pattern=r"^/login\s+(\S+)\s+(.+)$"))
+        async def cmd_login(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            email = event.pattern_match.group(1).strip()
+            password = event.pattern_match.group(2).strip()
+            ok, msg_text = await self.api.email_signin(email, password)
             try:
-                data = ev.data.decode("utf-8", "ignore") if isinstance(ev.data, bytes) else str(ev.data or "")
-            except Exception:
-                data = ""
-            try:
-                await self._handle_cb(ev, data)
-            except Exception:
-                log.exception("Callback failed: %s", data)
-            try:
-                await ev.answer()
+                await event.delete()
             except Exception:
                 pass
+            await event.respond(f"{'✅' if ok else '❌'} {msg_text}")
 
-        @bot.on(events.NewMessage)
-        async def on_msg(ev):
-            if not self._is_owner(ev.sender_id) or ev.out:
+        @self.bot.on(events.NewMessage(pattern=r"^/settoken\s+(\S+)(?:\s+(\S+))?$"))
+        async def cmd_settoken(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
                 return
-            text = (ev.message.text or "").strip()
-            if not text or text.startswith("/"):
-                return
-            state = self._awaiting_input.get(ev.chat_id)
-            if state:
-                await self._handle_input(ev, state, text)
-                return
-            if text == KB_HOME:
-                await self._show_panel(ev, "home")
-            elif text == KB_WATCH:
-                await self._show_panel(ev, "watchlist", 0)
-            elif text == KB_ACTIVE:
-                await self._show_panel(ev, "active")
-            elif text == KB_ARCHIVE:
-                await self._show_panel(ev, "archive", 0)
-            elif text == KB_SETTINGS:
-                await self._show_panel(ev, "settings")
-            elif text == KB_ADD:
-                self._awaiting_input[ev.chat_id] = "add"
-                await ev.respond("🆔 آیدی، لینک پروفایل یا لینک لایو SuperLive رو بفرست:")
-            elif text == KB_REC:
-                self._awaiting_input[ev.chat_id] = "qr"
-                await ev.respond("🎬 آیدی یا لینک لایو برای ضبط فوری رو بفرست:")
+            tok = event.pattern_match.group(1).strip()
+            dev = (event.pattern_match.group(2) or "").strip()
+            self.api.set_credentials(tok, dev)
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            await event.respond(
+                "✅ توکن و Device-ID با موفقیت ذخیره شد (پیام شما برای امنیت حذف شد).\n"
+                "الان با <code>/debug آیدی_استریمر</code> یا <code>/rec آیدی_استریمر</code> تست کن!",
+                parse_mode="html",
+            )
 
-    async def _handle_cb(self, ev, data: str) -> None:
-        if data == "h":
-            await self._show_panel(ev, "home")
-        elif data.startswith("w:"):
-            try:
-                await self._show_panel(ev, "watchlist", int(data[2:]))
-            except ValueError:
-                await self._show_panel(ev, "watchlist", 0)
-        elif data == "a":
-            await self._show_panel(ev, "active")
-        elif data.startswith("ar:"):
-            try:
-                await self._show_panel(ev, "archive", int(data[3:]))
-            except ValueError:
-                await self._show_panel(ev, "archive", 0)
-        elif data == "s":
-            await self._show_panel(ev, "settings")
-        elif data == "acc":
-            await self._show_panel(ev, "accounts")
-        elif data.startswith("p:"):
-            parts = data[2:].split(":")
-            cid = parts[0]
-            page = 0
-            if len(parts) > 1 and parts[1].isdigit():
-                page = int(parts[1])
-            await self._show_panel(ev, "person", cid, page)
-        elif data.startswith("qr:"):
-            await self._do_quick_record(ev, data[3:])
-        elif data.startswith("st:"):
-            cid = data[3:]
-            if await self.rec_mgr.stop_recording(cid):
-                await ev.respond("⏹ در حال توقف...")
-            await self._show_panel(ev, "person", cid, 0)
-        elif data.startswith("sp:"):
-            cid = data[3:]
-            if await self.rec_mgr.split_recording(cid):
-                await ev.respond("✂️ پارت فعلی ارسال می‌شود، ضبط ادامه دارد.")
-        elif data.startswith("rm:"):
-            cid = data[3:]
-            if self.db.remove_watch(cid):
-                await ev.respond(f"🗑 حذف شد: <code>{html.escape(cid)}</code>", parse_mode="html")
-            await self._show_panel(ev, "watchlist", 0)
-        elif data.startswith("ar2:"):
-            cid = data[4:]
-            nv = self.db.toggle_auto_record(cid)
-            if nv is not None:
-                await ev.respond(f"🤖 ضبط خودکار: {'✅ روشن' if nv else '⏸ خاموش'}")
-            await self._show_panel(ev, "person", cid, 0)
-        elif data == "sa":
-            n = await self.rec_mgr.stop_all()
-            await ev.respond(f"⏹ {n} ضبط در حال توقف...")
-            await self._show_panel(ev, "active")
-        elif data == "add":
-            self._awaiting_input[ev.chat_id] = "add"
-            await ev.respond("🆔 آیدی، لینک پروفایل یا لینک لایو SuperLive رو بفرست:")
-        elif data == "accadd":
-            self._awaiting_input[ev.chat_id] = "accadd"
-            await ev.respond("🔑 توکن SuperLive اکانت رو بفرست\n"
-                             "می‌تونی بعد از توکن، device_id رو هم با فاصله بفرستی.")
-        elif data.startswith("accrm:"):
-            try:
-                slot = int(data[6:])
-            except ValueError:
+        @self.bot.on(events.NewMessage(pattern=r"^/setarchive(?:\s+(-?\d+|off))?$"))
+        async def cmd_setarchive(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
                 return
-            if self.pool.remove(slot):
-                await ev.respond(f"🗑 اکانت {slot} حذف شد.")
-            await self._show_panel(ev, "accounts")
-        elif data.startswith("sett:"):
-            await self._prompt_setting(ev, data[5:])
+            val = (event.pattern_match.group(1) or "").strip()
+            if not val:
+                cur = self.db.get_setting("archive_chat_id", "تنظیم نشده")
+                await event.reply(
+                    f"📦 کانال آرشیو فعلی: <code>{html.escape(cur)}</code>\n"
+                    f"برای تنظیم: <code>/setarchive -1001234567890</code> (ربات باید ادمین کانال باشه)\n"
+                    f"برای غیرفعال کردن: <code>/setarchive off</code>",
+                    parse_mode="html",
+                )
+                return
+            if val.lower() == "off":
+                self.db.set_setting("archive_chat_id", "")
+                await event.reply("✅ ارسال خودکار به کانال آرشیو غیرفعال شد.")
+            else:
+                self.db.set_setting("archive_chat_id", val)
+                await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
 
-    async def _do_quick_record(self, ev, cid: str) -> None:
-        if self.rec_mgr.is_recording(cid):
-            await ev.respond("⏺ همین الان در حال ضبطه.")
+        @self.bot.on(events.NewMessage(pattern=r"^/settings$"))
+        async def cmd_settings(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            await self._send_settings_view(event)
+
+        @self.bot.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith("/")))
+        async def on_plain_text(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            mode = self._awaiting_input.pop(event.sender_id, None)
+            raw = event.text.strip()
+            if mode == "rec":
+                await self._handle_manual_rec(event, raw)
+            elif mode == "watch":
+                await self._handle_add_watch(event, raw)
+            else:
+                # Smart direct-paste: if user pastes a SuperLive link or numeric ID directly
+                if "superlive" in raw.lower() or "spl-live" in raw.lower() or re.fullmatch(r"\d{5,15}", raw):
+                    cid = extract_creator_identifier(raw)
+                    await event.reply(
+                        f"آیدی <code>{html.escape(cid)}</code> تشخیص داده شد. چیکار کنم؟",
+                        parse_mode="html",
+                        buttons=[
+                            [
+                                Button.inline("➕ اضافه به واچ‌لیست", data=f"qwatch:{cid}"),
+                                Button.inline("🎬 ضبط فوری", data=f"qrec:{cid}"),
+                            ]
+                        ],
+                    )
+
+        @self.bot.on(events.CallbackQuery())
+        async def on_callback(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                await event.answer("⛔ دسترسی ندارید", alert=True)
+                return
+            data = event.data.decode("utf-8", errors="ignore")
+            try:
+                if data == "page:home":
+                    text, buttons = self._dashboard_text_and_buttons()
+                    await event.edit(text, parse_mode="html", buttons=buttons)
+                elif data == "act:add_watch":
+                    self._awaiting_input[event.sender_id] = "watch"
+                    await event.answer()
+                    await event.respond("➕ آیدی عددی، یوزرنیم یا لینک پروفایل SuperLive رو بفرست:")
+                elif data == "act:manual_rec":
+                    self._awaiting_input[event.sender_id] = "rec"
+                    await event.answer()
+                    await event.respond("🎬 آیدی یا لینک استریمر رو برای ضبط فوری بفرست:")
+                elif data.startswith("page:watchlist:"):
+                    page = int(data.split(":")[2])
+                    await self._send_watchlist_view(event, page=page, edit=True)
+                elif data == "page:active":
+                    await self._send_active_view(event, edit=True)
+                elif data.startswith("page:archive:"):
+                    page = int(data.split(":")[2])
+                    await self._send_archive_view(event, page=page, edit=True)
+                elif data == "page:settings":
+                    await self._send_settings_view(event, edit=True)
+                elif data.startswith("qwatch:"):
+                    cid = data.split(":", 1)[1]
+                    await event.answer("در حال افزودن...")
+                    await self._handle_add_watch(event, cid)
+                elif data.startswith("qrec:"):
+                    cid = data.split(":", 1)[1]
+                    await event.answer("در حال بررسی لایو...")
+                    await self._handle_manual_rec(event, cid)
+                elif data.startswith("toggle:"):
+                    cid = data.split(":", 1)[1]
+                    val = self.db.toggle_auto_record(cid)
+                    await event.answer("ضبط خودکار روشن شد ✅" if val else "ضبط خودکار خاموش شد ⏸")
+                    await self._send_watchlist_view(event, page=0, edit=True)
+                elif data.startswith("rmwatch:"):
+                    cid = data.split(":", 1)[1]
+                    self.db.remove_watch(cid)
+                    await event.answer("از واچ‌لیست حذف شد 🗑")
+                    await self._send_watchlist_view(event, page=0, edit=True)
+                elif data.startswith("stop:"):
+                    cid = data.split(":", 1)[1]
+                    ok = await self.rec_mgr.stop_recording(cid)
+                    await event.answer("در حال توقف و ارسال ویدیو..." if ok else "ضبط فعالی پیدا نشد")
+                    await self._send_active_view(event, edit=True)
+                elif data.startswith("set:"):
+                    await self._handle_setting_toggle(event, data.split(":", 1)[1])
+            except MessageNotModifiedError:
+                await event.answer()
+            except Exception as e:
+                log.warning("Callback error (%s): %s", data, e)
+                await event.answer("خطا در اجرای دستور", alert=False)
+
+    async def _handle_add_watch(self, event: Any, raw: str) -> None:
+        wait_msg = await event.respond("⏳ در حال شناسایی استریمر در SuperLive...")
+        cid, uname, dname, avatar = await self.api.resolve_creator(raw)
+        if not cid:
+            await wait_msg.edit("❌ نتونستم آیدی معتبری از این متن استخراج کنم.")
             return
-        if not self.rec_mgr.has_capacity():
-            await ev.respond("⚠️ ظرفیت ضبط پر است.")
+        added = self.db.add_watch(cid, uname, dname, avatar)
+        info = await self.api.check_creator_and_get_stream(cid)
+        if info.is_live:
+            self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
+            ok, rec_msg = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="watchlist")
+            await wait_msg.edit(
+                f"{'✅ به واچ‌لیست اضافه شد' if added else '♻️ در واچ‌لیست بروزرسانی شد'}: "
+                f"<b>{html.escape(info.display_name or dname or cid)}</b> (<code>{cid}</code>)\n"
+                f"{rec_msg}",
+                parse_mode="html",
+            )
+        else:
+            await wait_msg.edit(
+                f"{'✅ به واچ‌لیست اضافه شد' if added else '♻️ در واچ‌لیست بود (بروزرسانی شد)'}:\n"
+                f"👤 <b>{html.escape(info.display_name or dname or cid)}</b> (<code>{cid}</code>)\n"
+                f"⚫ وضعیت فعلی: آفلاین — به محض آنلاین شدن خودکار ضبط می‌شه.",
+                parse_mode="html",
+                buttons=[[Button.inline("📋 مشاهده واچ‌لیست", data="page:watchlist:0")]],
+            )
+
+    async def _handle_manual_rec(self, event: Any, raw: str) -> None:
+        wait_msg = await event.respond("🔍 در حال بررسی آنلاین بودن استریمر...")
+        cid, _, dname, _ = await self.api.resolve_creator(raw)
+        if not cid:
+            await wait_msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
             return
-        await ev.respond("🔎 در حال بررسی و شروع ضبط...")
-        try:
-            info = await self.api.check_creator_and_get_stream(cid)
-            if not info.is_live or not info.stream_url:
-                await ev.respond("⚫ لایو نیست یا استریم در دسترس نیست.")
-                return
-            ok, msg = await self.rec_mgr.start_recording(
-                info, chat_id=ev.chat_id, triggered_by="manual")
-            await ev.respond(msg if not ok else f"✅ {msg}", parse_mode="html")
-            await self._show_panel(ev, "person", info.creator_id, 0)
-        except Exception as e:
-            await ev.respond(f"❌ خطا: {e}")
+        info = await self.api.check_creator_and_get_stream(cid)
+        if not info.is_live:
+            await wait_msg.edit(
+                f"⚫ استریمر <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.\n"
+                f"می‌خوای به واچ‌لیست اضافه کنم تا هر وقت آنلاین شد خودکار ضبط بشه؟",
+                parse_mode="html",
+                buttons=[[Button.inline("➕ اضافه به واچ‌لیست", data=f"qwatch:{info.creator_id}")]],
+            )
+            return
+        ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
+        await wait_msg.edit(msg_text, parse_mode="html")
 
-    async def _prompt_setting(self, ev, key: str) -> None:
-        prompts = {
-            "split_minutes": "⏱ تقسیم خودکار به دقیقه (0 = خاموش):",
-            "part_mb": "💾 سقف حجم هر پارت به MB (50-1950):",
-            "poll_interval": "🔄 بازه چک واچ‌لیست به ثانیه (10-300):",
-            "notify_ttl": "🕘 خودحذفی اعلان‌ها به ثانیه (0 = بدون حذف):",
-            "archive_chat_id": "📦 آیدی عددی کانال آرشیو (0 = خاموش):",
-        }
-        self._awaiting_input[ev.chat_id] = f"set:{key}"
-        await ev.respond(prompts.get(key, f"مقدار {key}:"))
+    async def _send_watchlist_view(self, event: Any, page: int = 0, edit: bool = False) -> None:
+        items = self.db.list_watchlist()
+        per_page = 6
+        total_pages = max(1, (len(items) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        chunk = items[page * per_page : (page + 1) * per_page]
 
-    async def _handle_input(self, ev, state: str, text: str) -> None:
-        self._awaiting_input.pop(ev.chat_id, None)
-        try:
-            if state == "add":
-                await ev.respond("🔎 در حال جستجو...")
-                cid, uname, dname, avatar = await self.api.resolve_creator(text)
-                if not cid:
-                    await ev.respond("❌ پیدا نشد.")
-                    return
-                is_new = self.db.add_watch(cid, username=uname,
-                                           display_name=dname, avatar_url=avatar)
-                await ev.respond(
-                    f"{'✅ اضافه شد' if is_new else '♻️ بروزرسانی شد'}: "
-                    f"<b>{html.escape(dname or cid)}</b>\n🆔 <code>{cid}</code>",
-                    parse_mode="html")
-                await self._show_panel(ev, "person", cid, 0)
-            elif state == "qr":
-                await ev.respond("🎬 در حال آماده‌سازی...")
-                cid, _, _, _ = await self.api.resolve_creator(text)
-                if not cid:
-                    await ev.respond("❌ پیدا نشد.")
-                    return
-                await self._do_quick_record(ev, cid)
-            elif state == "accadd":
-                parts = text.split()
-                token = parts[0] if parts else ""
-                device = parts[1] if len(parts) > 1 else ""
-                if not token or len(token) < 20:
-                    await ev.respond("❌ توکن نامعتبر.")
-                    return
-                c = self.pool.add(token, device_id=device)
-                await ev.respond(f"✅ اکانت {c.slot} اضافه شد.")
-                await self._show_panel(ev, "accounts")
-            elif state.startswith("set:"):
-                key = state[4:]
-                if key in ("split_minutes", "poll_interval", "notify_ttl", "part_mb", "archive_chat_id"):
-                    if not text.lstrip("-").isdigit() and key != "archive_chat_id":
-                        await ev.respond("❌ عدد نامعتبر.")
-                        return
-                self.db.set_setting(key, text)
-                await ev.respond(f"✅ ذخیره شد: <code>{key} = {html.escape(text)}</code>",
-                                 parse_mode="html")
-                await self._show_panel(ev, "settings")
-        except Exception as e:
-            log.exception("Input handling failed")
-            await ev.respond(f"❌ خطا: {e}")
+        lines = [f"📋 <b>واچ‌لیست شخصی (نامحدود) — صفحه {page+1}/{total_pages}</b>\n"]
+        buttons: List[List[Any]] = []
+        if not chunk:
+            lines.append("هنوز کسی توی واچ‌لیست نیست. با `/watch ID` یا دکمه پایین اضافه کن.")
+        else:
+            for item in chunk:
+                cid = item["creator_id"]
+                name = html.escape(item["display_name"] or cid)
+                is_rec = self.rec_mgr.is_recording(cid)
+                st = "⏺ در حال ضبط" if is_rec else ("🔴 آنلاین" if item["last_status"] == "live" else "⚫ آفلاین")
+                auto = "✅" if item["auto_record"] else "⏸"
+                lines.append(f"• <b>{name}</b> (<code>{cid}</code>) — {st} | خودکار: {auto} | ضبط‌ها: {item['total_recordings']}")
+                buttons.append(
+                    [
+                        Button.inline(f"🎬 ضبط {item['display_name'][:12] or cid}", data=f"qrec:{cid}"),
+                        Button.inline(f"{'⏸' if item['auto_record'] else '▶️'} خودکار", data=f"toggle:{cid}"),
+                        Button.inline("🗑 حذف", data=f"rmwatch:{cid}"),
+                    ]
+                )
 
-    # --------------------------------------------------------------- lifecycle
-    async def start(self) -> None:
+        nav: List[Any] = []
+        if page > 0:
+            nav.append(Button.inline("⬅️ قبلی", data=f"page:watchlist:{page-1}"))
+        if page < total_pages - 1:
+            nav.append(Button.inline("بعدی ➡️", data=f"page:watchlist:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("➕ افزودن جدید", data="act:add_watch"), Button.inline("🏠 منو", data="page:home")])
+
+        text = "\n".join(lines)
+        if edit:
+            await event.edit(text, parse_mode="html", buttons=buttons)
+        else:
+            await event.reply(text, parse_mode="html", buttons=buttons)
+
+    async def _send_active_view(self, event: Any, edit: bool = False) -> None:
+        actives = list(self.rec_mgr.active.values())
+        lines = [f"🔴 <b>ضبط‌های فعال الان ({len(actives)})</b>\n"]
+        buttons: List[List[Any]] = []
+        if not actives:
+            lines.append("در حال حاضر هیچ استریمی در حال ضبط نیست.")
+        else:
+            for rec in actives:
+                elapsed = fmt_duration(time.time() - rec.started_at)
+                lines.append(
+                    f"• <b>{html.escape(rec.creator_name)}</b> (<code>{rec.creator_id}</code>)\n"
+                    f"  ⏱ {elapsed} | 💾 {fmt_bytes(rec.bytes_written)} | پارت {rec.part_number}\n"
+                    f"  📌 {html.escape(rec.status_text)}"
+                )
+                buttons.append([Button.inline(f"⏹ توقف و ارسال {rec.creator_name[:16]}", data=f"stop:{rec.creator_id}")])
+
+        buttons.append([Button.inline("🔄 بروزرسانی", data="page:active"), Button.inline("🏠 منو", data="page:home")])
+        text = "\n".join(lines)
+        if edit:
+            await event.edit(text, parse_mode="html", buttons=buttons)
+        else:
+            await event.reply(text, parse_mode="html", buttons=buttons)
+
+    async def _send_archive_view(self, event: Any, page: int = 0, edit: bool = False) -> None:
+        per_page = 8
+        rows = self.db.list_recent_recordings(limit=per_page, offset=page * per_page)
+        lines = [f"📚 <b>آرشیو ضبط‌شده‌ها — صفحه {page+1}</b>\n"]
+        if not rows:
+            lines.append("هنوز ویدیویی در آرشیو ثبت نشده.")
+        else:
+            for r in rows:
+                icon = "✅" if r["status"] == "completed" else ("🔴" if r["status"] == "recording" else "⚠️")
+                dt = (r["started_at"] or "")[:16].replace("T", " ")
+                lines.append(
+                    f"{icon} <b>{html.escape(r['creator_name'] or r['creator_id'])}</b> — "
+                    f"<code>{fmt_duration(r['duration_sec'])}</code> | <code>{fmt_bytes(r['file_size_bytes'])}</code>\n"
+                    f"   📅 {dt} | وضعیت: <code>{r['status']}</code>"
+                )
+        nav: List[Any] = []
+        if page > 0:
+            nav.append(Button.inline("⬅️ قبلی", data=f"page:archive:{page-1}"))
+        if len(rows) == per_page:
+            nav.append(Button.inline("بعدی ➡️", data=f"page:archive:{page+1}"))
+        buttons: List[List[Any]] = []
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("🏠 منو", data="page:home")])
+        text = "\n".join(lines)
+        if edit:
+            await event.edit(text, parse_mode="html", buttons=buttons)
+        else:
+            await event.reply(text, parse_mode="html", buttons=buttons)
+
+    async def _send_settings_view(self, event: Any, edit: bool = False) -> None:
+        sheet = self.db.get_setting("contact_sheet", "1") == "1"
+        notify = self.db.get_setting("notify_live", "1") == "1"
+        auto_del = self.db.get_setting("auto_delete", "1") == "1"
+        poll = self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
+        conc = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
+        arch = self.db.get_setting("archive_chat_id", "تنظیم نشده")
+
+        text = (
+            "⚙️ <b>تنظیمات SuperLiveRec</b>\n\n"
+            f"🖼 ارسال Contact Sheet (پیش‌نمایش ۴×۳): {'✅ روشن' if sheet else '❌ خاموش'}\n"
+            f"🔔 اعلان شروع ضبط: {'✅ روشن' if notify else '❌ خاموش'}\n"
+            f"🧹 حذف خودکار فایل از دیسک بعد از آپلود: {'✅ روشن' if auto_del else '❌ خاموش'}\n"
+            f"⏱ بازه چک کردن واچ‌لیست: <code>{poll} ثانیه</code>\n"
+            f"⚡ سقف ضبط هم‌زمان: <code>{'نامحدود' if conc == '0' else conc}</code>\n"
+            f"📦 کانال آرشیو: <code>{html.escape(arch)}</code>\n\n"
+            "• تنظیم کانال آرشیو: <code>/setarchive -100...</code>\n"
+            "• لاگین اکانت SuperLive (اختیاری): <code>/login email password</code>"
+        )
+        buttons = [
+            [
+                Button.inline(f"🖼 Contact Sheet: {'ON' if sheet else 'OFF'}", data="set:sheet"),
+                Button.inline(f"🔔 اعلان لایو: {'ON' if notify else 'OFF'}", data="set:notify"),
+            ],
+            [
+                Button.inline(f"🧹 پاکسازی دیسک: {'ON' if auto_del else 'OFF'}", data="set:autodel"),
+                Button.inline(f"⏱ بازه چک ({poll}s)", data="set:poll"),
+            ],
+            [
+                Button.inline(f"⚡ هم‌زمان ({'∞' if conc == '0' else conc})", data="set:conc"),
+                Button.inline("🏠 منو", data="page:home"),
+            ],
+        ]
+        if edit:
+            await event.edit(text, parse_mode="html", buttons=buttons)
+        else:
+            await event.reply(text, parse_mode="html", buttons=buttons)
+
+    async def _handle_setting_toggle(self, event: Any, key: str) -> None:
+        if key == "sheet":
+            cur = self.db.get_setting("contact_sheet", "1")
+            self.db.set_setting("contact_sheet", "0" if cur == "1" else "1")
+        elif key == "notify":
+            cur = self.db.get_setting("notify_live", "1")
+            self.db.set_setting("notify_live", "0" if cur == "1" else "1")
+        elif key == "autodel":
+            cur = self.db.get_setting("auto_delete", "1")
+            self.db.set_setting("auto_delete", "0" if cur == "1" else "1")
+        elif key == "poll":
+            opts = ["15", "25", "45", "60"]
+            cur = self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
+            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else "25"
+            self.db.set_setting("poll_interval", nxt)
+        elif key == "conc":
+            opts = ["4", "8", "15", "0"]
+            cur = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
+            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else "8"
+            self.db.set_setting("max_concurrent", nxt)
+        await event.answer("تنظیمات ذخیره شد ✅")
+        await self._send_settings_view(event, edit=True)
+
+    async def _start_health_server(self) -> Optional[web.AppRunner]:
+        port_raw = os.environ.get("PORT", "").strip()
+        if not port_raw or not port_raw.isdigit():
+            return None
+        port = int(port_raw)
+        app = web.Application()
+
+        async def handle_health(_request: Any) -> web.Response:
+            _, free_mb, _ = get_disk_stats()
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "service": "SuperLiveRec Personal Unlimited",
+                    "active_recordings": len(self.rec_mgr.active),
+                    "watchlist_count": len(self.db.list_watchlist()),
+                    "free_disk_mb": round(free_mb, 1),
+                    "agora_ready": AGORA_AVAILABLE,
+                }
+            )
+
+        app.router.add_get("/", handle_health)
+        app.router.add_get("/health", handle_health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        log.info("Healthcheck HTTP server listening on port %d", port)
+        return runner
+
+    async def run(self) -> None:
+        # Clean up stale interrupted recordings & orphan temp directories from prior restarts
+        stale = self.db.mark_stale_recordings_interrupted()
+        if stale:
+            log.info("Marked %d stale recordings as interrupted.", stale)
+        if self.db.get_setting("auto_delete", "1") == "1":
+            for child in RECORDINGS_DIR.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        self._register_handlers()
+        health_runner = await self._start_health_server()
+        log.info("Starting SuperLiveRec Personal Unlimited Bot (Telethon MTProto)...")
         await self.bot.start(bot_token=BOT_TOKEN)
         me = await self.bot.get_me()
-        log.info("Bot @%s started", me.username)
-        self.db.mark_stale_recordings_interrupted()
-        self._register_handlers()
-        self.rec_mgr.on_change = self._request_panel_refresh
+        log.info("Logged in as @%s (id=%s) | FFmpeg=%s | Agora=%s", me.username, me.id, FFMPEG_BIN, AGORA_AVAILABLE)
         self.monitor.start()
-        owner = self.db.get_owner_id()
-        if owner:
-            try:
-                await self.bot.send_message(
-                    owner,
-                    "🚀 <b>SuperLive Recorder</b> روشن شد.",
-                    parse_mode="html", buttons=main_keyboard())
-            except Exception:
-                pass
-
-    async def shutdown(self) -> None:
-        log.info("Shutting down...")
         try:
+            await self.bot.run_until_disconnected()
+        finally:
             await self.monitor.stop()
-        except Exception:
-            pass
-        try:
             await self.rec_mgr.stop_all()
-        except Exception:
-            pass
-        # Give active tasks a moment
+            tasks = [r.task for r in list(self.rec_mgr.active.values()) if r.task]
+            if tasks:
+                log.info("Waiting for %d recordings to finalize...", len(tasks))
+                await asyncio.wait(tasks, timeout=600)
+            await self.api.close()
+            if health_runner:
+                await health_runner.cleanup()
+
+
+async def main() -> None:
+    app = SuperLiveRecBot()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            await asyncio.sleep(2.0)
-        except Exception:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(app.bot.disconnect()))
+        except NotImplementedError:
             pass
-        try:
-            await self.pool.close()
-        except Exception:
-            pass
-        try:
-            self.db.close()
-        except Exception:
-            pass
-        try:
-            await self.bot.disconnect()
-        except Exception:
-            pass
-
-
-async def _async_main() -> None:
-    bot = SuperLiveRecBot()
-    shutdown = asyncio.Event()
-
-    def _sig(*_):
-        shutdown.set()
-
-    try:
-        loop = asyncio.get_running_loop()
-        for s in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(s, _sig)
-            except NotImplementedError:
-                pass
-    except Exception:
-        pass
-
-    try:
-        await bot.start()
-        await shutdown.wait()
-    finally:
-        await bot.shutdown()
-
-
-def main() -> None:
-    try:
-        asyncio.run(_async_main())
-    except KeyboardInterrupt:
-        pass
+    await app.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
