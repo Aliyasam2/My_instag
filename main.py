@@ -2565,6 +2565,14 @@ class RecordingManager:
                     log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
                     rec.status_text = "اتصال قطع شد، اتصال مجدد..."
                     break
+                if not connected_ok:
+                    log.warning("Agora never connected for %s: %s", rec.creator_id, receiver.conn_events[-4:])
+                    rec.status_text = "اتصال برقرار نشد"
+                    break
+                if receiver.video_frames == 0 and time.time() - session_start >= 25:
+                    log.warning("No video at all for %s after 25s: %s", rec.creator_id, receiver.conn_events[-4:])
+                    rec.status_text = "تصویری دریافت نشد"
+                    break
                 ref = receiver.last_video_at or session_start
                 if connected_ok and time.time() - ref >= VIDEO_STALL_TIMEOUT:
                     log.warning("Video stalled for %s (%.0fs), reconnecting", rec.creator_id, time.time() - ref)
@@ -3051,6 +3059,7 @@ class SuperLiveRecBot:
                 f"{conn} <b>{html.escape(short(r.creator_name, 24))}</b>\n"
                 f"   ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code> کل  ·  "
                 f"<code>{fmt_duration(time.time() - r.seg_started_at)}</code> پارت {r.part_number}  ·  💾 <code>{fmt_bytes(r.bytes_written)}</code>\n"
+                f"   👥 {html.escape(r.client.label if r.client else '-')}  ·  🎞 <code>{r.livestream_id}</code>  ·  📌 {html.escape(r.status_text)}\n"
                 f"   📤 {r.uploaded_parts} پارت ارسال شده" + (f"  ·  {html.escape(r.upload_status)}" if r.upload_status else "")
             )
             buttons.append([
@@ -3101,11 +3110,19 @@ class SuperLiveRecBot:
                 st = "⚪ بدون توکن"
             elif busy:
                 r = self.rec_mgr.active.get(busy)
-                st = f"⏺ مشغول: {html.escape(short(r.creator_name if r else busy, 16))}"
+                if r:
+                    st = (f"⏺ در حال ضبط <b>{html.escape(short(r.creator_name, 18))}</b>\n"
+                          f"     🎞 لایو: <a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
+                          f"  ·  ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
+                          f"  ·  {'🟢 تصویر میرسه' if r.connected else '🟡 در حال اتصال'}")
+                else:
+                    st = "⏳ در حال آمادهسازی..."
             else:
                 st = "🟢 آزاد"
             lines.append(f"• <b>{html.escape(c.label)}</b>{' (اصلی)' if slot == 0 else ''} — {st}")
             row = [Button.inline(f"🔑 {short(c.label, 10)}", data=f"acct:{slot}")]
+            if busy and busy in self.rec_mgr.active:
+                row.insert(0, Button.inline("👤 ضبط", data=f"p:{busy}:0"))
             if slot != 0:
                 row.append(Button.inline("🗑", data=f"accrmq:{slot}"))
             buttons.append(row)
@@ -3164,9 +3181,13 @@ class SuperLiveRecBot:
                 self._panel[chat_id] = msg
             except MessageNotModifiedError:
                 pass
+            except Exception as e:
+                log.warning("Panel edit failed (%s), sending new", e)
+                msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False)
+                self._panel[chat_id] = msg
         else:
             old = self._panel.get(chat_id)
-            msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons)
+            msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False)
             self._panel[chat_id] = msg
             if old is not None:
                 try:
@@ -3186,7 +3207,7 @@ class SuperLiveRecBot:
                     if time.time() > self._panel_until.get(chat_id, 0):
                         continue
                     view, args = self._panel_view.get(chat_id, ("home", ()))
-                    if view not in ("home", "watchlist", "person", "active"):
+                    if view not in ("home", "watchlist", "person", "active", "accounts"):
                         continue
                     text, buttons = self.render(view, *args)
                     if text == self._panel_last.get(chat_id):
@@ -3205,7 +3226,14 @@ class SuperLiveRecBot:
         old_id = self.db.get_setting(f"kb_msg_{chat_id}", "")
         if old_id and not force:
             return
-        m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.", buttons=main_keyboard())
+        try:
+            markup = main_keyboard()
+            m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.", buttons=markup)
+        except Exception as e:
+            log.warning("Persistent keyboard failed (%s), using simple keyboard", e)
+            rows = [[KB_WATCH, KB_ACTIVE], [KB_ADD, KB_REC], [KB_ARCHIVE, KB_SETTINGS], [KB_HOME]]
+            m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.",
+                                            buttons=[[Button.text(t, resize=True) for t in r] for r in rows])
         self.db.set_setting(f"kb_msg_{chat_id}", str(m.id))
         if old_id.isdigit():
             try:
@@ -3234,8 +3262,15 @@ class SuperLiveRecBot:
             self._awaiting_input.pop(event.sender_id, None)
             await self._delete_user_msg(event)
             # (re)attach the persistent bottom keyboard
-            await self._ensure_keyboard(event.chat_id, force=True)
-            await self.show(event, "home")
+            try:
+                await self.show(event, "home")
+            except Exception as e:
+                log.exception("Home panel failed: %s", e)
+                await event.respond(f"⚠️ خطا در نمایش منو: <code>{html.escape(str(e)[:300])}</code>", parse_mode="html")
+            try:
+                await self._ensure_keyboard(event.chat_id, force=True)
+            except Exception as e:
+                log.exception("Keyboard failed: %s", e)
 
         @self.bot.on(events.NewMessage(func=lambda e: e.is_private and (e.raw_text or "") in KB_ALL))
         async def on_keyboard(event: Any) -> None:
@@ -3405,6 +3440,71 @@ class SuperLiveRecBot:
             else:
                 self.db.set_setting("archive_chat_id", val)
                 await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
+
+        @self.bot.on(events.NewMessage(pattern=r"^/guesttest\s+(.+)$"))
+        async def cmd_guesttest(event: Any) -> None:
+            """Test: can a brand-new GUEST device (no login) get an Agora token and receive video?"""
+            if not self._is_owner(event.sender_id):
+                return
+            raw = event.pattern_match.group(1).strip()
+            await self._delete_user_msg(event)
+            msg = await event.respond("🧪 تست مهمان: ساخت دستگاه جدید...")
+            slot = 90000 + random.randint(0, 9999)
+            guest = SuperLiveClient(self.db, slot)
+            guest._token = ""  # make sure no token is reused
+            lines = ["🧪 <b>نتیجه تست مهمان</b>", SEP, f"📱 device: <code>{guest._device_id[:12]}…</code>"]
+            work = RECORDINGS_DIR / f"guesttest_{slot}"
+            try:
+                init = await guest.ensure_initialized(force=True)
+                lines.append(f"1️⃣ initialize: HTTP <code>{init.get('_http_status')}</code> · توکن مهمان: <b>{'✅ گرفت' if guest.has_token() else '❌ نگرفت'}</b>")
+                if not guest.has_token():
+                    lines.append(f"<code>{html.escape(json.dumps(init, ensure_ascii=False)[:500])}</code>")
+
+                cid, _, dname, _ = await self.api.resolve_creator(raw)  # resolve with main account (read-only)
+                if not cid:
+                    lines.append("❌ استریمر/لایو پیدا نشد.")
+                    raise RuntimeError("stop")
+                info = await guest.check_creator_and_get_stream(cid)
+                d = info.raw_debug
+                lines.append(f"2️⃣ استریمر: <b>{html.escape(info.display_name or dname or cid)}</b> · لایو: <b>{'✅' if info.is_live else '❌'}</b> · ls: <code>{info.livestream_id or '-'}</code>")
+                lines.append(f"3️⃣ retrieve/enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code> · توکن Agora: <b>{'✅' if info.stream_url.startswith('agora://') else ('✅ (HLS)' if info.stream_url else '❌')}</b>")
+                if d.get("token_info"):
+                    lines.append(f"   🔑 <code>{html.escape(str(d['token_info'])[:200])}</code>")
+                if not info.stream_url:
+                    m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get("enter_sample", "")) + str(d.get("retrieve_sample", "")))
+                    if m:
+                        lines.append(f"   دلیل: <code>{html.escape(m.group(1))}</code>")
+                    lines.append(f"   <code>{html.escape(str(d.get('enter_sample', ''))[:400])}</code>")
+                    raise RuntimeError("stop")
+
+                if info.stream_url.startswith("agora://") and AGORA_AVAILABLE:
+                    await msg.edit("\n".join(lines + ["", "4️⃣ اتصال آزمایشی به Agora (۱۵ ثانیه)..."]), parse_mode="html")
+                    work.mkdir(parents=True, exist_ok=True)
+                    rcv = AgoraStreamReceiver(info.stream_url, work / "t.h264", work / "t.pcm")
+                    try:
+                        await asyncio.to_thread(rcv.connect)
+                        await asyncio.sleep(15)
+                    finally:
+                        await asyncio.to_thread(rcv.close)
+                    ok = rcv.video_frames > 0
+                    lines.append(
+                        f"4️⃣ Agora: <b>{'✅ تصویر رسید' if ok else '❌ تصویر نرسید'}</b> · "
+                        f"v=<code>{rcv.video_frames}</code> a=<code>{rcv.audio_frames}</code> uid=<code>{rcv.uid}</code>\n"
+                        f"   ev: <code>{html.escape(','.join(rcv.conn_events[:6]))}</code>"
+                    )
+                    lines += [SEP, "✅ <b>مهمان جواب میده</b> — میشه ضبط بدون اکانت رو ساخت." if ok
+                              else "❌ <b>مهمان توکن گرفت ولی تصویر نیومد</b> — خروجی رو بفرست."]
+                else:
+                    lines += [SEP, "✅ مهمان لینک استریم گرفت."]
+            except RuntimeError:
+                lines += [SEP, "❌ <b>مهمان کافی نیست</b> — باید با اکانت لاگینشده ضبط کرد."]
+            except Exception as e:
+                lines.append(f"⚠️ خطا: <code>{html.escape(str(e)[:300])}</code>")
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+                guest.wipe()
+                await guest.close()
+            await msg.edit("\n".join(lines)[:4000], parse_mode="html", link_preview=False)
 
         @self.bot.on(events.NewMessage(pattern=r"^/addacc\s+(\S+)\s+(\S+)(?:\s+(\S+))?$"))
         async def cmd_addacc(event: Any) -> None:
