@@ -223,6 +223,12 @@ def extract_creator_identifier(raw_input: str) -> str:
         return ""
     # Extract URL if pasted inside a sentence
     url_match = re.search(r"https?://[^\s]+", text)
+    # Direct livestream page link: https://superlive.chat/livestream/155964343
+    ls_match = re.search(r"/livestream/(\d{4,16})", text)
+    if ls_match:
+        return f"ls:{ls_match.group(1)}"
+    if text.lower().startswith("ls:") and text[3:].isdigit():
+        return text.lower()
     if url_match:
         url = url_match.group(0)
         parsed = urllib.parse.urlparse(url)
@@ -578,10 +584,8 @@ class SuperLiveClient:
         self._session: Optional[aiohttp.ClientSession] = None
         env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip()
         env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip()
-        default_sl_tok = "99da0e6171df700c93e67f436815af2026b8dd6a"
-        default_sl_dev = "42dabfbd4b8b05a85122b64d078755c1"
-        self._token: str = env_tok or db.get_setting("superlive_token", "") or default_sl_tok
-        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or default_sl_dev
+        self._token: str = env_tok or db.get_setting("superlive_token", "")
+        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
         self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
         self._rtc_id: str = (
             os.environ.get("SUPERLIVE_RTC_ID", "").strip()
@@ -802,6 +806,23 @@ class SuperLiveClient:
         await self.ensure_initialized()
         ident = extract_creator_identifier(raw_query)
         if not ident:
+            return "", "", "", ""
+
+        # 0) Livestream link -> ask SuperLive who owns this livestream
+        if ident.startswith("ls:"):
+            ls_id = ident[3:]
+            ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
+            owner = self._deep_find_keys(ret, ("livestream_owner_id",)).get("livestream_owner_id")
+            u = ret.get("user") if isinstance(ret.get("user"), dict) else {}
+            if not u:
+                lsobj = ret.get("livestream") if isinstance(ret.get("livestream"), dict) else {}
+                u = lsobj.get("user") if isinstance(lsobj.get("user"), dict) else {}
+            cid = str(owner or u.get("user_id") or u.get("id") or "")
+            if cid:
+                uname = str(u.get("username") or u.get("shared_id") or "")
+                dname = str(u.get("name") or uname or cid)
+                return cid, uname, dname, self._extract_avatar(u) if u else ""
+            log.warning("Could not resolve livestream %s owner: %s", ls_id, json.dumps(ret, ensure_ascii=False)[:300])
             return "", "", "", ""
 
         # 1) Try direct users/profile (in case ident is already internal user_id)
@@ -1098,10 +1119,7 @@ class SuperLiveClient:
         cache_name = info.display_name
 
         # 1) Query user profile only if not already matched in discover_map
-        if cache_ls_id:
-            prof_resp = {"_http_status": 200, "_skipped": "discover_hit"}
-        else:
-            prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
+        prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
             await self.ensure_initialized(force=True)
             prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1508,8 +1526,29 @@ class _VideoEncodedObserver(IVideoEncodedFrameObserver):  # type: ignore
         super().__init__()
         self.receiver = receiver
 
-    def on_encoded_video_frame(self, uid: Any, image_buffer: Any, length: int, video_encoded_frame_info: Any = None, *args: Any, **kwargs: Any) -> int:
-        self.receiver.handle_video_frame(image_buffer, length)
+    def on_encoded_video_frame(self, *args: Any, **kwargs: Any) -> int:
+        # SDK versions differ: (uid, buf, len, info) or (observer, uid, buf, len, info).
+        # Find the bytes-like buffer and the int length that follows it, whatever the order.
+        try:
+            buf = kwargs.get("image_buffer")
+            length = kwargs.get("length")
+            if buf is None:
+                vals = list(args)
+                for i, a in enumerate(vals):
+                    if isinstance(a, (bytes, bytearray, memoryview)) or (
+                        hasattr(a, "__len__") and not isinstance(a, str) and hasattr(a, "__getitem__") and len(a) > 16
+                    ):
+                        buf = a
+                        nxt = vals[i + 1] if i + 1 < len(vals) else None
+                        length = nxt if isinstance(nxt, int) and nxt > 0 else len(a)
+                        break
+            if buf is not None:
+                self.receiver.handle_video_frame(buf, int(length or len(buf)))
+            elif not self.receiver.cb_error:
+                self.receiver.cb_error = "video_cb_args=" + ",".join(type(a).__name__ for a in args)
+        except Exception as e:
+            if not self.receiver.cb_error:
+                self.receiver.cb_error = f"video_cb:{e}"
         return 1
 
 
@@ -1590,9 +1629,10 @@ class AgoraStreamReceiver:
         self.conn_events: List[str] = []
         self.connect_rc: Any = None
         self.diag_flags: str = ""
+        self.cb_error: str = ""
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
-        if self._closed or not image_buffer or length <= 0:
+        if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
             return
         try:
             data = bytes(image_buffer[:length]) if not isinstance(image_buffer, (bytes, bytearray)) else image_buffer[:length]
@@ -1602,8 +1642,9 @@ class AgoraStreamReceiver:
                     self.video_frames += 1
                     self.bytes_written += len(data)
                     self.last_frame_at = time.time()
-        except Exception:
-            pass
+        except Exception as e:
+            if not self.cb_error:
+                self.cb_error = f"video_write:{e}"
 
     def handle_audio_frame(self, audio_frame: Any) -> None:
         if self._closed or audio_frame is None:
@@ -1848,6 +1889,7 @@ class ActiveRecording:
     bytes_written: int = 0
     part_number: int = 1
     task: Optional[asyncio.Task] = None
+    agora_diag: str = ""
 
 
 class RecordingManager:
@@ -2051,12 +2093,11 @@ class RecordingManager:
             "-movflags", "+faststart",
             str(output_mp4),
         ]
-        ff_log_fh = open(output_mp4.with_suffix(".ffmpeg.log"), "wb")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=ff_log_fh,
+            stderr=open(output_mp4.with_suffix(".ffmpeg.log"), "wb"),
         )
         reached_size_cap = False
         try:
@@ -2091,10 +2132,6 @@ class RecordingManager:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except Exception:
                         proc.kill()
-            try:
-                ff_log_fh.close()
-            except Exception:
-                pass
         return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
 
     async def _capture_agora_part(
@@ -2172,8 +2209,10 @@ class RecordingManager:
         rec.status_text = (
             f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
             f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, tok={len(receiver.token)}, "
-            f"{receiver.diag_flags}"
+            f"{receiver.diag_flags}, h264={h264_file.stat().st_size if h264_file.exists() else 0}B, "
+            f"pcm={pcm_file.stat().st_size if pcm_file.exists() else 0}B, cb_err={receiver.cb_error or '-'}"
         )
+        rec.agora_diag = rec.status_text
         log.info("Agora capture ended for %s: %s", rec.creator_id, rec.status_text)
         mux_cmd = build_mux_command(
             FFMPEG_BIN or "ffmpeg",
@@ -2185,6 +2224,11 @@ class RecordingManager:
             channels=ch,
         )
         if not mux_cmd:
+            return False, False
+        if receiver.video_frames == 0:
+            log.warning("No video frames for %s; skipping mux. %s", rec.creator_id, rec.status_text)
+            h264_file.unlink(missing_ok=True)
+            pcm_file.unlink(missing_ok=True)
             return False, False
 
         proc = await asyncio.create_subprocess_exec(
@@ -2268,6 +2312,8 @@ class RecordingManager:
             f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>\n"
             f"📐 کیفیت: <code>{width}x{height}</code> | 📅 {date_str}"
         )
+        if rec.agora_diag:
+            caption += f"\n🛠 <code>{html.escape(rec.agora_diag[:400])}</code>"
 
         attrs = [
             DocumentAttributeVideo(
@@ -2538,7 +2584,10 @@ class SuperLiveRecBot:
             raw = event.pattern_match.group(1).strip()
             msg = await event.reply("🔍 در حال بررسی وضعیت استریمر...")
             cid, uname, dname, _ = await self.api.resolve_creator(raw)
-            info = await self.api.check_creator_and_get_stream(cid or raw)
+            if not cid:
+                await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+                return
+            info = await self.api.check_creator_and_get_stream(cid)
             status = "🔴 آنلاین (LIVE)" if info.is_live else "⚫ آفلاین"
             proto = "Agora RTC" if info.stream_url.startswith("agora://") else ("HLS/Direct" if info.stream_url else "نامشخص")
             await msg.edit(
@@ -2564,7 +2613,10 @@ class SuperLiveRecBot:
             raw = event.pattern_match.group(1).strip()
             msg = await event.reply("🛠 در حال دریافت پاسخ خام سرور SuperLive...")
             cid, _, _, _ = await self.api.resolve_creator(raw)
-            info = await self.api.check_creator_and_get_stream(cid or raw)
+            if not cid:
+                await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+                return
+            info = await self.api.check_creator_and_get_stream(cid)
             d = info.raw_debug
             report = (
                 f"🛠 <b>گزارش دیباگ API برای <code>{html.escape(info.creator_id)}</code></b>\n"
@@ -2751,7 +2803,10 @@ class SuperLiveRecBot:
     async def _handle_manual_rec(self, event: Any, raw: str) -> None:
         wait_msg = await event.respond("🔍 در حال بررسی آنلاین بودن استریمر...")
         cid, _, dname, _ = await self.api.resolve_creator(raw)
-        info = await self.api.check_creator_and_get_stream(cid or raw)
+        if not cid:
+            await wait_msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+            return
+        info = await self.api.check_creator_and_get_stream(cid)
         if not info.is_live:
             await wait_msg.edit(
                 f"⚫ استریمر <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.\n"
