@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperLiveRec Personal Unlimited Pro (v2.0)
+SuperLiveRec Personal Unlimited Pro (v2.1)
 ==========================================
 Personal, unlimited SuperLive livestream recorder & watchlist bot for Telegram,
 inspired by @superliverec_bot and StreamRecorder.io.
@@ -53,10 +53,9 @@ from telethon.tl.types import DocumentAttributeVideo
 # CONFIGURATION (Override via Environment Variables on Altare / VPS)
 # ==============================================================================
 
-BOT_TOKEN = os.environ.get(
-    "BOT_TOKEN",
-    "8837565058:AAExoYiFvTB7aq8aZHPENBu_qaWIxlgV6pM",
-).strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8837565058:AAExoYiFvTB7aq8aZHPENBu_qaWIxlgV6pM").strip()
+if not BOT_TOKEN:
+    sys.exit("❌ BOT_TOKEN environment variable is required (get a new one from @BotFather).")
 
 # Telethon MTProto credentials (needed for 2 GB uploads without 50 MB Bot API limit)
 # You can set your own from https://my.telegram.org via TG_API_ID / TG_API_HASH env vars
@@ -87,10 +86,15 @@ MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", "500"))
 AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
-# How many pages of /discover (live list) to scan when looking for a creator
-DISCOVER_PAGES = int(os.environ.get("DISCOVER_PAGES", "15"))
 # Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
 DEFAULT_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "8"))
+
+# Show Agora diagnostics in video captions (0/1)
+DEBUG_CAPTION = os.environ.get("DEBUG_CAPTION", "0") == "1"
+
+
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
 # ==============================================================================
 # LOGGING
@@ -396,7 +400,7 @@ class Database:
         display_name: str = "",
         avatar_url: str = "",
     ) -> bool:
-        now = datetime.datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         with self._lock, self._conn() as conn:
             existing = conn.execute(
                 "SELECT creator_id FROM watchlist WHERE creator_id = ?", (creator_id,)
@@ -463,7 +467,7 @@ class Database:
         username: str = "",
         increment_recordings: bool = False,
     ) -> None:
-        now = datetime.datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         with self._lock, self._conn() as conn:
             conn.execute(
                 """
@@ -492,7 +496,7 @@ class Database:
     def create_recording_record(
         self, creator_id: str, creator_name: str, livestream_id: str = ""
     ) -> int:
-        now = datetime.datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         with self._lock, self._conn() as conn:
             cur = conn.execute(
                 """
@@ -515,7 +519,7 @@ class Database:
         archive_message_id: int = 0,
         notes: str = "",
     ) -> None:
-        now = datetime.datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         with self._lock, self._conn() as conn:
             conn.execute(
                 """
@@ -552,7 +556,7 @@ class Database:
             return int(row["c"]) if row else 0
 
     def mark_stale_recordings_interrupted(self) -> int:
-        now = datetime.datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         with self._lock, self._conn() as conn:
             cur = conn.execute(
                 "UPDATE recordings SET status = 'interrupted', ended_at = ?, notes = 'Server restarted during capture' "
@@ -803,42 +807,9 @@ class SuperLiveClient:
                             return sub0
         return {}
 
-    async def expand_short_link(self, raw: str) -> str:
-        """Expand app share links (https://sprlv.link/s/XXXX or /XXXX) into the real superlive URL/ids."""
-        m = re.search(r"https?://(?:www\.)?sprlv\.link/[^\s]+", raw)
-        if not m:
-            return raw
-        url = m.group(0)
-        sess = await self._get_session()
-        texts: List[str] = []
-        try:
-            async with sess.get(url, allow_redirects=True, headers={"User-Agent": self._headers()["User-Agent"]}) as resp:
-                texts.append(str(resp.url))
-                for h in resp.history:
-                    texts.append(str(h.headers.get("Location", "")))
-                try:
-                    texts.append((await resp.text())[:20000])
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning("Short link expand failed for %s: %s", url, e)
-            return raw
-        blob = urllib.parse.unquote(" ".join(texts))
-        mls = re.search(r"livestream[/=_](?:id[=/])?(\d{5,16})", blob)
-        if mls:
-            log.info("Short link %s -> livestream %s", url, mls.group(1))
-            return f"https://superlive.chat/livestream/{mls.group(1)}"
-        mu = re.search(r"(?:user_id|profile|users?)[/=](\d{5,16})", blob)
-        if mu:
-            log.info("Short link %s -> user %s", url, mu.group(1))
-            return mu.group(1)
-        log.warning("Short link %s could not be parsed: %s", url, blob[:300])
-        return raw
-
     async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
         """Resolve any SuperLive user_id, public shared_id, username, or URL into (real_user_id, username, display_name, avatar)."""
         await self.ensure_initialized()
-        raw_query = await self.expand_short_link(raw_query)
         ident = extract_creator_identifier(raw_query)
         if not ident:
             return "", "", "", ""
@@ -872,15 +843,6 @@ class SuperLiveClient:
 
         # 2) Resolve via profile_share_search (translates public shared_id like 59534891 -> internal user_id)
         found_u = await self._search_by_shared_id(ident)
-        if not found_u:
-            # 3) Creator is live? The discover list contains both shared_id and real user_id
-            try:
-                dmap, _, _ = await self.fetch_discover_map(max_pages=DISCOVER_PAGES)
-                item = dmap.get(str(ident)) or dmap.get(str(ident).lower())
-                if item:
-                    found_u = item.get("user") or item.get("host") or item.get("broadcaster") or item
-            except Exception as e:
-                log.warning("discover lookup failed for %s: %s", ident, e)
         if found_u:
             cid = str(found_u.get("user_id") or found_u.get("id") or ident)
             uname = str(found_u.get("username") or found_u.get("shared_id") or "")
@@ -1163,7 +1125,10 @@ class SuperLiveClient:
         cache_name = info.display_name
 
         # 1) Query user profile only if not already matched in discover_map
-        prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
+        if info.raw_debug.get("discover_cache_hit"):
+            prof_resp = {"_http_status": "skipped (discover hit)"}
+        else:
+            prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
             await self.ensure_initialized(force=True)
             prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1238,7 +1203,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(DISCOVER_PAGES):
+            for page_idx in range(4):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -1509,29 +1474,34 @@ def generate_thumbnail_and_contact_sheet(
     except Exception:
         pass
 
-    # 2) 4x3 Contact Sheet (12 preview frames across the full stream)
+    # 2) 4x3 Contact Sheet: 12 fast keyframe seeks (no full decode of a 2 GB file)
     if make_sheet and duration_sec >= 15:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="sheet_", dir=str(video_path.parent)))
         try:
-            fps_val = max(0.0005, 12.0 / max(12.0, float(duration_sec)))
-            vf = f"fps={fps_val:.6f},scale=320:-2,tile=4x3:padding=4:margin=4:color=0x111111"
-            subprocess.run(
-                [
-                    FFMPEG_BIN, "-y",
-                    "-i", str(video_path),
-                    "-vf", vf,
-                    "-frames:v", "1",
-                    "-q:v", "3",
-                    str(sheet_path),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=45,
-                check=False,
-            )
-            if sheet_path.exists() and sheet_path.stat().st_size > 1000:
-                out_sheet = sheet_path
+            got = 0
+            for i in range(12):
+                ts = duration_sec * (i + 0.5) / 12.0
+                frame = tmp_dir / f"f_{got:02d}.jpg"
+                subprocess.run(
+                    [FFMPEG_BIN, "-y", "-ss", f"{ts:.2f}", "-i", str(video_path),
+                     "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", str(frame)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False,
+                )
+                if frame.exists() and frame.stat().st_size > 300:
+                    got += 1
+            if got >= 4:
+                subprocess.run(
+                    [FFMPEG_BIN, "-y", "-framerate", "1", "-i", str(tmp_dir / "f_%02d.jpg"),
+                     "-vf", "tile=4x3:padding=4:margin=4:color=0x111111",
+                     "-frames:v", "1", "-q:v", "3", str(sheet_path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False,
+                )
+                if sheet_path.exists() and sheet_path.stat().st_size > 1000:
+                    out_sheet = sheet_path
         except Exception:
             pass
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return out_thumb, out_sheet
 
@@ -1562,6 +1532,8 @@ class AgoraServiceManager:
                 svc.initialize(cfg)
                 cls._service = svc
                 cls._app_id = app_id
+            elif app_id and cls._app_id and app_id != cls._app_id:
+                log.warning("Agora App ID %s differs from initialized %s; connection may fail.", app_id, cls._app_id)
             return cls._service
 
 
@@ -1666,6 +1638,8 @@ class AgoraStreamReceiver:
         self.video_frames = 0
         self.audio_frames = 0
         self.bytes_written = 0
+        self.video_bytes = 0
+        self.audio_bytes = 0
         self.sample_rate = 48000
         self.channels = 1
         self._conn: Any = None
@@ -1684,6 +1658,7 @@ class AgoraStreamReceiver:
                 if not self._closed:
                     self._h264_fh.write(data)
                     self.video_frames += 1
+                    self.video_bytes += len(data)
                     self.bytes_written += len(data)
                     self.last_frame_at = time.time()
         except Exception as e:
@@ -1708,6 +1683,7 @@ class AgoraStreamReceiver:
                 if not self._closed:
                     self._pcm_fh.write(data)
                     self.audio_frames += 1
+                    self.audio_bytes += len(data)
                     self.bytes_written += len(data)
                     self.last_frame_at = time.time()
         except Exception:
@@ -1885,6 +1861,11 @@ class AgoraStreamReceiver:
         self.started_at = time.time()
         self.last_frame_at = time.time()
 
+    def estimated_output_bytes(self) -> int:
+        """Estimate final MP4 size: raw H.264 + PCM compressed to AAC 128 kbps."""
+        pcm_bps = max(1, self.sample_rate * self.channels * 2 * 8)
+        return int(self.video_bytes + self.audio_bytes * (128000 / pcm_bps))
+
     def estimated_fps(self) -> float:
         elapsed = max(1.0, self.last_frame_at - self.started_at)
         if self.video_frames < 10:
@@ -1943,6 +1924,15 @@ class RecordingManager:
         self.api = api
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
+        self._upload_sem = asyncio.Semaphore(int(os.environ.get("MAX_PARALLEL_UPLOADS", "2")))
+
+    def can_start(self, creator_id: str) -> bool:
+        """Cheap pre-check so the monitor doesn't hit the API for streams it can't record anyway."""
+        cid = str(creator_id)
+        if cid in self.active or time.time() < self._fail_cooldown.get(cid, 0.0):
+            return False
+        limit = self.max_concurrent()
+        return not (limit > 0 and len(self.active) >= limit)
 
     def max_concurrent(self) -> int:
         raw = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
@@ -2041,6 +2031,31 @@ class RecordingManager:
         last_arch_msg = 0
         notes = ""
 
+        upload_tasks: List[asyncio.Task] = []
+        upload_results: List[Tuple[int, int, int]] = []
+        upload_errors: List[str] = []
+        upload_sem = self._upload_sem
+
+        async def _upload_bg(part_path: Path, dur: int, part_no: int) -> None:
+            async with upload_sem:
+                try:
+                    res = await self._upload_part_to_telegram(rec, part_path, dur, status_msg, part_no)
+                    upload_results.append(res)
+                    if self.db.get_setting("auto_delete", "1") == "1":
+                        part_path.unlink(missing_ok=True)
+                except Exception as up_err:
+                    upload_errors.append(f"part{part_no}: {up_err}")
+                    log.warning("Upload of part %d for %s failed: %s", part_no, rec.creator_id, up_err)
+                    try:
+                        await self.bot.send_message(
+                            rec.chat_id,
+                            f"⚠️ آپلود پارت {part_no} از <b>{html.escape(rec.creator_name)}</b> ناموفق بود؛ "
+                            f"فایل روی دیسک نگه داشته شد:\n<code>{html.escape(str(part_path))}</code>",
+                            parse_mode="html",
+                        )
+                    except Exception:
+                        pass
+
         try:
             while not rec.stop_event.is_set():
                 part_mp4 = work_dir / f"{sanitize_filename(rec.creator_name)}_part{rec.part_number}.mp4"
@@ -2051,27 +2066,28 @@ class RecordingManager:
 
                 if captured_ok and part_mp4.exists() and part_mp4.stat().st_size > 10_000:
                     dur, _, _ = await asyncio.to_thread(probe_video_metadata, part_mp4)
-                    fsize = part_mp4.stat().st_size
                     total_duration += dur
-                    total_size += fsize
-                    msg_id, arch_chat, arch_msg = await self._upload_part_to_telegram(
-                        rec, part_mp4, dur, status_msg
-                    )
-                    last_msg_id = msg_id or last_msg_id
-                    last_arch_chat = arch_chat or last_arch_chat
-                    last_arch_msg = arch_msg or last_arch_msg
-
-                    # Cleanup uploaded part immediately if auto_delete enabled (protects 10 GiB disk)
-                    if self.db.get_setting("auto_delete", "1") == "1":
-                        try:
-                            part_mp4.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                    total_size += part_mp4.stat().st_size
+                    # Upload in background so the next part starts recording immediately
+                    upload_tasks.append(asyncio.create_task(_upload_bg(part_mp4, dur, rec.part_number)))
 
                 if reached_size_cap and not rec.stop_event.is_set():
                     rec.part_number += 1
+                    rec.status_text = f"در حال ضبط پارت {rec.part_number}..."
                     continue
                 break
+
+            if upload_tasks:
+                rec.status_text = "در حال تکمیل آپلود پارت‌ها..."
+                await asyncio.gather(*upload_tasks, return_exceptions=True)
+            for msg_id, arch_chat, arch_msg in upload_results:
+                last_msg_id = msg_id or last_msg_id
+                last_arch_chat = arch_chat or last_arch_chat
+                last_arch_msg = arch_msg or last_arch_msg
+            if upload_errors:
+                notes = "; ".join(upload_errors)[:300]
+                if not upload_results:
+                    final_status = "upload_failed"
 
             if total_size == 0:
                 final_status = "empty"
@@ -2099,6 +2115,9 @@ class RecordingManager:
             except Exception:
                 pass
         finally:
+            for t in upload_tasks:
+                if not t.done():
+                    t.cancel()
             self.db.finish_recording_record(
                 rec.db_rec_id,
                 status=final_status,
@@ -2110,15 +2129,14 @@ class RecordingManager:
                 archive_message_id=last_arch_msg,
                 notes=notes,
             )
-            if final_status == "completed":
-                self.db.update_watch_status(
-                    rec.creator_id,
-                    "offline",
-                    display_name=rec.creator_name,
-                    increment_recordings=True,
-                )
+            self.db.update_watch_status(
+                rec.creator_id,
+                "offline",
+                display_name=rec.creator_name,
+                increment_recordings=(final_status == "completed"),
+            )
             self.active.pop(rec.creator_id, None)
-            if self.db.get_setting("auto_delete", "1") == "1" and final_status != "error":
+            if self.db.get_setting("auto_delete", "1") == "1" and final_status not in ("error", "upload_failed") and not upload_errors:
                 shutil.rmtree(work_dir, ignore_errors=True)
             if status_msg:
                 try:
@@ -2127,56 +2145,77 @@ class RecordingManager:
                     pass
 
     async def _capture_ffmpeg_part(self, rec: ActiveRecording, output_mp4: Path) -> Tuple[bool, bool]:
-        """Record HLS/FLV/RTMP directly with FFmpeg (-c copy, no re-encoding)."""
+        """Record HLS/FLV/RTMP with FFmpeg (-c copy) into crash-safe MPEG-TS, then remux to MP4."""
+        ts_path = output_mp4.with_suffix(".ts")
+        log_path = output_mp4.with_suffix(".ffmpeg.log")
         cmd = [FFMPEG_BIN or "ffmpeg", "-y"]
         if rec.stream_url.lower().startswith(("http://", "https://")):
             cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-        cmd += [
-            "-i", rec.stream_url,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            str(output_mp4),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=open(output_mp4.with_suffix(".ffmpeg.log"), "wb"),
-        )
+        cmd += ["-i", rec.stream_url, "-c", "copy", "-f", "mpegts", str(ts_path)]
         reached_size_cap = False
-        try:
-            while proc.returncode is None:
-                if rec.stop_event.is_set():
-                    break
-                if output_mp4.exists():
-                    sz = output_mp4.stat().st_size
-                    rec.bytes_written = sz
-                    if sz >= MAX_SINGLE_FILE_BYTES:
-                        reached_size_cap = True
+        with open(log_path, "wb") as log_fh:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=log_fh,
+            )
+            try:
+                while proc.returncode is None:
+                    if rec.stop_event.is_set():
                         break
-                _, free_mb, _ = get_disk_stats()
-                if free_mb < MIN_FREE_DISK_MB:
-                    log.warning("Disk low (%.0f MB free) - finalizing %s", free_mb, rec.creator_id)
-                    rec.stop_event.set()
-                    break
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    continue
-        finally:
-            if proc.returncode is None:
-                try:
-                    if proc.stdin:
-                        proc.stdin.write(b"q\n")
-                        await proc.stdin.drain()
-                    await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except Exception:
-                    proc.terminate()
+                    if ts_path.exists():
+                        sz = ts_path.stat().st_size
+                        rec.bytes_written = sz
+                        if sz >= MAX_SINGLE_FILE_BYTES:
+                            reached_size_cap = True
+                            break
+                    _, free_mb, _ = get_disk_stats()
+                    if free_mb < MIN_FREE_DISK_MB:
+                        log.warning("Disk low (%.0f MB free) - finalizing %s", free_mb, rec.creator_id)
+                        rec.stop_event.set()
+                        break
                     try:
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        continue
+            finally:
+                if proc.returncode is None:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.write(b"q\n")
+                            await proc.stdin.drain()
+                        await asyncio.wait_for(proc.wait(), timeout=10.0)
                     except Exception:
-                        proc.kill()
-        return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except Exception:
+                            proc.kill()
+
+        if not ts_path.exists() or ts_path.stat().st_size <= 10_000:
+            ts_path.unlink(missing_ok=True)
+            return False, reached_size_cap
+
+        # Remux TS -> MP4 (faststart) for Telegram streaming; keep TS if remux fails
+        remux = await asyncio.create_subprocess_exec(
+            FFMPEG_BIN or "ffmpeg", "-y", "-i", str(ts_path), "-c", "copy",
+            "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", str(output_mp4),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await remux.communicate()
+        if remux.returncode != 0 or not output_mp4.exists() or output_mp4.stat().st_size <= 10_000:
+            log.warning("Remux with aac bsf failed, retrying plain: %s", err.decode("utf-8", "ignore")[-300:])
+            remux = await asyncio.create_subprocess_exec(
+                FFMPEG_BIN or "ffmpeg", "-y", "-i", str(ts_path), "-c", "copy",
+                "-movflags", "+faststart", str(output_mp4),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await remux.wait()
+        ok = output_mp4.exists() and output_mp4.stat().st_size > 10_000
+        if ok:
+            ts_path.unlink(missing_ok=True)
+        return ok, reached_size_cap
 
     async def _capture_agora_part(
         self, rec: ActiveRecording, work_dir: Path, output_mp4: Path
@@ -2222,7 +2261,7 @@ class RecordingManager:
         try:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(2.0)
-                rec.bytes_written = receiver.bytes_written
+                rec.bytes_written = receiver.estimated_output_bytes()
 
                 # Fast-exit if Agora rejected all token/UID candidates
                 if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
@@ -2234,7 +2273,7 @@ class RecordingManager:
                     break
 
                 # Roll over before hitting Telegram's 2 GB MTProto cap
-                if receiver.bytes_written >= MAX_SINGLE_FILE_BYTES:
+                if receiver.estimated_output_bytes() >= MAX_SINGLE_FILE_BYTES:
                     reached_size_cap = True
                     break
 
@@ -2296,9 +2335,9 @@ class RecordingManager:
         mp4_path: Path,
         duration_sec: int,
         status_msg: Any,
+        part_no: int = 1,
     ) -> Tuple[int, int, int]:
         """Upload up to 2 GB MP4 via Telethon MTProto with progress, cover thumb & contact sheet."""
-        rec.status_text = "در حال آپلود به تلگرام..."
         fsize = mp4_path.stat().st_size
         _, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
 
@@ -2341,22 +2380,22 @@ class RecordingManager:
                 try:
                     await status_msg.edit(
                         f"⬆️ <b>در حال آپلود ویدیو به تلگرام...</b>\n"
-                        f"👤 {html.escape(rec.creator_name)} (پارت {rec.part_number})\n"
+                        f"👤 {html.escape(rec.creator_name)} (پارت {part_no})\n"
                         f"📊 پیشرفت: <code>{pct:.1f}%</code> ({fmt_bytes(current)} / {fmt_bytes(total)})",
                         parse_mode="html",
                     )
                 except Exception:
                     pass
 
-        date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        part_label = f" | پارت {rec.part_number}" if rec.part_number > 1 else ""
+        date_str = utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        part_label = f" | پارت {part_no}" if (part_no > 1 or rec.part_number > 1) else ""
         caption = (
             f"🎬 <b>{html.escape(rec.creator_name)}</b>{part_label}\n"
             f"🆔 آیدی: <code>{rec.creator_id}</code>\n"
             f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>\n"
             f"📐 کیفیت: <code>{width}x{height}</code> | 📅 {date_str}"
         )
-        if rec.agora_diag:
+        if rec.agora_diag and DEBUG_CAPTION:
             caption += f"\n🛠 <code>{html.escape(rec.agora_diag[:400])}</code>"
 
         attrs = [
@@ -2445,14 +2484,14 @@ class WatchlistMonitor:
                     discover_map: Optional[Dict[str, Dict[str, Any]]] = None
                     if items:
                         try:
-                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=DISCOVER_PAGES)
+                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=4)
                         except Exception as e:
                             log.warning("Batch discover fetch failed: %s", e)
                     for item in items:
                         if self._stop.is_set():
                             break
                         cid = item["creator_id"]
-                        if not item["auto_record"] or self.rec_mgr.is_recording(cid):
+                        if not item["auto_record"] or not self.rec_mgr.can_start(cid):
                             continue
                         try:
                             info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
@@ -2495,10 +2534,13 @@ class SuperLiveRecBot:
         self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr)
         self._awaiting_input: Dict[int, str] = {}
 
-    def _is_owner(self, user_id: int) -> bool:
+    def _is_owner(self, user_id: int, allow_bind: bool = False) -> bool:
         owner = self.db.get_owner_id()
         if owner == 0:
+            if not allow_bind:
+                return False
             self.db.set_owner_id(user_id)
+            log.info("Bot bound to owner %s", user_id)
             return True
         return user_id == owner
 
@@ -2546,7 +2588,7 @@ class SuperLiveRecBot:
     def _register_handlers(self) -> None:
         @self.bot.on(events.NewMessage(pattern=r"^/(start|menu)(@\w+)?(\s.*)?$"))
         async def cmd_start(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
+            if not self._is_owner(event.sender_id, allow_bind=event.is_private):
                 await event.reply("⛔ این ربات شخصی هست و فقط برای مالک سرور فعاله.")
                 return
             self._awaiting_input.pop(event.sender_id, None)
@@ -2746,18 +2788,10 @@ class SuperLiveRecBot:
                 await self._handle_add_watch(event, raw)
             else:
                 # Smart direct-paste: if user pastes a SuperLive link or numeric ID directly
-                if "superlive" in raw.lower() or "spl-live" in raw.lower() or "sprlv" in raw.lower() or raw.startswith("@") or re.fullmatch(r"\d{5,15}", raw):
-                    wait = await event.reply("🔍 در حال شناسایی...")
-                    cid, _, dname, _ = await self.api.resolve_creator(raw)
-                    try:
-                        await wait.delete()
-                    except Exception:
-                        pass
-                    if not cid or len(f"qwatch:{cid}".encode()) > 64:
-                        await event.reply("❌ نتونستم استریمر رو از این لینک/آیدی پیدا کنم.")
-                        return
+                if "superlive" in raw.lower() or "spl-live" in raw.lower() or re.fullmatch(r"\d{5,15}", raw):
+                    cid = extract_creator_identifier(raw)
                     await event.reply(
-                        f"👤 <b>{html.escape(dname or cid)}</b> (<code>{html.escape(cid)}</code>) پیدا شد. چیکار کنم؟",
+                        f"آیدی <code>{html.escape(cid)}</code> تشخیص داده شد. چیکار کنم؟",
                         parse_mode="html",
                         buttons=[
                             [
@@ -3055,6 +3089,20 @@ class SuperLiveRecBot:
         log.info("Healthcheck HTTP server listening on port %d", port)
         return runner
 
+    async def graceful_shutdown(self) -> None:
+        """Stop recordings and finish uploads WHILE Telegram is still connected, then disconnect."""
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        log.info("Graceful shutdown requested...")
+        await self.monitor.stop()
+        await self.rec_mgr.stop_all()
+        tasks = [r.task for r in list(self.rec_mgr.active.values()) if r.task]
+        if tasks:
+            log.info("Waiting for %d recordings to finalize & upload...", len(tasks))
+            await asyncio.wait(tasks, timeout=900)
+        await self.bot.disconnect()
+
     async def run(self) -> None:
         # Clean up stale interrupted recordings & orphan temp directories from prior restarts
         stale = self.db.mark_stale_recordings_interrupted()
@@ -3081,11 +3129,6 @@ class SuperLiveRecBot:
             await self.bot.run_until_disconnected()
         finally:
             await self.monitor.stop()
-            await self.rec_mgr.stop_all()
-            tasks = [r.task for r in list(self.rec_mgr.active.values()) if r.task]
-            if tasks:
-                log.info("Waiting for %d recordings to finalize...", len(tasks))
-                await asyncio.wait(tasks, timeout=600)
             await self.api.close()
             if health_runner:
                 await health_runner.cleanup()
@@ -3096,7 +3139,7 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(app.bot.disconnect()))
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(app.graceful_shutdown()))
         except NotImplementedError:
             pass
     await app.run()
