@@ -800,6 +800,15 @@ class SuperLiveClient:
     def has_token(self) -> bool:
         return bool(self._token)
 
+    async def disallowed_reason(self, ls_id: str) -> str:
+        """'' if we may watch, else server reason (e.g. private_not_accepted)."""
+        try:
+            ret = await self._request_smart("livestream/retrieve", {"livestream_id": str(ls_id)})
+            r = ret.get("disallowed_reason")
+            return str(r) if r else ""
+        except Exception:
+            return ""
+
     def wipe(self) -> None:
         for k in ("superlive_token", "superlive_device_id", "superlive_auth_scheme", "superlive_rtc_id", "superlive_label"):
             self.db.set_setting(self._k(k), "")
@@ -1608,6 +1617,7 @@ def build_mux_command(
             "-c:a", "aac",
             "-b:a", "128k",
             "-af", "aresample=async=1",
+            "-shortest",
             "-movflags", "+faststart",
             str(output_mp4),
         ]
@@ -1789,10 +1799,15 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
         self.receiver = receiver
 
     def on_connected(self, *args: Any, **kwargs: Any) -> None:
+        self.receiver.is_connected = True
+        self.receiver.dropped_at = 0.0
         self.receiver.conn_events.append("connected")
 
     def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.is_connected = False
+        if self.receiver.dropped_at == 0.0:
+            self.receiver.dropped_at = time.time()
         self.receiver.conn_events.append(f"disconn({reason})")
         self.receiver.event_times.append((time.time(), "drop"))
 
@@ -1805,6 +1820,10 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
 
     def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
+        self.receiver.is_connected = False
+        self.receiver.fatal_error = True
+        if self.receiver.dropped_at == 0.0:
+            self.receiver.dropped_at = time.time()
         self.receiver.conn_events.append(f"fail({reason})")
         self.receiver.event_times.append((time.time(), "drop"))
 
@@ -1851,6 +1870,9 @@ class AgoraStreamReceiver:
         self._need_keyframe = True
         self.last_video_at = 0.0
         self.event_times: List[Tuple[float, str]] = []
+        self.is_connected = False
+        self.dropped_at = 0.0
+        self.fatal_error = False
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
@@ -1896,7 +1918,7 @@ class AgoraStreamReceiver:
                     return
                 # The SDK keeps firing playback callbacks with SILENCE after the connection drops,
                 # so audio is only written while video is actually arriving (A/V stay the same length).
-                if self._need_keyframe or time.time() - self.last_video_at > 3.0:
+                if self._need_keyframe or time.time() - self.last_video_at > 1.0:
                     return
                 self._pcm_fh.write(data)
                 self.audio_frames += 1
@@ -2170,6 +2192,7 @@ class ActiveRecording:
     uploaded_bytes: int = 0
     connected: bool = False
     client: Any = None
+    private_hit: bool = False
 
 
 FAILED_DIR = BASE_DIR / "failed_uploads"
@@ -2294,6 +2317,12 @@ class RecordingManager:
                 + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
                 + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
             )
+        reason = await client.disallowed_reason(fresh.livestream_id) if fresh.livestream_id else ""
+        if reason:
+            self._release(client.slot, cid)
+            if "private" in reason:
+                return False, "🔒 این لایو الان <b>خصوصی (Private)</b> هست؛ سرور فقط چند ثانیه اجازه دیدن میده. وقتی عمومی شد ضبط کن."
+            return False, f"⛔ سرور اجازه ورود نداد: <code>{html.escape(reason)}</code>"
         fresh.display_name = fresh.display_name or stream_info.display_name
         stream_info = fresh
         old_cid = cid
@@ -2384,21 +2413,39 @@ class RecordingManager:
 
         try:
             restarts = 0
+            short_drops = 0
             while not rec.stop_event.is_set():
                 parts_before = rec.part_number
+                iter_start = time.time()
                 if rec.stream_url.startswith("agora://"):
                     await self._agora_session(rec, work_dir, enqueue)
                 else:
                     await self._ffmpeg_session(rec, work_dir, enqueue)
+                session_dur = time.time() - iter_start
                 if rec.stop_event.is_set():
                     break
-                if rec.part_number > parts_before:
+                if rec.private_hit:
+                    break
+                if session_dur >= 30.0 and rec.part_number > parts_before:
                     restarts = 0
+                    short_drops = 0
+                elif session_dur < 15.0:
+                    short_drops += 1
+                    if short_drops >= 3:
+                        log.warning("Stopping %s after %d consecutive short drops (<15s): %s",
+                                    rec.creator_id, short_drops, rec.agora_diag)
+                        self._fail_cooldown[rec.creator_id] = time.time() + 180.0
+                        break
                 # Stream went quiet: is the creator really offline or was it a network hiccup?
                 try:
                     info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id)
                 except Exception:
                     info = None
+                if info and info.livestream_id:
+                    reason = await (rec.client or self.api).disallowed_reason(info.livestream_id)
+                    if "private" in reason:
+                        rec.private_hit = True
+                        break
                 if info and info.is_live and info.stream_url and restarts < 10:
                     restarts += 1
                     rec.stream_url = info.stream_url
@@ -2419,6 +2466,17 @@ class RecordingManager:
             if upload_tasks:
                 await asyncio.gather(*upload_tasks, return_exceptions=True)
 
+            if rec.private_hit:
+                try:
+                    m = await self.bot.send_message(
+                        rec.chat_id,
+                        f"🔒 لایو <b>{html.escape(rec.creator_name)}</b> خصوصی شد؛ ضبط متوقف شد"
+                        + (f" ({rec.uploaded_parts} پارت ارسال شد)." if rec.uploaded_parts else "."),
+                        parse_mode="html",
+                    )
+                    schedule_delete(m, 30)
+                except Exception:
+                    pass
             if rec.uploaded_parts == 0 and final_status == "completed":
                 final_status = "empty"
                 self._fail_cooldown[rec.creator_id] = time.time() + 180.0
@@ -2580,17 +2638,34 @@ class RecordingManager:
         last_seg: Dict[str, Any] = {}
         session_start = time.time()
         last_enter = time.time()
+        last_priv = time.time()
         receiver.event_times.clear()
+        if connected_ok:
+            receiver.dropped_at = 0.0
+            receiver.fatal_error = False
         try:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(1.0)
-                if connected_ok and receiver.event_times:
-                    log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
-                    rec.status_text = "اتصال قطع شد، اتصال مجدد..."
-                    break
                 if not connected_ok:
                     log.warning("Agora never connected for %s: %s", rec.creator_id, receiver.conn_events[-4:])
                     rec.status_text = "اتصال برقرار نشد"
+                    break
+                dropped = receiver.fatal_error or (
+                    receiver.dropped_at > 0.0
+                    and not receiver.is_connected
+                    and time.time() - receiver.dropped_at >= 4.0
+                )
+                if rec.livestream_id and (time.time() - last_priv >= 15 or dropped):
+                    last_priv = time.time()
+                    reason = await (rec.client or self.api).disallowed_reason(rec.livestream_id)
+                    if "private" in reason:
+                        log.info("Livestream %s of %s turned private", rec.livestream_id, rec.creator_id)
+                        rec.private_hit = True
+                        rec.status_text = "🔒 لایو خصوصی شد"
+                        break
+                if dropped:
+                    log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
+                    rec.status_text = "اتصال قطع شد، اتصال مجدد..."
                     break
                 if receiver.video_frames == 0 and time.time() - session_start >= 25:
                     log.warning("No video at all for %s after 25s: %s", rec.creator_id, receiver.conn_events[-4:])
@@ -2605,8 +2680,6 @@ class RecordingManager:
                 rec.bytes_written = receiver.seg_bytes
                 if receiver.seg_video_frames == 1:
                     rec.seg_started_at = receiver.seg_started_at
-                if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
-                    break
                 _, free_mb, _ = get_disk_stats()
                 if free_mb < MIN_FREE_DISK_MB:
                     rec.stop_event.set()
@@ -2629,11 +2702,19 @@ class RecordingManager:
             f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
         )
         log.info("Agora session ended for %s: %s", rec.creator_id, rec.agora_diag)
-        if last_seg.get("video_frames", 0) > 0:
+        min_sec = max(5, int(self.db.get_setting("min_clip_sec", "5") or 5))
+        seg_ok = (
+            last_seg.get("video_frames", 0) >= 15
+            and (rec.manual_stop or last_seg.get("elapsed", 0.0) >= min_sec)
+        )
+        if seg_ok:
             part_no = rec.part_number
             rec.part_number += 1
             enqueue(lambda o=last_seg, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
         else:
+            if last_seg.get("video_frames", 0) > 0:
+                log.info("Discarding short Agora segment for %s (frames=%s, elapsed=%.1fs < %ss)",
+                         rec.creator_id, last_seg.get("video_frames"), last_seg.get("elapsed", 0.0), min_sec)
             for k in ("h264", "pcm"):
                 try:
                     Path(last_seg.get(k)).unlink(missing_ok=True)
@@ -2663,6 +2744,11 @@ class RecordingManager:
         async with self._upload_sem:
             dur, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
             fsize = mp4_path.stat().st_size
+            min_sec = max(5, int(self.db.get_setting("min_clip_sec", "5") or 5))
+            if dur < (2 if rec.manual_stop else min_sec):
+                log.info("Skipping %ss clip of %s (< %ss)", dur, rec.creator_id, min_sec)
+                mp4_path.unlink(missing_ok=True)
+                return
             thumb_path = mp4_path.with_suffix(".thumb.jpg")
             sheet_path = mp4_path.with_suffix(".sheet.jpg")
             thumb_file, sheet_file = await asyncio.to_thread(
@@ -2780,8 +2866,8 @@ class WatchlistMonitor:
         if self._notified_ls.get(info.creator_id) == key:
             return
         if not started and not info.stream_url:
-            # quick joinability probe with a free account (doesn't disturb busy ones)
-            probe = self.rec_mgr.free_account()
+            # quick joinability probe with a completely idle account (never disturb active recordings)
+            probe = next((c for c in self.rec_mgr.accounts() if not self.rec_mgr.busy.get(c.slot)), None)
             if probe is not None:
                 try:
                     full = await probe.check_creator_and_get_stream(info.creator_id)
@@ -2840,6 +2926,9 @@ class WatchlistMonitor:
                         if info.is_live:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
+                            if info.livestream_id and "private" in (await self.api.disallowed_reason(info.livestream_id)):
+                                self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
+                                continue  # private right now -> retry next poll silently
                             if item["auto_record"] and self.rec_mgr.has_capacity():
                                 ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
                                 started = ok
