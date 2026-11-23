@@ -719,90 +719,24 @@ class CreatorStreamInfo:
     raw_debug: Dict[str, Any] = field(default_factory=dict)
 
 
-class AccountPool:
-    """Several SuperLive accounts; each one can watch exactly ONE livestream at a time."""
-    def __init__(self, db: "Database"):
-        self.db = db
-        raw = db.get_setting("account_slots", "0")
-        slots = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()} | {0})
-        self.clients: Dict[int, "SuperLiveClient"] = {n: SuperLiveClient(db, n) for n in slots}
-
-    def _save(self) -> None:
-        self.db.set_setting("account_slots", ",".join(str(n) for n in sorted(self.clients)))
-
-    @property
-    def primary(self) -> "SuperLiveClient":
-        return self.clients[0]
-
-    def add(self, token: str, device_id: str = "", label: str = "") -> "SuperLiveClient":
-        n = 1
-        while n in self.clients:
-            n += 1
-        c = SuperLiveClient(self.db, n)
-        c.set_credentials(token, device_id)
-        if label:
-            c.label = label
-            self.db.set_setting(c._k("superlive_label"), label)
-        self.clients[n] = c
-        self._save()
-        return c
-
-    def new_empty(self) -> "SuperLiveClient":
-        n = 1
-        while n in self.clients:
-            n += 1
-        c = SuperLiveClient(self.db, n)
-        self.clients[n] = c
-        self._save()
-        return c
-
-    def remove(self, slot: int) -> bool:
-        if slot == 0 or slot not in self.clients:
-            return False
-        c = self.clients.pop(slot)
-        c.wipe()
-        self._save()
-        bg_task(c.close())
-        return True
-
-    def usable(self) -> List["SuperLiveClient"]:
-        return [c for _, c in sorted(self.clients.items()) if c.has_token()]
-
-    async def close(self) -> None:
-        for c in self.clients.values():
-            await c.close()
-
-
 class SuperLiveClient:
-    def __init__(self, db: Database, slot: int = 0):
+    def __init__(self, db: Database):
         self.db = db
-        self.slot = slot
         self._session: Optional[aiohttp.ClientSession] = None
-        env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip() if slot == 0 else ""
-        env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip() if slot == 0 else ""
-        self._token: str = env_tok or db.get_setting(self._k("superlive_token"), "")
-        self._device_id: str = env_dev or db.get_setting(self._k("superlive_device_id"), "") or uuid.uuid4().hex
-        self._auth_scheme: str = db.get_setting(self._k("superlive_auth_scheme"), "Token")
+        env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip()
+        env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip()
+        self._token: str = env_tok or db.get_setting("superlive_token", "")
+        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
+        self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
         self._rtc_id: str = (
-            (os.environ.get("SUPERLIVE_RTC_ID", "").strip() if slot == 0 else "")
-            or db.get_setting(self._k("superlive_rtc_id"), "")
+            os.environ.get("SUPERLIVE_RTC_ID", "").strip()
+            or db.get_setting("superlive_rtc_id", "")
             or str(random.randint(1000000000, 4200000000))
         )
-        if not db.get_setting(self._k("superlive_device_id"), ""):
-            db.set_setting(self._k("superlive_device_id"), self._device_id)
-        if not db.get_setting(self._k("superlive_rtc_id"), ""):
-            db.set_setting(self._k("superlive_rtc_id"), self._rtc_id)
-        self.label: str = db.get_setting(self._k("superlive_label"), "") or f"اکانت {slot + 1}"
-
-    def _k(self, key: str) -> str:
-        return key if self.slot == 0 else f"acc{self.slot}_{key}"
-
-    def has_token(self) -> bool:
-        return bool(self._token)
-
-    def wipe(self) -> None:
-        for k in ("superlive_token", "superlive_device_id", "superlive_auth_scheme", "superlive_rtc_id", "superlive_label"):
-            self.db.set_setting(self._k(k), "")
+        if not db.get_setting("superlive_device_id", ""):
+            db.set_setting("superlive_device_id", self._device_id)
+        if not db.get_setting("superlive_rtc_id", ""):
+            db.set_setting("superlive_rtc_id", self._rtc_id)
 
     def _client_params(self, source_url: str = "https://superlive.chat/") -> Dict[str, Any]:
         return {
@@ -854,10 +788,10 @@ class SuperLiveClient:
 
     def set_credentials(self, token: str, device_id: str = "") -> None:
         self._token = token.strip()
-        self.db.set_setting(self._k("superlive_token"), self._token)
+        self.db.set_setting("superlive_token", self._token)
         if device_id.strip():
             self._device_id = device_id.strip()
-            self.db.set_setting(self._k("superlive_device_id"), self._device_id)
+            self.db.set_setting("superlive_device_id", self._device_id)
 
     async def _post(self, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{SUPERLIVE_API_BASE}/{endpoint.lstrip('/')}"
@@ -908,7 +842,7 @@ class SuperLiveClient:
             self._auth_scheme = alt_scheme
             retry = await self._post(endpoint, payload)
             if retry.get("_http_status", 0) in (200, 201):
-                self.db.set_setting(self._k("superlive_auth_scheme"), alt_scheme)
+                self.db.set_setting("superlive_auth_scheme", alt_scheme)
                 return retry
             self._auth_scheme = prev_scheme
         if status in (404, 405):
@@ -956,7 +890,7 @@ class SuperLiveClient:
         )
         if token:
             self._token = str(token)
-            self.db.set_setting(self._k("superlive_token"), self._token)
+            self.db.set_setting("superlive_token", self._token)
         return data
 
     async def email_signin(self, email: str, password: str) -> Tuple[bool, str]:
@@ -968,7 +902,7 @@ class SuperLiveClient:
         token = found.get("access_token") or found.get("token") or found.get("auth_token") or found.get("jwt")
         if token:
             self._token = str(token)
-            self.db.set_setting(self._k("superlive_token"), self._token)
+            self.db.set_setting("superlive_token", self._token)
             return True, "ورود به اکانت SuperLive با موفقیت انجام شد."
         err = data.get("message") or data.get("error") or data.get("_error") or f"HTTP {data.get('_http_status')}"
         return False, f"خطا در ورود: {err}"
@@ -1291,7 +1225,7 @@ class SuperLiveClient:
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
@@ -1465,9 +1399,7 @@ class SuperLiveClient:
         info.livestream_id = ls_id
         info.is_live = is_live_flag and bool(ls_id)
 
-        if not info.is_live or light:
-            # light=True: only liveness; does NOT enter the room (entering would kick this
-            # account out of whatever livestream it is currently recording)
+        if not info.is_live:
             return info
 
         # 3) Retrieve livestream details & enter room for Agora/HLS credentials
@@ -2169,7 +2101,6 @@ class ActiveRecording:
     uploaded_duration: int = 0
     uploaded_bytes: int = 0
     connected: bool = False
-    client: Any = None
 
 
 FAILED_DIR = BASE_DIR / "failed_uploads"
@@ -2177,12 +2108,10 @@ FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class RecordingManager:
-    def __init__(self, bot: TelegramClient, db: Database, pool: "AccountPool"):
+    def __init__(self, bot: TelegramClient, db: Database, api: SuperLiveClient):
         self.bot = bot
         self.db = db
-        self.pool = pool
-        self.api = pool.primary
-        self.busy: Dict[int, str] = {}  # account slot -> creator_id
+        self.api = api
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
         # livestream_ids the user stopped manually -> don't auto-restart the same live
@@ -2199,21 +2128,6 @@ class RecordingManager:
 
     def is_recording(self, creator_id: str) -> bool:
         return str(creator_id) in self.active
-
-    def accounts(self) -> List[SuperLiveClient]:
-        return self.pool.usable() or [self.pool.primary]
-
-    def free_account(self) -> Optional[SuperLiveClient]:
-        for c in self.accounts():
-            if c.slot not in self.busy:
-                return c
-        return None
-
-    def max_concurrent(self) -> int:
-        return len(self.accounts())
-
-    def has_capacity(self) -> bool:
-        return self.free_account() is not None
 
     def split_seconds(self) -> int:
         raw = self.db.get_setting("split_minutes", "0")
@@ -2241,55 +2155,15 @@ class RecordingManager:
         else:
             self.manually_stopped_ls.pop(cid, None)
 
-        client = self.free_account()
-        if client is None:
-            return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
-                           f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
-        # Reserve the account, then get a fresh token issued for THIS account
-        self.busy[client.slot] = cid
-        try:
-            fresh = await client.check_creator_and_get_stream(cid)
-        except Exception as e:
-            fresh = None
-            log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
-        if not fresh or not fresh.is_live or not fresh.stream_url:
-            self.busy.pop(client.slot, None)
-            if not fresh:
-                return False, "⚠️ ارتباط با SuperLive برقرار نشد."
-            if not fresh.is_live:
-                return False, "⚫ این استریمر الان لایو نیست."
-            d = fresh.raw_debug
-            reason = ""
-            for k in ("enter_sample", "retrieve_sample"):
-                m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get(k, "")))
-                if m and m.group(1) not in ("null", '""'):
-                    reason = m.group(1).strip('"')
-                    break
-            return False, (
-                "⚠️ لایو روشنه ولی اطلاعات اتصال (Agora) داده نشد.\n"
-                f"• Retrieve/Enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code>"
-                + (f"\n• دلیل سرور: <code>{html.escape(reason)}</code>" if reason else "")
-                + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
-                + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
-            )
-        fresh.display_name = fresh.display_name or stream_info.display_name
-        stream_info = fresh
-        cid = str(stream_info.creator_id or cid)
-        if cid in self.active:
-            self.busy.pop(client.slot, None)
-            return False, "⏺ همین الان در حال ضبطه."
-        self.busy[client.slot] = cid
         _, free_mb, _ = get_disk_stats()
-        err = ""
         if free_mb < MIN_FREE_DISK_MB:
-            err = f"💽 فضای خالی دیسک کمه ({free_mb:.0f} MB)؛ ضبط جدید شروع نشد."
-        elif stream_info.stream_url.startswith("agora://") and not AGORA_AVAILABLE:
-            err = "پکیج agora-python-server-sdk روی سرور نصب نیست."
-        elif not FFMPEG_BIN:
-            err = "FFmpeg روی سرور پیدا نشد."
-        if err:
-            self.busy.pop(client.slot, None)
-            return False, err
+            return False, f"💽 فضای خالی دیسک کمه ({free_mb:.0f} MB)؛ ضبط جدید شروع نشد."
+        if not stream_info.stream_url:
+            return False, "لینک استریم یا اطلاعات Agora برای این لایو پیدا نشد."
+        if stream_info.stream_url.startswith("agora://") and not AGORA_AVAILABLE:
+            return False, "پکیج agora-python-server-sdk روی سرور نصب نیست."
+        if not FFMPEG_BIN:
+            return False, "FFmpeg روی سرور پیدا نشد."
 
         cname = stream_info.display_name or stream_info.username or cid
         db_rec_id = self.db.create_recording_record(cid, cname, stream_info.livestream_id)
@@ -2302,11 +2176,10 @@ class RecordingManager:
             chat_id=chat_id,
             triggered_by=triggered_by,
         )
-        rec.client = client
         self.active[cid] = rec
         rec.task = asyncio.create_task(self._run_recording_lifecycle(rec))
         self._changed()
-        return True, f"⏺ ضبط <b>{html.escape(cname)}</b> با {html.escape(client.label)} شروع شد."
+        return True, f"⏺ ضبط <b>{html.escape(cname)}</b> شروع شد."
 
     async def stop_recording(self, creator_id: str) -> bool:
         rec = self.active.get(str(creator_id))
@@ -2373,7 +2246,7 @@ class RecordingManager:
                     restarts = 0
                 # Stream went quiet: is the creator really offline or was it a network hiccup?
                 try:
-                    info = await (rec.client or self.api).check_creator_and_get_stream(rec.creator_id)
+                    info = await self.api.check_creator_and_get_stream(rec.creator_id)
                 except Exception:
                     info = None
                 if info and info.is_live and info.stream_url and restarts < 10:
@@ -2400,17 +2273,16 @@ class RecordingManager:
                 final_status = "empty"
                 self._fail_cooldown[rec.creator_id] = time.time() + 180.0
                 notes = rec.agora_diag or "no data"
-                log.info("Empty recording for %s (%s): %s", rec.creator_id, rec.triggered_by, notes)
-                if rec.triggered_by == "manual" and not rec.manual_stop:
-                    try:
-                        m = await self.bot.send_message(
-                            rec.chat_id,
-                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).",
-                            parse_mode="html",
-                        )
-                        schedule_delete(m, 15)
-                    except Exception:
-                        pass
+                try:
+                    m = await self.bot.send_message(
+                        rec.chat_id,
+                        f"⚠️ از لایو <b>{html.escape(rec.creator_name)}</b> دیتایی دریافت نشد.\n"
+                        f"<code>{html.escape((rec.agora_diag or rec.status_text)[:350])}</code>",
+                        parse_mode="html",
+                    )
+                    schedule_delete(m, 120)
+                except Exception:
+                    pass
             elif rec.uploaded_parts > 0:
                 self.db.increment_recordings(rec.creator_id)
                 try:
@@ -2434,8 +2306,6 @@ class RecordingManager:
             )
             self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
             self.active.pop(rec.creator_id, None)
-            if rec.client is not None and self.busy.get(rec.client.slot) == rec.creator_id:
-                self.busy.pop(rec.client.slot, None)
             shutil.rmtree(work_dir, ignore_errors=True)
             self._changed()
 
@@ -2565,20 +2435,14 @@ class RecordingManager:
                     log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
                     rec.status_text = "اتصال قطع شد، اتصال مجدد..."
                     break
-                if not connected_ok:
-                    log.warning("Agora never connected for %s: %s", rec.creator_id, receiver.conn_events[-4:])
-                    rec.status_text = "اتصال برقرار نشد"
-                    break
-                if receiver.video_frames == 0 and time.time() - session_start >= 25:
-                    log.warning("No video at all for %s after 25s: %s", rec.creator_id, receiver.conn_events[-4:])
-                    rec.status_text = "تصویری دریافت نشد"
-                    break
                 ref = receiver.last_video_at or session_start
                 if connected_ok and time.time() - ref >= VIDEO_STALL_TIMEOUT:
                     log.warning("Video stalled for %s (%.0fs), reconnecting", rec.creator_id, time.time() - ref)
                     rec.status_text = "تصویر قطع شد، اتصال مجدد..."
                     break
-
+                if rec.livestream_id and time.time() - last_enter >= 40:
+                    last_enter = time.time()
+                    bg_task(self.api._request_smart("livestream/enter", {"livestream_id": str(rec.livestream_id)}))
                 rec.bytes_written = receiver.seg_bytes
                 if receiver.seg_video_frames == 1:
                     rec.seg_started_at = receiver.seg_started_at
@@ -2756,29 +2620,16 @@ class WatchlistMonitor:
         key = info.livestream_id or "live"
         if self._notified_ls.get(info.creator_id) == key:
             return
-        if not started and not info.stream_url:
-            # quick joinability probe with a free account (doesn't disturb busy ones)
-            probe = self.rec_mgr.free_account()
-            if probe is not None:
-                try:
-                    full = await probe.check_creator_and_get_stream(info.creator_id)
-                    if not full.stream_url:
-                        return
-                except Exception:
-                    return
         self._notified_ls[info.creator_id] = key
         if self.db.get_setting("notify_live", "1") != "1":
             return
-        row = [Button.inline("👤 صفحه", data=f"p:{info.creator_id}:0")]
-        if not started:
-            row.insert(0, Button.inline("🎬 ضبط فوری", data=f"qr:{info.creator_id}"))
         try:
             m = await self.bot.send_message(
                 owner_id,
                 f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
-                + (" · ⏺ ضبط خودکار شروع شد" if started else ""),
+                + (" · ⏺ ضبط شروع شد" if started else ""),
                 parse_mode="html",
-                buttons=[row],
+                buttons=[[Button.inline("👤 صفحه استریمر", data=f"p:{info.creator_id}:0")]],
             )
             ttl = self.rec_mgr.notify_ttl()
             if ttl > 0:
@@ -2807,7 +2658,7 @@ class WatchlistMonitor:
                     if self.rec_mgr.is_recording(cid):
                         continue
                     try:
-                        info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map, light=True)
+                        info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
                         if info.creator_id and info.creator_id != cid and info.creator_id.isdigit():
                             log.info("Watchlist id %s -> real user_id %s", cid, info.creator_id)
                             self.db.migrate_watch(cid, info.creator_id)
@@ -2817,7 +2668,7 @@ class WatchlistMonitor:
                         if info.is_live:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
-                            if item["auto_record"] and self.rec_mgr.has_capacity():
+                            if item["auto_record"]:
                                 ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
                                 started = ok
                                 if not ok:
@@ -2863,20 +2714,13 @@ def _kb_button(label: str) -> Any:
     return Button.text(label, **kwargs)
 
 
-def main_keyboard() -> Any:
-    from telethon.tl.types import KeyboardButton, KeyboardButtonRow, ReplyKeyboardMarkup
-    rows = [[KB_WATCH, KB_ACTIVE], [KB_ADD, KB_REC], [KB_ARCHIVE, KB_SETTINGS], [KB_HOME]]
-    trows = [KeyboardButtonRow([KeyboardButton(t) for t in r]) for r in rows]
-    kw: Dict[str, Any] = {"rows": trows, "resize": True}
-    try:
-        params = inspect.signature(ReplyKeyboardMarkup.__init__).parameters
-        if "persistent" in params:
-            kw["persistent"] = True
-        if "placeholder" in params:
-            kw["placeholder"] = "آیدی یا لینک رو بفرست…"
-    except Exception:
-        pass
-    return ReplyKeyboardMarkup(**kw)
+def main_keyboard() -> List[List[Any]]:
+    return [
+        [_kb_button(KB_WATCH), _kb_button(KB_ACTIVE)],
+        [_kb_button(KB_ADD), _kb_button(KB_REC)],
+        [_kb_button(KB_ARCHIVE), _kb_button(KB_SETTINGS)],
+        [_kb_button(KB_HOME)],
+    ]
 
 
 def short(name: str, n: int = 18) -> str:
@@ -2887,10 +2731,9 @@ def short(name: str, n: int = 18) -> str:
 class SuperLiveRecBot:
     def __init__(self):
         self.db = Database(DB_PATH)
-        self.pool = AccountPool(self.db)
-        self.api = self.pool.primary
+        self.api = SuperLiveClient(self.db)
         self.bot = TelegramClient(str(SESSION_PATH), TG_API_ID, TG_API_HASH)
-        self.rec_mgr = RecordingManager(self.bot, self.db, self.pool)
+        self.rec_mgr = RecordingManager(self.bot, self.db, self.api)
         self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr, self.bot)
         self._awaiting_input: Dict[int, str] = {}
         self._panel: Dict[int, Any] = {}           # chat_id -> current panel message
@@ -3059,7 +2902,6 @@ class SuperLiveRecBot:
                 f"{conn} <b>{html.escape(short(r.creator_name, 24))}</b>\n"
                 f"   ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code> کل  ·  "
                 f"<code>{fmt_duration(time.time() - r.seg_started_at)}</code> پارت {r.part_number}  ·  💾 <code>{fmt_bytes(r.bytes_written)}</code>\n"
-                f"   👥 {html.escape(r.client.label if r.client else '-')}  ·  🎞 <code>{r.livestream_id}</code>  ·  📌 {html.escape(r.status_text)}\n"
                 f"   📤 {r.uploaded_parts} پارت ارسال شده" + (f"  ·  {html.escape(r.upload_status)}" if r.upload_status else "")
             )
             buttons.append([
@@ -3100,39 +2942,6 @@ class SuperLiveRecBot:
         buttons.append([Button.inline("🏠", data="h")])
         return "\n".join(lines), buttons
 
-    def _v_accounts(self) -> Tuple[str, List[List[Any]]]:
-        lines = ["👥 <b>اکانتهای SuperLive</b>", SEP,
-                 "<i>هر اکانت همزمان فقط یه لایو رو میتونه ضبط کنه. برای ضبط همزمان N نفر، N اکانت لازمه.</i>", ""]
-        buttons: List[List[Any]] = []
-        for slot, c in sorted(self.pool.clients.items()):
-            busy = self.rec_mgr.busy.get(slot)
-            if not c.has_token():
-                st = "⚪ بدون توکن"
-            elif busy:
-                r = self.rec_mgr.active.get(busy)
-                if r:
-                    st = (f"⏺ در حال ضبط <b>{html.escape(short(r.creator_name, 18))}</b>\n"
-                          f"     🎞 لایو: <a href=\"https://superlive.chat/livestream/{r.livestream_id}\">{r.livestream_id}</a>"
-                          f"  ·  ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code>"
-                          f"  ·  {'🟢 تصویر میرسه' if r.connected else '🟡 در حال اتصال'}")
-                else:
-                    st = "⏳ در حال آمادهسازی..."
-            else:
-                st = "🟢 آزاد"
-            lines.append(f"• <b>{html.escape(c.label)}</b>{' (اصلی)' if slot == 0 else ''} — {st}")
-            row = [Button.inline(f"🔑 {short(c.label, 10)}", data=f"acct:{slot}")]
-            if busy and busy in self.rec_mgr.active:
-                row.insert(0, Button.inline("👤 ضبط", data=f"p:{busy}:0"))
-            if slot != 0:
-                row.append(Button.inline("🗑", data=f"accrmq:{slot}"))
-            buttons.append(row)
-        lines += ["", SEP,
-                  "➕ <b>افزودن اکانت:</b>",
-                  "<code>/addacc ایمیل رمز</code>   یا   <code>/addacc token توکن [device_id]</code>",
-                  "🔑 دکمهی هر اکانت = تنظیم دوباره توکن همون اکانت"]
-        buttons.append([Button.inline("🔄", data="acc"), Button.inline("‹ تنظیمات", data="s"), Button.inline("🏠", data="h")])
-        return "\n".join(lines), buttons
-
     def _v_settings(self) -> Tuple[str, List[List[Any]]]:
         g = self.db.get_setting
         notify = g("notify_live", "1") == "1"
@@ -3140,8 +2949,6 @@ class SuperLiveRecBot:
         split = g("split_minutes", "0")
         part = g("part_mb", "1900")
         poll = g("poll_interval", str(DEFAULT_POLL_INTERVAL))
-        accs = self.rec_mgr.accounts()
-        conc_txt = f"{len(accs)} (به تعداد اکانتها)"
         arch = g("archive_chat_id", "") or "خاموش"
         ttl_txt = "هیچوقت" if ttl == "0" else f"{ttl} ثانیه"
         split_txt = "خاموش" if split == "0" else f"هر {split} دقیقه"
@@ -3155,8 +2962,7 @@ class SuperLiveRecBot:
             f"⏱ بازه چک واچلیست: <b>{poll} ثانیه</b>",
             f"🗄 کانال آرشیو: <code>{html.escape(arch)}</code>",
             SEP,
-            f"⚡ ضبط همزمان: <b>{conc_txt}</b>",
-            "• واچلیست: <b>نامحدود</b>",
+            "• واچلیست و ضبط همزمان: <b>نامحدود</b>",
             "• پیشنمایش برای همه ویدیوها: <b>همیشه</b>",
             "• حذف فایل از سرور بعد از ارسال: <b>همیشه</b>",
             "\n<i>کانال آرشیو:</i> <code>/setarchive -100…</code>  ·  <code>/setarchive off</code>",
@@ -3164,7 +2970,7 @@ class SuperLiveRecBot:
         buttons = [
             [Button.inline(f"🔔 اعلان: {'ON' if notify else 'OFF'}", data="set:notify"), Button.inline(f"🧹 حذف: {ttl_txt}", data="set:ttl")],
             [Button.inline(f"✂️ تکهتکه: {split_txt}", data="set:split"), Button.inline(f"📦 {part}MB", data="set:part")],
-            [Button.inline(f"⏱ چک: {poll}s", data="set:poll"), Button.inline(f"👥 اکانتها ({len(accs)})", data="acc")],
+            [Button.inline(f"⏱ چک: {poll}s", data="set:poll")],
             [Button.inline("🏠", data="h")],
         ]
         return text, buttons
@@ -3181,13 +2987,9 @@ class SuperLiveRecBot:
                 self._panel[chat_id] = msg
             except MessageNotModifiedError:
                 pass
-            except Exception as e:
-                log.warning("Panel edit failed (%s), sending new", e)
-                msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False)
-                self._panel[chat_id] = msg
         else:
             old = self._panel.get(chat_id)
-            msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False)
+            msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons)
             self._panel[chat_id] = msg
             if old is not None:
                 try:
@@ -3207,7 +3009,7 @@ class SuperLiveRecBot:
                     if time.time() > self._panel_until.get(chat_id, 0):
                         continue
                     view, args = self._panel_view.get(chat_id, ("home", ()))
-                    if view not in ("home", "watchlist", "person", "active", "accounts"):
+                    if view not in ("home", "watchlist", "person", "active"):
                         continue
                     text, buttons = self.render(view, *args)
                     if text == self._panel_last.get(chat_id):
@@ -3220,26 +3022,6 @@ class SuperLiveRecBot:
                     await asyncio.sleep(int(getattr(fw, "seconds", 10)))
                 except Exception:
                     self._panel_until[chat_id] = 0
-
-    async def _ensure_keyboard(self, chat_id: int, force: bool = False) -> None:
-        """The message that carries the reply keyboard must NOT be deleted, or Telegram hides the keyboard."""
-        old_id = self.db.get_setting(f"kb_msg_{chat_id}", "")
-        if old_id and not force:
-            return
-        try:
-            markup = main_keyboard()
-            m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.", buttons=markup)
-        except Exception as e:
-            log.warning("Persistent keyboard failed (%s), using simple keyboard", e)
-            rows = [[KB_WATCH, KB_ACTIVE], [KB_ADD, KB_REC], [KB_ARCHIVE, KB_SETTINGS], [KB_HOME]]
-            m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.",
-                                            buttons=[[Button.text(t, resize=True) for t in r] for r in rows])
-        self.db.set_setting(f"kb_msg_{chat_id}", str(m.id))
-        if old_id.isdigit():
-            try:
-                await self.bot.delete_messages(chat_id, [int(old_id)])
-            except Exception:
-                pass
 
     async def toast(self, event: Any, text: str, ttl: int = 8, **kw: Any) -> Any:
         m = await self.bot.send_message(event.chat_id, text, parse_mode="html", **kw)
@@ -3262,15 +3044,9 @@ class SuperLiveRecBot:
             self._awaiting_input.pop(event.sender_id, None)
             await self._delete_user_msg(event)
             # (re)attach the persistent bottom keyboard
-            try:
-                await self.show(event, "home")
-            except Exception as e:
-                log.exception("Home panel failed: %s", e)
-                await event.respond(f"⚠️ خطا در نمایش منو: <code>{html.escape(str(e)[:300])}</code>", parse_mode="html")
-            try:
-                await self._ensure_keyboard(event.chat_id, force=True)
-            except Exception as e:
-                log.exception("Keyboard failed: %s", e)
+            kb = await self.bot.send_message(event.chat_id, "⌨️ منوی پایین فعال شد.", buttons=main_keyboard())
+            schedule_delete(kb, 3)
+            await self.show(event, "home")
 
         @self.bot.on(events.NewMessage(func=lambda e: e.is_private and (e.raw_text or "") in KB_ALL))
         async def on_keyboard(event: Any) -> None:
@@ -3441,118 +3217,7 @@ class SuperLiveRecBot:
                 self.db.set_setting("archive_chat_id", val)
                 await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
 
-        @self.bot.on(events.NewMessage(pattern=r"^/guesttest\s+(.+)$"))
-        async def cmd_guesttest(event: Any) -> None:
-            """Test: can a brand-new GUEST device (no login) get an Agora token and receive video?"""
-            if not self._is_owner(event.sender_id):
-                return
-            raw = event.pattern_match.group(1).strip()
-            await self._delete_user_msg(event)
-            msg = await event.respond("🧪 تست مهمان: ساخت دستگاه جدید...")
-            slot = 90000 + random.randint(0, 9999)
-            guest = SuperLiveClient(self.db, slot)
-            guest._token = ""  # make sure no token is reused
-            lines = ["🧪 <b>نتیجه تست مهمان</b>", SEP, f"📱 device: <code>{guest._device_id[:12]}…</code>"]
-            work = RECORDINGS_DIR / f"guesttest_{slot}"
-            try:
-                init = await guest.ensure_initialized(force=True)
-                guid = str(init.get("guid") or "")
-                if not guest.has_token() and guid:
-                    # SuperLive web guests are identified by the "guid" returned from /initialize
-                    guest._token = guid
-                    lines.append(f"ℹ️ توکن نداد ولی <code>guid</code> داد؛ از همون به عنوان توکن مهمان استفاده میشه.")
-                lines.append(f"1️⃣ initialize: HTTP <code>{init.get('_http_status')}</code> · توکن مهمان: <b>{'✅ گرفت' if guest.has_token() else '❌ نگرفت'}</b>")
-                if not guest.has_token():
-                    lines.append(f"<code>{html.escape(json.dumps(init, ensure_ascii=False)[:500])}</code>")
-                # Auth probe: which scheme (if any) does the server accept for this guest?
-                probe = await guest._post("users/me", {})
-                lines.append(f"   🔐 users/me با {guest._auth_scheme}: HTTP <code>{probe.get('_http_status')}</code>")
-
-                cid, _, dname, _ = await self.api.resolve_creator(raw)  # resolve with main account (read-only)
-                if not cid:
-                    lines.append("❌ استریمر/لایو پیدا نشد.")
-                    raise RuntimeError("stop")
-                main_info = await self.api.check_creator_and_get_stream(cid, light=True)
-                info = await guest.check_creator_and_get_stream(cid)
-                if not info.is_live and main_info.is_live and main_info.livestream_id:
-                    # guest couldn't see the profile; force the livestream id from the main account
-                    lines.append(f"ℹ️ اکانت اصلی لایو رو دید (<code>{main_info.livestream_id}</code>)؛ مهمان مستقیم وارد همون لایو میشه.")
-                    ls = main_info.livestream_id
-                    ret = await guest._request_smart("livestream/retrieve", {"livestream_id": ls})
-                    ent = await guest._request_smart("livestream/enter", {"livestream_id": ls})
-                    info.is_live = True
-                    info.livestream_id = ls
-                    info.raw_debug["retrieve_http"] = ret.get("_http_status")
-                    info.raw_debug["enter_http"] = ent.get("_http_status")
-                    info.raw_debug["enter_sample"] = json.dumps(ent, ensure_ascii=False)[:700]
-                    info.raw_debug["retrieve_sample"] = json.dumps(ret, ensure_ascii=False)[:700]
-                    info.stream_url = guest._extract_direct_stream_url(ent) or guest._extract_direct_stream_url(ret) or \
-                        guest._build_agora_uri({"retrieve": ret, "enter": ent}, ls_id=ls, debug_out=info.raw_debug)
-                elif not main_info.is_live:
-                    lines.append("⚠️ اکانت اصلی هم این استریمر رو آفلاین دید؛ تست رو موقع لایو بودنش تکرار کن.")
-                d = info.raw_debug
-                lines.append(f"2️⃣ استریمر: <b>{html.escape(info.display_name or dname or cid)}</b> · لایو: <b>{'✅' if info.is_live else '❌'}</b> · ls: <code>{info.livestream_id or '-'}</code>")
-                lines.append(f"3️⃣ retrieve/enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code> · توکن Agora: <b>{'✅' if info.stream_url.startswith('agora://') else ('✅ (HLS)' if info.stream_url else '❌')}</b>")
-                if d.get("token_info"):
-                    lines.append(f"   🔑 <code>{html.escape(str(d['token_info'])[:200])}</code>")
-                if not info.stream_url:
-                    m = re.search(r'"disallowed_reason":\s*("?[^,}]*"?)', str(d.get("enter_sample", "")) + str(d.get("retrieve_sample", "")))
-                    if m:
-                        lines.append(f"   دلیل: <code>{html.escape(m.group(1))}</code>")
-                    lines.append(f"   <code>{html.escape(str(d.get('enter_sample', ''))[:400])}</code>")
-                    raise RuntimeError("stop")
-
-                if info.stream_url.startswith("agora://") and AGORA_AVAILABLE:
-                    await msg.edit("\n".join(lines + ["", "4️⃣ اتصال آزمایشی به Agora (۱۵ ثانیه)..."]), parse_mode="html")
-                    work.mkdir(parents=True, exist_ok=True)
-                    rcv = AgoraStreamReceiver(info.stream_url, work / "t.h264", work / "t.pcm")
-                    try:
-                        await asyncio.to_thread(rcv.connect)
-                        await asyncio.sleep(15)
-                    finally:
-                        await asyncio.to_thread(rcv.close)
-                    ok = rcv.video_frames > 0
-                    lines.append(
-                        f"4️⃣ Agora: <b>{'✅ تصویر رسید' if ok else '❌ تصویر نرسید'}</b> · "
-                        f"v=<code>{rcv.video_frames}</code> a=<code>{rcv.audio_frames}</code> uid=<code>{rcv.uid}</code>\n"
-                        f"   ev: <code>{html.escape(','.join(rcv.conn_events[:6]))}</code>"
-                    )
-                    lines += [SEP, "✅ <b>مهمان جواب میده</b> — میشه ضبط بدون اکانت رو ساخت." if ok
-                              else "❌ <b>مهمان توکن گرفت ولی تصویر نیومد</b> — خروجی رو بفرست."]
-                else:
-                    lines += [SEP, "✅ مهمان لینک استریم گرفت."]
-            except RuntimeError:
-                lines += [SEP, "❌ <b>مهمان کافی نیست</b> — باید با اکانت لاگینشده ضبط کرد."]
-            except Exception as e:
-                lines.append(f"⚠️ خطا: <code>{html.escape(str(e)[:300])}</code>")
-            finally:
-                shutil.rmtree(work, ignore_errors=True)
-                guest.wipe()
-                await guest.close()
-            await msg.edit("\n".join(lines)[:4000], parse_mode="html", link_preview=False)
-
-        @self.bot.on(events.NewMessage(pattern=r"^/addacc\s+(\S+)\s+(\S+)(?:\s+(\S+))?$"))
-        async def cmd_addacc(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
-                return
-            a1, a2, a3 = event.pattern_match.group(1), event.pattern_match.group(2), event.pattern_match.group(3) or ""
-            await self._delete_user_msg(event)
-            if a1.lower() == "token":
-                c = self.pool.add(a2, a3)
-                await self.toast(event, f"✅ {html.escape(c.label)} با توکن اضافه شد.", ttl=8)
-            else:
-                c = self.pool.new_empty()
-                ok, msg_text = await c.email_signin(a1, a2)
-                if not ok:
-                    self.pool.remove(c.slot)
-                    await self.toast(event, f"❌ {html.escape(msg_text)}", ttl=15)
-                    return
-                c.label = a1.split("@")[0]
-                self.db.set_setting(c._k("superlive_label"), c.label)
-                await self.toast(event, f"✅ اکانت {html.escape(c.label)} اضافه شد.", ttl=8)
-            await self.show(event, "accounts")
-
-        @self.bot.on(events.NewMessage(pattern=r"^/(settings|watchlist|active|archive|history|accounts)$"))
+        @self.bot.on(events.NewMessage(pattern=r"^/(settings|watchlist|active|archive|history)$"))
         async def cmd_views(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 return
@@ -3567,16 +3232,6 @@ class SuperLiveRecBot:
                 return
             mode = self._awaiting_input.pop(event.sender_id, None)
             raw = event.raw_text.strip()
-            if mode and mode.startswith("acctok:"):
-                await self._delete_user_msg(event)
-                slot = int(mode.split(":")[1])
-                c = self.pool.clients.get(slot)
-                if c:
-                    bits = raw.split()
-                    c.set_credentials(bits[0], bits[1] if len(bits) > 1 else "")
-                    await self.toast(event, f"✅ توکن {html.escape(c.label)} ذخیره شد.", ttl=6)
-                await self.show(event, "accounts")
-                return
             if mode == "rec":
                 await self._delete_user_msg(event)
                 await self._handle_manual_rec(event, raw)
@@ -3675,24 +3330,6 @@ class SuperLiveRecBot:
                     except Exception:
                         await event.answer("این ویدیو دیگه در دسترس نیست (شاید پاک شده)", alert=True)
                     return
-                elif head == "acc":
-                    await self.show(event, "accounts", edit=True)
-                elif head == "acct":
-                    self._awaiting_input[event.sender_id] = f"acctok:{parts[1]}"
-                    await event.answer()
-                    await self.toast(event, "🔑 توکن جدید این اکانت رو بفرست (اختیاری: بعدش با فاصله device_id):", ttl=90)
-                    return
-                elif head == "accrmq":
-                    await event.edit("🗑 این اکانت حذف بشه؟", buttons=[[Button.inline("✅ بله", data=f"accrm:{parts[1]}"), Button.inline("‹ انصراف", data="acc")]])
-                elif head == "accrm":
-                    slot = int(parts[1])
-                    if slot in self.rec_mgr.busy:
-                        await event.answer("این اکانت الان در حال ضبطه", alert=True)
-                        return
-                    self.pool.remove(slot)
-                    await event.answer("حذف شد")
-                    await self.show(event, "accounts", edit=True)
-                    return
                 elif head == "set":
                     await self._handle_setting_toggle(event, parts[1])
                     return
@@ -3721,7 +3358,7 @@ class SuperLiveRecBot:
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
         added = self.db.add_watch(cid, uname, dname, avatar)
-        info = await self.api.check_creator_and_get_stream(cid, light=True)
+        info = await self.api.check_creator_and_get_stream(cid)
         if info.display_name:
             self.db.update_watch_status(cid, "live" if info.is_live else "offline", display_name=info.display_name, username=info.username)
         if info.is_live:
@@ -3741,7 +3378,7 @@ class SuperLiveRecBot:
                 pass
             await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
-        info = await self.api.check_creator_and_get_stream(cid, light=True)
+        info = await self.api.check_creator_and_get_stream(cid)
         try:
             await wait.delete()
         except Exception:
@@ -3750,7 +3387,7 @@ class SuperLiveRecBot:
             await self.toast(event, f"⚫ <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
         else:
             ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
-            await self.toast(event, msg_text, ttl=6 if ok else 60)
+            await self.toast(event, msg_text, ttl=6)
         await self.show(event, "person", info.creator_id or cid, 0, edit=panel_edit)
 
     async def _handle_setting_toggle(self, event: Any, key: str) -> None:
@@ -3770,7 +3407,6 @@ class SuperLiveRecBot:
             cycle("part_mb", ["500", "1000", "1500", "1900"], "1900")
         elif key == "poll":
             cycle("poll_interval", ["15", "25", "45", "60"], str(DEFAULT_POLL_INTERVAL))
-
         await event.answer("ذخیره شد ✅")
         await self.show(event, "settings", edit=True)
 
@@ -3830,12 +3466,6 @@ class SuperLiveRecBot:
             ]))
         except Exception as e:
             log.debug("set commands failed: %s", e)
-        owner = self.db.get_owner_id()
-        if owner:
-            try:
-                await self._ensure_keyboard(owner, force=True)
-            except Exception as e:
-                log.debug("keyboard restore failed: %s", e)
         self.monitor.start()
         bg_task(self._panel_refresher())
         try:
@@ -3847,7 +3477,7 @@ class SuperLiveRecBot:
             if tasks:
                 log.info("Waiting for %d recordings to finalize...", len(tasks))
                 await asyncio.wait(tasks, timeout=900)
-            await self.pool.close()
+            await self.api.close()
             if health_runner:
                 await health_runner.cleanup()
 
