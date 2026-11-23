@@ -85,6 +85,7 @@ MAX_SINGLE_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "1900")) * 1024 * 1024
 MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", "500"))
 # Inactivity timeout for Agora stream end detection (seconds without frames)
 AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
+VIDEO_STALL_TIMEOUT = int(os.environ.get("VIDEO_STALL_TIMEOUT", "12"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
 # Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
@@ -665,6 +666,15 @@ class Database:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
             return dict(row) if row else None
+
+    def migrate_watch(self, old_id: str, new_id: str) -> None:
+        if not new_id or old_id == new_id:
+            return
+        with self._lock, self._conn() as conn:
+            if conn.execute("SELECT 1 FROM watchlist WHERE creator_id = ?", (new_id,)).fetchone():
+                conn.execute("DELETE FROM watchlist WHERE creator_id = ?", (old_id,))
+            else:
+                conn.execute("UPDATE watchlist SET creator_id = ? WHERE creator_id = ?", (new_id, old_id))
 
     def increment_recordings(self, creator_id: str) -> None:
         with self._lock, self._conn() as conn:
@@ -1248,6 +1258,8 @@ class SuperLiveClient:
                 info.raw_debug["discover_cache_hit"] = True
         cache_ls_id = ls_id
         cache_name = info.display_name
+        if info.creator_id and info.creator_id != target_uid:
+            target_uid = info.creator_id  # discover gave us the real internal user_id
 
         # 1) Query user profile only if not already matched in discover_map
         prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1325,7 +1337,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(4):
+            for page_idx in range(8):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -1714,6 +1726,7 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
     def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
         self.receiver.conn_events.append(f"disconn({reason})")
+        self.receiver.event_times.append((time.time(), "drop"))
 
     def on_connecting(self, *args: Any, **kwargs: Any) -> None:
         self.receiver.conn_events.append("connecting")
@@ -1725,6 +1738,7 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
     def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
         self.receiver.conn_events.append(f"fail({reason})")
+        self.receiver.event_times.append((time.time(), "drop"))
 
 
 class AgoraStreamReceiver:
@@ -1767,6 +1781,8 @@ class AgoraStreamReceiver:
         self.seg_bytes = 0
         self.seg_started_at = time.time()
         self._need_keyframe = True
+        self.last_video_at = 0.0
+        self.event_times: List[Tuple[float, str]] = []
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
@@ -1783,6 +1799,7 @@ class AgoraStreamReceiver:
                         return
                     self._need_keyframe = False
                     self.seg_started_at = time.time()
+                self.last_video_at = time.time()
                 self._h264_fh.write(data)
                 self.video_frames += 1
                 self.seg_video_frames += 1
@@ -1809,9 +1826,10 @@ class AgoraStreamReceiver:
             with self._io_lock:
                 if self._closed:
                     return
-                self.last_frame_at = time.time()
-                if self._need_keyframe:
-                    return  # keep audio aligned with the first video keyframe of the segment
+                # The SDK keeps firing playback callbacks with SILENCE after the connection drops,
+                # so audio is only written while video is actually arriving (A/V stay the same length).
+                if self._need_keyframe or time.time() - self.last_video_at > 3.0:
+                    return
                 self._pcm_fh.write(data)
                 self.audio_frames += 1
                 self.seg_audio_frames += 1
@@ -2217,24 +2235,27 @@ class RecordingManager:
         try:
             restarts = 0
             while not rec.stop_event.is_set():
+                parts_before = rec.part_number
                 if rec.stream_url.startswith("agora://"):
                     await self._agora_session(rec, work_dir, enqueue)
                 else:
                     await self._ffmpeg_session(rec, work_dir, enqueue)
                 if rec.stop_event.is_set():
                     break
+                if rec.part_number > parts_before:
+                    restarts = 0
                 # Stream went quiet: is the creator really offline or was it a network hiccup?
                 try:
                     info = await self.api.check_creator_and_get_stream(rec.creator_id)
                 except Exception:
                     info = None
-                if info and info.is_live and info.stream_url and restarts < 6:
+                if info and info.is_live and info.stream_url and restarts < 10:
                     restarts += 1
                     rec.stream_url = info.stream_url
                     rec.livestream_id = info.livestream_id or rec.livestream_id
                     rec.status_text = f"اتصال مجدد ({restarts})..."
                     log.info("Reconnecting %s (attempt %d)", rec.creator_id, restarts)
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(min(10, 2 + restarts))
                     continue
                 break
         except Exception as e:
@@ -2404,16 +2425,28 @@ class RecordingManager:
         rec.seg_started_at = time.time()
         self._changed()
         last_seg: Dict[str, Any] = {}
+        session_start = time.time()
+        last_enter = time.time()
+        receiver.event_times.clear()
         try:
             while not rec.stop_event.is_set():
                 await asyncio.sleep(1.0)
+                if connected_ok and receiver.event_times:
+                    log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
+                    rec.status_text = "اتصال قطع شد، اتصال مجدد..."
+                    break
+                ref = receiver.last_video_at or session_start
+                if connected_ok and time.time() - ref >= VIDEO_STALL_TIMEOUT:
+                    log.warning("Video stalled for %s (%.0fs), reconnecting", rec.creator_id, time.time() - ref)
+                    rec.status_text = "تصویر قطع شد، اتصال مجدد..."
+                    break
+                if rec.livestream_id and time.time() - last_enter >= 40:
+                    last_enter = time.time()
+                    bg_task(self.api._request_smart("livestream/enter", {"livestream_id": str(rec.livestream_id)}))
                 rec.bytes_written = receiver.seg_bytes
                 if receiver.seg_video_frames == 1:
                     rec.seg_started_at = receiver.seg_started_at
                 if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
-                    break
-                if time.time() - receiver.last_frame_at >= AGORA_INACTIVITY_TIMEOUT:
-                    log.info("Agora stream %s inactive, finishing session.", rec.creator_id)
                     break
                 _, free_mb, _ = get_disk_stats()
                 if free_mb < MIN_FREE_DISK_MB:
@@ -2615,7 +2648,7 @@ class WatchlistMonitor:
                 discover_map: Optional[Dict[str, Dict[str, Any]]] = None
                 if items:
                     try:
-                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=6)
+                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=8)
                     except Exception as e:
                         log.warning("Batch discover fetch failed: %s", e)
                 for item in items:
@@ -2626,6 +2659,12 @@ class WatchlistMonitor:
                         continue
                     try:
                         info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
+                        if info.creator_id and info.creator_id != cid and info.creator_id.isdigit():
+                            log.info("Watchlist id %s -> real user_id %s", cid, info.creator_id)
+                            self.db.migrate_watch(cid, info.creator_id)
+                            if self.rec_mgr.is_recording(info.creator_id):
+                                continue
+                            cid = info.creator_id
                         if info.is_live:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
