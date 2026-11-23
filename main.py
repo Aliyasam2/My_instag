@@ -72,11 +72,11 @@ SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.
 DEFAULT_AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310").strip()
 
 PRELOADED_ACCOUNTS: List[Dict[str, str]] = [
-    {"label": "elinoori50", "token": "daf6dee61e5271a57f96544dfb69459e5c3f0b0e", "device_id": ""},
-    {"label": "elyaszabeti", "token": "8a28ea961cb43959140d2c5b5400c2ad153e1052", "device_id": ""},
-    {"label": "refegidewadi12", "token": "640858521e925fb3f06dcc2be641b590b61adcf0", "device_id": ""},
-    {"label": "اکانت 4", "token": "99da0e6171df700c93e67f436815af2026b8dd6a", "device_id": ""},
-    {"label": "elllyaszabeti", "token": "ae0b4e5362c4a370d4f3a716ee953121cae2c71c", "device_id": ""},
+    {"label": "elinoori50", "token": "daf6dee61e5271a57f96544dfb69459e5c3f0b0e", "device_id": "ECEBF14246F245A5892281E6F16A9190"},
+    {"label": "elyaszabeti", "token": "8a28ea961cb43959140d2c5b5400c2ad153e1052", "device_id": "ECEBF14246F245A5892281E6F16A9190"},
+    {"label": "refegidewadi12", "token": "640858521e925fb3f06dcc2be641b590b61adcf0", "device_id": "ECEBF14246F245A5892281E6F16A9190"},
+    {"label": "اکانت 4", "token": "99da0e6171df700c93e67f436815af2026b8dd6a", "device_id": "BB98A51F2EB34B399AC0F90D405E8324"},
+    {"label": "elllyaszabeti", "token": "ae0b4e5362c4a370d4f3a716ee953121cae2c71c", "device_id": "77837DE9ECC5453DBBEDFD6868088756"},
 ]
 
 # Storage & Limits (tuned for 6 GiB RAM / 10 GiB Disk)
@@ -747,6 +747,8 @@ class AccountPool:
             dev = (acc.get("device_id") or "").strip() or self.clients[0]._device_id
             if tok in existing_tokens:
                 c = existing_tokens[tok]
+                if (acc.get("device_id") or "").strip() and c._device_id != acc["device_id"].strip():
+                    c.set_credentials(tok, acc["device_id"].strip())
                 if lbl and c.label.startswith("اکانت "):
                     c.label = lbl
                     self.db.set_setting(c._k("superlive_label"), lbl)
@@ -3511,41 +3513,85 @@ class SuperLiveRecBot:
                 self.db.set_setting("archive_chat_id", val)
                 await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
 
-        @self.bot.on(events.NewMessage(pattern=r"^/whoami$"))
+        @self.bot.on(events.NewMessage(pattern=r"^/whoami(?:\s+(.+))?$"))
         async def cmd_whoami(event: Any) -> None:
-            """Check each account's token: does the server recognise it? (users/me)"""
+            """Real health check: each account tries to ENTER a currently-live stream and get an Agora token."""
             if not self._is_owner(event.sender_id):
                 return
+            arg = (event.pattern_match.group(1) or "").strip()
             await self._delete_user_msg(event)
-            msg = await event.respond("🔍 در حال بررسی اکانتها...")
-            lines = ["🪪 <b>وضعیت اکانتها</b>", SEP]
+            msg = await event.respond("🔍 در حال پیدا کردن یه لایو آنلاین برای تست...")
+
+            ls_id = ""
+            cid = ""
+            if arg:
+                cid, _, _, _ = await self.api.resolve_creator(arg)
+                m = re.search(r"/livestream/(\d+)", arg)
+                if m:
+                    ls_id = m.group(1)
+                if cid:
+                    info = await self.api.check_creator_and_get_stream(cid, light=True)
+                    ls_id = info.livestream_id or ls_id
+            if not ls_id:
+                try:
+                    dmap, _, _ = await self.api.fetch_discover_map(max_pages=2)
+                except Exception:
+                    dmap = {}
+                for item in dmap.values():
+                    host = item.get("user") or item.get("host") or item
+                    ls_id = str(host.get("livestream_id") or item.get("livestream_id") or item.get("id") or "")
+                    if ls_id:
+                        break
+            if not ls_id:
+                await msg.edit("❌ لایو آنلاینی برای تست پیدا نشد. یه لایو آنلاین بزن: <code>/whoami لینک_لایو</code>", parse_mode="html")
+                return
+
+            await msg.edit(f"🧪 تست هر اکانت روی لایو <code>{ls_id}</code> ...", parse_mode="html")
+            lines = [f"🪪 <b>وضعیت اکانتها</b>  ·  لایو تست: <code>{ls_id}</code>", SEP]
+            healthy = 0
             for slot, c in sorted(self.pool.clients.items()):
                 tag = " (اصلی)" if slot == 0 else ""
                 if not c.has_token():
                     lines.append(f"⚪ <b>{html.escape(c.label)}</b>{tag} — بدون توکن")
                     continue
-                ok = False
-                detail = ""
-                for scheme in ("Token", "Bearer"):
-                    c._auth_scheme = scheme
-                    res = await c._post("users/me", {})
-                    st = res.get("_http_status")
-                    u = c._extract_user_dict(res)
-                    if st in (200, 201) and u.get("user_id"):
-                        ok = True
-                        c.db.set_setting(c._k("superlive_auth_scheme"), scheme)
-                        detail = f"user_id=<code>{u.get('user_id')}</code> · نام: {html.escape(str(u.get('name') or '-'))} · scheme={scheme}"
+                await c.ensure_initialized()
+                orig_dev = c._device_id
+                variants = [orig_dev, orig_dev.lower(), orig_dev.upper()]
+                if len(orig_dev) == 32 and "-" not in orig_dev:
+                    d0 = orig_dev.lower()
+                    variants.append(f"{d0[:8]}-{d0[8:12]}-{d0[12:16]}-{d0[16:20]}-{d0[20:]}")
+                ret: Dict[str, Any] = {}
+                ent: Dict[str, Any] = {}
+                for dv in dict.fromkeys(variants):
+                    c._device_id = dv
+                    ret = await c._request_smart("livestream/retrieve", {"livestream_id": ls_id})
+                    ent = await c._request_smart("livestream/enter", {"livestream_id": ls_id})
+                    if ent.get("_http_status") in (200, 201):
+                        if dv != orig_dev:
+                            c.set_credentials(c._token, dv)
                         break
-                    err = res.get("error") if isinstance(res.get("error"), dict) else {}
-                    detail = f"HTTP <code>{st}</code> · <code>{html.escape(str(err.get('message') or res.get('_error') or '-'))}</code>"
+                else:
+                    c._device_id = orig_dev
+                rh, eh = ret.get("_http_status"), ent.get("_http_status")
+                reason = ret.get("disallowed_reason") or ent.get("disallowed_reason") or ""
+                agora = c._extract_direct_stream_url(ent) or c._build_agora_uri({"r": ret, "e": ent}, ls_id=ls_id)
+                err = ent.get("error") if isinstance(ent.get("error"), dict) else {}
+                ok = bool(agora) and eh in (200, 201)
+                if ok:
+                    healthy += 1
+                    detail = f"✅ توکن Agora گرفت (enter {eh})" + (" · فرمت device اصلاح و ذخیره شد" if c._device_id != orig_dev else "")
+                elif reason:
+                    detail = f"🔒 برای این اکانت خصوصیه (<code>{html.escape(str(reason))}</code>)"
+                else:
+                    detail = f"❌ رد شد — retrieve/enter <code>{rh}/{eh}</code> · <code>{html.escape(str(err.get('message') or ret.get('_error') or '-'))}</code>"
                 lines.append(
-                    f"{'✅' if ok else '❌'} <b>{html.escape(c.label)}</b>{tag}\n"
-                    f"     📱 device: <code>{html.escape(c._device_id[:14])}…</code>\n"
+                    f"<b>{html.escape(c.label)}</b>{tag}\n"
+                    f"     📱 device <code>{html.escape(c._device_id[:12])}…</code>  ·  🔐 {c._auth_scheme}\n"
                     f"     {detail}"
                 )
-            lines += [SEP,
-                      "❌ = سرور این توکن رو قبول نداره (معمولاً Device-Id با توکن جور نیست یا توکن منقضیه).",
-                      "برای درست کردن: توکن و <code>Device-Id</code> رو با هم از مرورگر بردار و با 🔑 توی «👥 اکانتها» دوباره ست کن."]
+            lines += [SEP, f"سالم: <b>{healthy}</b> از <b>{len([c for c in self.pool.clients.values() if c.has_token()])}</b> اکانت"]
+            if healthy == 0:
+                lines.append("هیچ اکانتی وارد نشد. اگه لایو خصوصیه با یه لایو عمومی دوباره تست کن؛ اگه عمومیه یعنی توکن/Device-Id جور نیست.")
             await msg.edit("\n".join(lines)[:4000], parse_mode="html", link_preview=False)
 
         @self.bot.on(events.NewMessage(pattern=r"^/guesttest\s+(.+)$"))
@@ -3931,7 +3977,7 @@ class SuperLiveRecBot:
                 BotCommand("watch", "افزودن به واچلیست"),
                 BotCommand("check", "بررسی وضعیت استریمر"),
                 BotCommand("debug", "گزارش فنی API"),
-                BotCommand("whoami", "بررسی سالم بودن اکانتها"),
+                BotCommand("whoami", "تست ورود اکانتها به یک لایو"),
             ]))
         except Exception as e:
             log.debug("set commands failed: %s", e)
