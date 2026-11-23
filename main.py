@@ -1326,7 +1326,7 @@ class SuperLiveClient:
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False, known_ls_id: str = ""
     ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
@@ -1338,7 +1338,7 @@ class SuperLiveClient:
         info.raw_debug["has_token"] = bool(self._token)
 
         target_uid = str(creator_id)
-        ls_id = ""
+        ls_id = str(known_ls_id or "")
         is_live_flag = False
         prof_resp: Dict[str, Any] = {}
         user_obj: Dict[str, Any] = {}
@@ -1438,7 +1438,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(8):
+            for page_idx in range(15):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -2285,7 +2285,7 @@ class RecordingManager:
         # Reserve the account, then get a fresh token issued for THIS account
         self.busy[client.slot] = cid
         try:
-            fresh = await client.check_creator_and_get_stream(cid)
+            fresh = await client.check_creator_and_get_stream(cid, known_ls_id=str(stream_info.livestream_id or ""))
         except Exception as e:
             fresh = None
             log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
