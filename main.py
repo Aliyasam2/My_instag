@@ -53,9 +53,10 @@ from telethon.tl.types import DocumentAttributeVideo
 # CONFIGURATION (Override via Environment Variables on Altare / VPS)
 # ==============================================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    sys.exit("❌ BOT_TOKEN environment variable is required (get a new one from @BotFather).")
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN",
+    "8837565058:AAFDtM7wJRI2AOgV67dPDdK-206STorQ1Ew",
+).strip()
 
 # Telethon MTProto credentials (needed for 2 GB uploads without 50 MB Bot API limit)
 # You can set your own from https://my.telegram.org via TG_API_ID / TG_API_HASH env vars
@@ -63,7 +64,7 @@ TG_API_ID = int(os.environ.get("TG_API_ID", "2040"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627").strip()
 
 # Optional: lock bot to your Telegram numeric user ID (0 = auto-bind to first /start user)
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
 
 # SuperLive Web API & Agora defaults
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
