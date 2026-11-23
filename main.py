@@ -71,14 +71,6 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
 DEFAULT_AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310").strip()
 
-PRELOADED_ACCOUNTS: List[Dict[str, str]] = [
-    {"label": "elinoori50", "token": "daf6dee61e5271a57f96544dfb69459e5c3f0b0e", "device_id": ""},
-    {"label": "elyaszabeti", "token": "8a28ea961cb43959140d2c5b5400c2ad153e1052", "device_id": ""},
-    {"label": "refegidewadi12", "token": "640858521e925fb3f06dcc2be641b590b61adcf0", "device_id": ""},
-    {"label": "اکانت 4", "token": "99da0e6171df700c93e67f436815af2026b8dd6a", "device_id": ""},
-    {"label": "elllyaszabeti", "token": "ae0b4e5362c4a370d4f3a716ee953121cae2c71c", "device_id": ""},
-]
-
 # Storage & Limits (tuned for 6 GiB RAM / 10 GiB Disk)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "./superliverec_data")).resolve()
 RECORDINGS_DIR = BASE_DIR / "recordings"
@@ -735,32 +727,6 @@ class AccountPool:
         raw = db.get_setting("account_slots", "0")
         slots = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()} | {0})
         self.clients: Dict[int, "SuperLiveClient"] = {n: SuperLiveClient(db, n) for n in slots}
-        self._seed_preloaded()
-
-    def _seed_preloaded(self) -> None:
-        existing_tokens = {c._token: c for c in self.clients.values() if c._token}
-        for acc in PRELOADED_ACCOUNTS:
-            tok = (acc.get("token") or "").strip()
-            if not tok:
-                continue
-            lbl = (acc.get("label") or "").strip()
-            dev = (acc.get("device_id") or "").strip()
-            if tok in existing_tokens:
-                c = existing_tokens[tok]
-                if lbl and c.label.startswith("اکانت "):
-                    c.label = lbl
-                    self.db.set_setting(c._k("superlive_label"), lbl)
-                continue
-            if not self.clients[0].has_token():
-                c = self.clients[0]
-                c.set_credentials(tok, dev)
-                if lbl:
-                    c.label = lbl
-                    self.db.set_setting(c._k("superlive_label"), lbl)
-                existing_tokens[tok] = c
-            else:
-                c = self.add(tok, dev, lbl)
-                existing_tokens[tok] = c
 
     def _save(self) -> None:
         self.db.set_setting("account_slots", ",".join(str(n) for n in sorted(self.clients)))
@@ -1326,7 +1292,7 @@ class SuperLiveClient:
         return live_map, first_http, first_sample
 
     async def check_creator_and_get_stream(
-        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False, known_ls_id: str = ""
+        self, creator_id: str, discover_map: Optional[Dict[str, Dict[str, Any]]] = None, light: bool = False
     ) -> CreatorStreamInfo:
         """
         Check whether a SuperLive creator is currently live and retrieve a playable stream URI.
@@ -1338,7 +1304,7 @@ class SuperLiveClient:
         info.raw_debug["has_token"] = bool(self._token)
 
         target_uid = str(creator_id)
-        ls_id = str(known_ls_id or "")
+        ls_id = ""
         is_live_flag = False
         prof_resp: Dict[str, Any] = {}
         user_obj: Dict[str, Any] = {}
@@ -1438,7 +1404,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(15):
+            for page_idx in range(8):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -2282,31 +2248,13 @@ class RecordingManager:
         if client is None:
             return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
                            f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
-        # Try free accounts in pool; if one gets 400/401/403 on retrieve/enter, fall back to the next account
-        tried_slots = set()
-        fresh = None
-        known_ls = str(stream_info.livestream_id or "")
-        for _ in range(max(1, len(self.accounts()))):
-            self.busy[client.slot] = cid
-            tried_slots.add(client.slot)
-            try:
-                fresh = await client.check_creator_and_get_stream(cid, known_ls_id=known_ls)
-            except Exception as e:
-                fresh = None
-                log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
-            if fresh and fresh.is_live and fresh.stream_url:
-                break
-            self.busy.pop(client.slot, None)
-            if not fresh or not fresh.is_live:
-                break
-            d = fresh.raw_debug
-            if d.get("retrieve_http") in (400, 401, 403) or d.get("enter_http") in (400, 401, 403):
-                nxt = next((c for c in self.accounts() if c.slot not in self.busy and c.slot not in tried_slots), None)
-                if nxt is not None:
-                    log.info("Account %s got %s/%s for %s, trying %s", client.label, d.get("retrieve_http"), d.get("enter_http"), cid, nxt.label)
-                    client = nxt
-                    continue
-            break
+        # Reserve the account, then get a fresh token issued for THIS account
+        self.busy[client.slot] = cid
+        try:
+            fresh = await client.check_creator_and_get_stream(cid)
+        except Exception as e:
+            fresh = None
+            log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
         if not fresh or not fresh.is_live or not fresh.stream_url:
             self.busy.pop(client.slot, None)
             if not fresh:
