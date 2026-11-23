@@ -71,6 +71,14 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
 DEFAULT_AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "dca16fbf522b4c6f96ecc88721800310").strip()
 
+PRELOADED_ACCOUNTS: List[Dict[str, str]] = [
+    {"label": "elinoori50", "token": "daf6dee61e5271a57f96544dfb69459e5c3f0b0e", "device_id": ""},
+    {"label": "elyaszabeti", "token": "8a28ea961cb43959140d2c5b5400c2ad153e1052", "device_id": ""},
+    {"label": "refegidewadi12", "token": "640858521e925fb3f06dcc2be641b590b61adcf0", "device_id": ""},
+    {"label": "اکانت 4", "token": "99da0e6171df700c93e67f436815af2026b8dd6a", "device_id": ""},
+    {"label": "elllyaszabeti", "token": "ae0b4e5362c4a370d4f3a716ee953121cae2c71c", "device_id": ""},
+]
+
 # Storage & Limits (tuned for 6 GiB RAM / 10 GiB Disk)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "./superliverec_data")).resolve()
 RECORDINGS_DIR = BASE_DIR / "recordings"
@@ -727,6 +735,32 @@ class AccountPool:
         raw = db.get_setting("account_slots", "0")
         slots = sorted({int(x) for x in raw.split(",") if x.strip().isdigit()} | {0})
         self.clients: Dict[int, "SuperLiveClient"] = {n: SuperLiveClient(db, n) for n in slots}
+        self._seed_preloaded()
+
+    def _seed_preloaded(self) -> None:
+        existing_tokens = {c._token: c for c in self.clients.values() if c._token}
+        for acc in PRELOADED_ACCOUNTS:
+            tok = (acc.get("token") or "").strip()
+            if not tok:
+                continue
+            lbl = (acc.get("label") or "").strip()
+            dev = (acc.get("device_id") or "").strip()
+            if tok in existing_tokens:
+                c = existing_tokens[tok]
+                if lbl and c.label.startswith("اکانت "):
+                    c.label = lbl
+                    self.db.set_setting(c._k("superlive_label"), lbl)
+                continue
+            if not self.clients[0].has_token():
+                c = self.clients[0]
+                c.set_credentials(tok, dev)
+                if lbl:
+                    c.label = lbl
+                    self.db.set_setting(c._k("superlive_label"), lbl)
+                existing_tokens[tok] = c
+            else:
+                c = self.add(tok, dev, lbl)
+                existing_tokens[tok] = c
 
     def _save(self) -> None:
         self.db.set_setting("account_slots", ",".join(str(n) for n in sorted(self.clients)))
