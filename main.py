@@ -744,7 +744,7 @@ class AccountPool:
             if not tok:
                 continue
             lbl = (acc.get("label") or "").strip()
-            dev = (acc.get("device_id") or "").strip()
+            dev = (acc.get("device_id") or "").strip() or self.clients[0]._device_id
             if tok in existing_tokens:
                 c = existing_tokens[tok]
                 if lbl and c.label.startswith("اکانت "):
@@ -2286,7 +2286,7 @@ class RecordingManager:
         tried_slots = set()
         fresh = None
         known_ls = str(stream_info.livestream_id or "")
-        for _ in range(max(1, len(self.accounts()))):
+        for _ in range(max(1, len(self.accounts())) + 1):
             self.busy[client.slot] = cid
             tried_slots.add(client.slot)
             try:
@@ -2302,6 +2302,8 @@ class RecordingManager:
             d = fresh.raw_debug
             if d.get("retrieve_http") in (400, 401, 403) or d.get("enter_http") in (400, 401, 403):
                 nxt = next((c for c in self.accounts() if c.slot not in self.busy and c.slot not in tried_slots), None)
+                if nxt is None and self.api.slot not in tried_slots and self.api.has_token():
+                    nxt = self.api  # /debug works with the primary account -> always try it last
                 if nxt is not None:
                     log.info("Account %s got %s/%s for %s, trying %s", client.label, d.get("retrieve_http"), d.get("enter_http"), cid, nxt.label)
                     client = nxt
@@ -2329,6 +2331,7 @@ class RecordingManager:
                 + (f"\n• دلیل سرور: <code>{html.escape(reason)}</code>" if reason else "")
                 + f"\n• کلیدها: <code>{html.escape(str(d.get('agora_keys', '-'))[:250])}</code>"
                 + f"\n• اکانت: <code>{html.escape(client.label)}</code>"
+                + f"\n• جواب سرور: <code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or '-')[:300])}</code>"
             )
         fresh.display_name = fresh.display_name or stream_info.display_name
         stream_info = fresh
