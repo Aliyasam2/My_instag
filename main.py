@@ -224,9 +224,9 @@ def extract_creator_identifier(raw_input: str) -> str:
     if not text:
         return ""
     # Extract URL if pasted inside a sentence
-    url_match = re.search(r"https?://[^\s]+", text)
+    url_match = re.search(r"https?://[^\s]+", text, re.I)
     # Direct livestream page link: https://superlive.chat/livestream/155964343
-    ls_match = re.search(r"/livestream/(\d{4,16})", text)
+    ls_match = re.search(r"/livestream/(\d{4,16})", text, re.I)
     if ls_match:
         return f"ls:{ls_match.group(1)}"
     if text.lower().startswith("ls:") and text[3:].isdigit():
@@ -1035,6 +1035,10 @@ class SuperLiveClient:
         if ident.startswith("ls:"):
             ls_id = ident[3:]
             ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
+            if ret.get("_http_status") == 400 and ls_id.isdigit():
+                ret_int = await self._request_smart("livestream/retrieve", {"livestream_id": int(ls_id)})
+                if ret_int.get("_http_status") in (200, 201):
+                    ret = ret_int
             if ret.get("_http_status") in (401, 403):
                 await self.ensure_initialized(force=True)
                 ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
@@ -1111,12 +1115,13 @@ class SuperLiveClient:
                 err_msg = str(ret["error"].get("message") or ret["error"].get("code") or "")
             elif ret.get("message") or ret.get("_error"):
                 err_msg = str(ret.get("message") or ret.get("_error"))
+            raw_snip = json.dumps({k: v for k, v in ret.items() if k != "_http_status"}, ensure_ascii=False)[:220]
             if http_st in (401, 403) or not self._token:
-                self.last_resolve_error = f"HTTP {http_st} — توکن SuperLive نامعتبر یا لاگین نشده (از /login یا /settoken وارد شو)."
+                self.last_resolve_error = f"HTTP {http_st} (token={bool(self._token)}) — توکن SuperLive نامعتبر یا لاگین نشده (با /login یا /settoken وارد شو). {raw_snip}"
             elif err_msg:
                 self.last_resolve_error = f"HTTP {http_st}: {err_msg}"
             else:
-                self.last_resolve_error = f"HTTP {http_st} — لایو بسته شده یا صاحب لایو در پاسخ سرور نبود."
+                self.last_resolve_error = f"HTTP {http_st} (token={bool(self._token)}): {raw_snip}"
             log.warning("Could not resolve livestream %s owner: %s", ls_id, json.dumps(ret, ensure_ascii=False)[:300])
             return "", "", "", ""
 
