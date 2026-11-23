@@ -64,7 +64,7 @@ TG_API_ID = int(os.environ.get("TG_API_ID", "2040"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627").strip()
 
 # Optional: lock bot to your Telegram numeric user ID (0 = auto-bind to first /start user)
-OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 # SuperLive Web API & Agora defaults
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
@@ -85,10 +85,11 @@ MAX_SINGLE_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "1900")) * 1024 * 1024
 MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", "500"))
 # Inactivity timeout for Agora stream end detection (seconds without frames)
 AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
+VIDEO_STALL_TIMEOUT = int(os.environ.get("VIDEO_STALL_TIMEOUT", "12"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
 # Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
-DEFAULT_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "8"))
+DEFAULT_MAX_CONCURRENT = 0  # unlimited
 
 # ==============================================================================
 # LOGGING
@@ -250,6 +251,72 @@ def extract_creator_identifier(raw_input: str) -> str:
     return text.lstrip("@").strip()
 
 
+try:
+    from zoneinfo import ZoneInfo  # type: ignore
+    LOCAL_TZ: Any = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Tehran"))
+except Exception:
+    LOCAL_TZ = datetime.timezone.utc
+
+_BG_TASKS: set = set()
+
+
+def bg_task(coro: Any) -> "asyncio.Task":
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+
+def schedule_delete(msg: Any, delay: float) -> None:
+    """Delete a transient Telegram message after `delay` seconds (keeps the chat tidy)."""
+    if msg is None:
+        return
+
+    async def _d() -> None:
+        try:
+            await asyncio.sleep(delay)
+            await msg.delete()
+        except Exception:
+            pass
+
+    bg_task(_d())
+
+
+def local_now_str(fmt: str = "%Y-%m-%d · %H:%M") -> str:
+    return datetime.datetime.now(LOCAL_TZ).strftime(fmt)
+
+
+def iso_to_local(iso: str, fmt: str = "%m-%d %H:%M") -> str:
+    if not iso:
+        return "-"
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime(fmt)
+    except Exception:
+        return iso[:16].replace("T", " ")
+
+
+def is_h264_keyframe(data: bytes) -> bool:
+    """True if an Annex-B H.264 access unit contains an IDR slice or SPS."""
+    try:
+        n = len(data)
+        i = data.find(b"\x00\x00\x01")
+        checks = 0
+        while 0 <= i < n - 3 and checks < 64:
+            t = data[i + 3] & 0x1F
+            if t in (5, 7):
+                return True
+            if t == 1:
+                return False
+            i = data.find(b"\x00\x00\x01", i + 3)
+            checks += 1
+    except Exception:
+        pass
+    return False
+
+
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\-.]+", "_", name.strip())
     return cleaned[:48] or "creator"
@@ -360,6 +427,21 @@ class Database:
                     archive_message_id INTEGER DEFAULT 0,
                     notes TEXT DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS clips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rec_id INTEGER DEFAULT 0,
+                    creator_id TEXT NOT NULL,
+                    creator_name TEXT DEFAULT '',
+                    part_no INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    duration_sec INTEGER DEFAULT 0,
+                    size_bytes INTEGER DEFAULT 0,
+                    chat_id INTEGER DEFAULT 0,
+                    msg_id INTEGER DEFAULT 0,
+                    sheet_msg_id INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_clips_creator ON clips (creator_id, id);
                 """
             )
 
@@ -548,6 +630,65 @@ class Database:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM recordings WHERE status = 'completed'").fetchone()
             return int(row["c"]) if row else 0
+
+    # --- Clips (every uploaded video part) ---
+    def add_clip(self, rec_id: int, creator_id: str, creator_name: str, part_no: int,
+                 duration_sec: int, size_bytes: int, chat_id: int, msg_id: int, sheet_msg_id: int = 0) -> None:
+        now = datetime.datetime.utcnow().isoformat()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "INSERT INTO clips (rec_id, creator_id, creator_name, part_no, created_at, duration_sec, "
+                "size_bytes, chat_id, msg_id, sheet_msg_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (rec_id, creator_id, creator_name, part_no, now, duration_sec, size_bytes, chat_id, msg_id, sheet_msg_id),
+            )
+
+    def list_clips(self, creator_id: str = "", limit: int = 8, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            if creator_id:
+                rows = conn.execute(
+                    "SELECT * FROM clips WHERE creator_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (creator_id, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM clips ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def clip_stats(self, creator_id: str = "") -> Tuple[int, int, int]:
+        with self._lock, self._conn() as conn:
+            q = "SELECT COUNT(*) c, COALESCE(SUM(duration_sec),0) d, COALESCE(SUM(size_bytes),0) s FROM clips"
+            row = conn.execute(q + (" WHERE creator_id = ?" if creator_id else ""),
+                               ((creator_id,) if creator_id else ())).fetchone()
+            return int(row["c"]), int(row["d"]), int(row["s"])
+
+    def get_clip(self, clip_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            return dict(row) if row else None
+
+    def migrate_watch(self, old_id: str, new_id: str) -> None:
+        if not new_id or old_id == new_id:
+            return
+        with self._lock, self._conn() as conn:
+            if conn.execute("SELECT 1 FROM watchlist WHERE creator_id = ?", (new_id,)).fetchone():
+                conn.execute("DELETE FROM watchlist WHERE creator_id = ?", (old_id,))
+            else:
+                conn.execute("UPDATE watchlist SET creator_id = ? WHERE creator_id = ?", (new_id, old_id))
+
+    def increment_recordings(self, creator_id: str) -> None:
+        with self._lock, self._conn() as conn:
+            conn.execute("UPDATE watchlist SET total_recordings = total_recordings + 1 WHERE creator_id = ?", (creator_id,))
+
+    def clip_creators(self, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(
+                "SELECT creator_id, MAX(creator_name) AS creator_name, COUNT(*) AS cnt, "
+                "SUM(duration_sec) AS dur, SUM(size_bytes) AS size, MAX(id) AS last_id "
+                "FROM clips GROUP BY creator_id ORDER BY last_id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def mark_stale_recordings_interrupted(self) -> int:
         now = datetime.datetime.utcnow().isoformat()
@@ -1117,6 +1258,8 @@ class SuperLiveClient:
                 info.raw_debug["discover_cache_hit"] = True
         cache_ls_id = ls_id
         cache_name = info.display_name
+        if info.creator_id and info.creator_id != target_uid:
+            target_uid = info.creator_id  # discover gave us the real internal user_id
 
         # 1) Query user profile only if not already matched in discover_map
         prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1194,7 +1337,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(4):
+            for page_idx in range(8):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -1396,7 +1539,7 @@ def build_mux_command(
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-shortest",
+            "-af", "aresample=async=1",
             "-movflags", "+faststart",
             str(output_mp4),
         ]
@@ -1466,7 +1609,7 @@ def generate_thumbnail_and_contact_sheet(
         pass
 
     # 2) 4x3 Contact Sheet (12 preview frames across the full stream)
-    if make_sheet and duration_sec >= 15:
+    if make_sheet and duration_sec >= 3:
         try:
             fps_val = max(0.0005, 12.0 / max(12.0, float(duration_sec)))
             vf = f"fps={fps_val:.6f},scale=320:-2,tile=4x3:padding=4:margin=4:color=0x111111"
@@ -1583,6 +1726,7 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
     def on_disconnected(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
         self.receiver.conn_events.append(f"disconn({reason})")
+        self.receiver.event_times.append((time.time(), "drop"))
 
     def on_connecting(self, *args: Any, **kwargs: Any) -> None:
         self.receiver.conn_events.append("connecting")
@@ -1594,6 +1738,7 @@ class _ConnObserver(IRTCConnectionObserver):  # type: ignore
     def on_connection_failure(self, *args: Any, **kwargs: Any) -> None:
         reason = args[-1] if args else kwargs.get("reason", "?")
         self.receiver.conn_events.append(f"fail({reason})")
+        self.receiver.event_times.append((time.time(), "drop"))
 
 
 class AgoraStreamReceiver:
@@ -1630,18 +1775,36 @@ class AgoraStreamReceiver:
         self.connect_rc: Any = None
         self.diag_flags: str = ""
         self.cb_error: str = ""
+        # Per-segment counters (a segment = one uploaded file; connection stays open across segments)
+        self.seg_video_frames = 0
+        self.seg_audio_frames = 0
+        self.seg_bytes = 0
+        self.seg_started_at = time.time()
+        self._need_keyframe = True
+        self.last_video_at = 0.0
+        self.event_times: List[Tuple[float, str]] = []
 
     def handle_video_frame(self, image_buffer: Any, length: int) -> None:
         if self._closed or image_buffer is None or not isinstance(length, int) or length <= 0:
             return
         try:
-            data = bytes(image_buffer[:length]) if not isinstance(image_buffer, (bytes, bytearray)) else image_buffer[:length]
+            data = bytes(image_buffer[:length]) if not isinstance(image_buffer, (bytes, bytearray)) else bytes(image_buffer[:length])
             with self._io_lock:
-                if not self._closed:
-                    self._h264_fh.write(data)
-                    self.video_frames += 1
-                    self.bytes_written += len(data)
-                    self.last_frame_at = time.time()
+                if self._closed:
+                    return
+                self.last_frame_at = time.time()
+                if self._need_keyframe:
+                    # Each segment must start on a keyframe, otherwise the file starts black/garbled
+                    if not is_h264_keyframe(data):
+                        return
+                    self._need_keyframe = False
+                    self.seg_started_at = time.time()
+                self.last_video_at = time.time()
+                self._h264_fh.write(data)
+                self.video_frames += 1
+                self.seg_video_frames += 1
+                self.bytes_written += len(data)
+                self.seg_bytes += len(data)
         except Exception as e:
             if not self.cb_error:
                 self.cb_error = f"video_write:{e}"
@@ -1661,13 +1824,51 @@ class AgoraStreamReceiver:
                 self.channels = int(ch)
             data = bytes(buf) if not isinstance(buf, (bytes, bytearray)) else buf
             with self._io_lock:
-                if not self._closed:
-                    self._pcm_fh.write(data)
-                    self.audio_frames += 1
-                    self.bytes_written += len(data)
-                    self.last_frame_at = time.time()
+                if self._closed:
+                    return
+                # The SDK keeps firing playback callbacks with SILENCE after the connection drops,
+                # so audio is only written while video is actually arriving (A/V stay the same length).
+                if self._need_keyframe or time.time() - self.last_video_at > 3.0:
+                    return
+                self._pcm_fh.write(data)
+                self.audio_frames += 1
+                self.seg_audio_frames += 1
+                self.bytes_written += len(data)
+                self.seg_bytes += len(data)
         except Exception:
             pass
+
+    def rotate(self, new_h264: Path, new_pcm: Path) -> Dict[str, Any]:
+        """Close current segment files and continue writing into new ones WITHOUT disconnecting."""
+        with self._io_lock:
+            old = {
+                "h264": self.h264_path, "pcm": self.pcm_path,
+                "video_frames": self.seg_video_frames, "audio_frames": self.seg_audio_frames,
+                "elapsed": max(1.0, time.time() - self.seg_started_at),
+                "sample_rate": self.sample_rate, "channels": self.channels,
+            }
+            for fh in (self._h264_fh, self._pcm_fh):
+                try:
+                    fh.flush()
+                    fh.close()
+                except Exception:
+                    pass
+            self.h264_path, self.pcm_path = new_h264, new_pcm
+            self._h264_fh = open(new_h264, "wb")
+            self._pcm_fh = open(new_pcm, "wb")
+            self.seg_video_frames = self.seg_audio_frames = self.seg_bytes = 0
+            self.seg_started_at = time.time()
+            self._need_keyframe = True
+        return old
+
+    def segment_snapshot(self) -> Dict[str, Any]:
+        with self._io_lock:
+            return {
+                "h264": self.h264_path, "pcm": self.pcm_path,
+                "video_frames": self.seg_video_frames, "audio_frames": self.seg_audio_frames,
+                "elapsed": max(1.0, time.time() - self.seg_started_at),
+                "sample_rate": self.sample_rate, "channels": self.channels,
+            }
 
     @staticmethod
     def _build_publish_config(svc: Any) -> Any:
@@ -1883,13 +2084,27 @@ class ActiveRecording:
     stream_url: str
     db_rec_id: int
     chat_id: int
+    triggered_by: str = "watchlist"
     started_at: float = field(default_factory=time.time)
+    seg_started_at: float = field(default_factory=time.time)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    status_text: str = "در حال ضبط..."
+    split_event: asyncio.Event = field(default_factory=asyncio.Event)
+    status_text: str = "در حال اتصال..."
     bytes_written: int = 0
     part_number: int = 1
     task: Optional[asyncio.Task] = None
     agora_diag: str = ""
+    manual_stop: bool = False
+    uploads_pending: int = 0
+    upload_status: str = ""
+    uploaded_parts: int = 0
+    uploaded_duration: int = 0
+    uploaded_bytes: int = 0
+    connected: bool = False
+
+
+FAILED_DIR = BASE_DIR / "failed_uploads"
+FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class RecordingManager:
@@ -1899,13 +2114,29 @@ class RecordingManager:
         self.api = api
         self.active: Dict[str, ActiveRecording] = {}
         self._fail_cooldown: Dict[str, float] = {}
+        # livestream_ids the user stopped manually -> don't auto-restart the same live
+        self.manually_stopped_ls: Dict[str, str] = {}
+        self._upload_sem = asyncio.Semaphore(int(os.environ.get("MAX_PARALLEL_UPLOADS", "3")))
+        self.on_change: Any = None  # callback to refresh UI panels
 
-    def max_concurrent(self) -> int:
-        raw = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
-        return int(raw) if raw.isdigit() else DEFAULT_MAX_CONCURRENT
+    def _changed(self) -> None:
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                pass
 
     def is_recording(self, creator_id: str) -> bool:
         return str(creator_id) in self.active
+
+    def split_seconds(self) -> int:
+        raw = self.db.get_setting("split_minutes", "0")
+        return int(raw) * 60 if raw.isdigit() else 0
+
+    def part_cap_bytes(self) -> int:
+        raw = self.db.get_setting("part_mb", str(MAX_SINGLE_FILE_BYTES // (1024 * 1024)))
+        mb = int(raw) if raw.isdigit() else 1900
+        return max(50, min(1950, mb)) * 1024 * 1024
 
     async def start_recording(
         self,
@@ -1915,28 +2146,24 @@ class RecordingManager:
     ) -> Tuple[bool, str]:
         cid = str(stream_info.creator_id)
         if cid in self.active:
-            return False, f"استریم <b>{html.escape(stream_info.display_name or cid)}</b> همین الان در حال ضبط هست."
+            return False, f"⏺ <b>{html.escape(stream_info.display_name or cid)}</b> همین الان در حال ضبطه."
         if triggered_by == "watchlist":
-            cd_until = self._fail_cooldown.get(cid, 0.0)
-            if time.time() < cd_until:
+            if time.time() < self._fail_cooldown.get(cid, 0.0):
                 return False, "cooldown"
-
-        limit = self.max_concurrent()
-        if limit > 0 and len(self.active) >= limit:
-            return False, f"سقف ضبط هم‌زمان ({limit} استریم) پر شده. از /settings می‌تونی بیشترش کنی یا 0 (نامحدود) بذاری."
+            if stream_info.livestream_id and self.manually_stopped_ls.get(cid) == stream_info.livestream_id:
+                return False, "manually stopped"
+        else:
+            self.manually_stopped_ls.pop(cid, None)
 
         _, free_mb, _ = get_disk_stats()
         if free_mb < MIN_FREE_DISK_MB:
-            return False, f"فضای خالی دیسک کمه ({free_mb:.0f} MB). برای جلوگیری از کرش سرور، ضبط جدید متوقف شد."
-
+            return False, f"💽 فضای خالی دیسک کمه ({free_mb:.0f} MB)؛ ضبط جدید شروع نشد."
         if not stream_info.stream_url:
-            return False, "لینک استریم یا اطلاعات کانال Agora برای این لایو پیدا نشد."
-
+            return False, "لینک استریم یا اطلاعات Agora برای این لایو پیدا نشد."
         if stream_info.stream_url.startswith("agora://") and not AGORA_AVAILABLE:
-            return False, f"این لایو از نوع Agora هست ولی پکیج `agora-python-server-sdk` روی سرور نصب نیست."
-
+            return False, "پکیج agora-python-server-sdk روی سرور نصب نیست."
         if not FFMPEG_BIN:
-            return False, "ابزار FFmpeg روی سرور پیدا نشد (پکیج `imageio-ffmpeg` رو نصب کن)."
+            return False, "FFmpeg روی سرور پیدا نشد."
 
         cname = stream_info.display_name or stream_info.username or cid
         db_rec_id = self.db.create_recording_record(cid, cname, stream_info.livestream_id)
@@ -1947,17 +2174,31 @@ class RecordingManager:
             stream_url=stream_info.stream_url,
             db_rec_id=db_rec_id,
             chat_id=chat_id,
+            triggered_by=triggered_by,
         )
         self.active[cid] = rec
-        rec.task = asyncio.create_task(self._run_recording_lifecycle(rec, triggered_by))
-        return True, f"🔴 ضبط لایو <b>{html.escape(cname)}</b> (ID: <code>{cid}</code>) شروع شد!"
+        rec.task = asyncio.create_task(self._run_recording_lifecycle(rec))
+        self._changed()
+        return True, f"⏺ ضبط <b>{html.escape(cname)}</b> شروع شد."
 
     async def stop_recording(self, creator_id: str) -> bool:
         rec = self.active.get(str(creator_id))
         if not rec:
             return False
-        rec.status_text = "در حال توقف و آماده‌سازی فایل..."
+        rec.manual_stop = True
+        if rec.livestream_id:
+            self.manually_stopped_ls[rec.creator_id] = rec.livestream_id
+        rec.status_text = "در حال پایان ضبط و ارسال..."
         rec.stop_event.set()
+        self._changed()
+        return True
+
+    async def split_recording(self, creator_id: str) -> bool:
+        """Send everything recorded so far, keep recording the rest seamlessly."""
+        rec = self.active.get(str(creator_id))
+        if not rec:
+            return False
+        rec.split_event.set()
         return True
 
     async def stop_all(self) -> int:
@@ -1967,181 +2208,185 @@ class RecordingManager:
             count += 1
         return count
 
-    async def _run_recording_lifecycle(self, rec: ActiveRecording, triggered_by: str) -> None:
-        notify_on = self.db.get_setting("notify_live", "1") == "1"
-        status_msg = None
-        if notify_on:
-            try:
-                badge = "👀 واچ‌لیست" if triggered_by == "watchlist" else "🎬 ضبط دستی"
-                status_msg = await self.bot.send_message(
-                    rec.chat_id,
-                    (
-                        f"🔴 <b>شروع ضبط لایو ({badge})</b>\n"
-                        f"👤 استریمر: <b>{html.escape(rec.creator_name)}</b> (<code>{rec.creator_id}</code>)\n"
-                        f"📡 پروتکل: <code>{'Agora RTC' if rec.stream_url.startswith('agora://') else 'HLS/FFmpeg'}</code>\n"
-                        f"⏳ وضعیت: در حال ضبط پیوسته (تا سقف 2GB بدون تکه‌تکه شدن)..."
-                    ),
-                    parse_mode="html",
-                    buttons=[[Button.inline("⏹ توقف و ارسال همین الان", data=f"stop:{rec.creator_id}")]],
-                )
-            except Exception as e:
-                log.warning("Failed sending start notice: %s", e)
-
+    # ------------------------------------------------------------------ lifecycle
+    async def _run_recording_lifecycle(self, rec: ActiveRecording) -> None:
         work_dir = RECORDINGS_DIR / f"{sanitize_filename(rec.creator_name)}_{rec.creator_id}_{int(rec.started_at)}"
         work_dir.mkdir(parents=True, exist_ok=True)
+        upload_lock = asyncio.Lock()
+        upload_tasks: List[asyncio.Task] = []
         final_status = "completed"
-        total_duration = 0
-        total_size = 0
-        last_msg_id = 0
-        last_arch_chat = 0
-        last_arch_msg = 0
         notes = ""
 
+        def enqueue(coro_factory: Any) -> None:
+            rec.uploads_pending += 1
+
+            async def _job() -> None:
+                try:
+                    async with upload_lock:  # keeps parts in order
+                        await coro_factory()
+                except Exception as e:
+                    log.exception("Upload job failed for %s: %s", rec.creator_id, e)
+                finally:
+                    rec.uploads_pending -= 1
+                    self._changed()
+
+            upload_tasks.append(asyncio.create_task(_job()))
+
         try:
+            restarts = 0
             while not rec.stop_event.is_set():
-                part_mp4 = work_dir / f"{sanitize_filename(rec.creator_name)}_part{rec.part_number}.mp4"
+                parts_before = rec.part_number
                 if rec.stream_url.startswith("agora://"):
-                    captured_ok, reached_size_cap = await self._capture_agora_part(rec, work_dir, part_mp4)
+                    await self._agora_session(rec, work_dir, enqueue)
                 else:
-                    captured_ok, reached_size_cap = await self._capture_ffmpeg_part(rec, part_mp4)
-
-                if captured_ok and part_mp4.exists() and part_mp4.stat().st_size > 10_000:
-                    dur, _, _ = await asyncio.to_thread(probe_video_metadata, part_mp4)
-                    fsize = part_mp4.stat().st_size
-                    total_duration += dur
-                    total_size += fsize
-                    msg_id, arch_chat, arch_msg = await self._upload_part_to_telegram(
-                        rec, part_mp4, dur, status_msg
-                    )
-                    last_msg_id = msg_id or last_msg_id
-                    last_arch_chat = arch_chat or last_arch_chat
-                    last_arch_msg = arch_msg or last_arch_msg
-
-                    # Cleanup uploaded part immediately if auto_delete enabled (protects 10 GiB disk)
-                    if self.db.get_setting("auto_delete", "1") == "1":
-                        try:
-                            part_mp4.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-
-                if reached_size_cap and not rec.stop_event.is_set():
-                    rec.part_number += 1
+                    await self._ffmpeg_session(rec, work_dir, enqueue)
+                if rec.stop_event.is_set():
+                    break
+                if rec.part_number > parts_before:
+                    restarts = 0
+                # Stream went quiet: is the creator really offline or was it a network hiccup?
+                try:
+                    info = await self.api.check_creator_and_get_stream(rec.creator_id)
+                except Exception:
+                    info = None
+                if info and info.is_live and info.stream_url and restarts < 10:
+                    restarts += 1
+                    rec.stream_url = info.stream_url
+                    rec.livestream_id = info.livestream_id or rec.livestream_id
+                    rec.status_text = f"اتصال مجدد ({restarts})..."
+                    log.info("Reconnecting %s (attempt %d)", rec.creator_id, restarts)
+                    await asyncio.sleep(min(10, 2 + restarts))
                     continue
                 break
-
-            if total_size == 0:
-                final_status = "empty"
-                self._fail_cooldown[rec.creator_id] = time.time() + 180.0
-                notes = "هیچ فریم ویدیویی/صوتی دریافت نشد (ممکن است لایو بسته شده یا خصوصی باشد)."
-                await self.bot.send_message(
-                    rec.chat_id,
-                    (
-                        f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> تمام شد ولی دیتایی دریافت نشد.\n"
-                        f"📊 جزئیات فنی: <code>{html.escape(rec.status_text)}</code>"
-                    ),
-                    parse_mode="html",
-                )
         except Exception as e:
             final_status = "error"
-            self._fail_cooldown[rec.creator_id] = time.time() + 180.0
             notes = str(e)[:300]
+            self._fail_cooldown[rec.creator_id] = time.time() + 180.0
             log.exception("Recording failed for %s", rec.creator_id)
-            try:
-                await self.bot.send_message(
-                    rec.chat_id,
-                    f"❌ خطا در ضبط <b>{html.escape(rec.creator_name)}</b>:\n<code>{html.escape(str(e)[:300])}</code>",
-                    parse_mode="html",
-                )
-            except Exception:
-                pass
         finally:
-            self.db.finish_recording_record(
-                rec.db_rec_id,
-                status=final_status,
-                duration_sec=total_duration,
-                file_size_bytes=total_size,
-                tg_chat_id=rec.chat_id,
-                tg_message_id=last_msg_id,
-                archive_chat_id=last_arch_chat,
-                archive_message_id=last_arch_msg,
-                notes=notes,
-            )
-            if final_status == "completed":
-                self.db.update_watch_status(
-                    rec.creator_id,
-                    "offline",
-                    display_name=rec.creator_name,
-                    increment_recordings=True,
-                )
-            self.active.pop(rec.creator_id, None)
-            if self.db.get_setting("auto_delete", "1") == "1" and final_status != "error":
-                shutil.rmtree(work_dir, ignore_errors=True)
-            if status_msg:
+            rec.status_text = "در حال ارسال پارتهای باقیمانده..."
+            self._changed()
+            if upload_tasks:
+                await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+            if rec.uploaded_parts == 0 and final_status == "completed":
+                final_status = "empty"
+                self._fail_cooldown[rec.creator_id] = time.time() + 180.0
+                notes = rec.agora_diag or "no data"
                 try:
-                    await status_msg.delete()
+                    m = await self.bot.send_message(
+                        rec.chat_id,
+                        f"⚠️ از لایو <b>{html.escape(rec.creator_name)}</b> دیتایی دریافت نشد.\n"
+                        f"<code>{html.escape((rec.agora_diag or rec.status_text)[:350])}</code>",
+                        parse_mode="html",
+                    )
+                    schedule_delete(m, 120)
+                except Exception:
+                    pass
+            elif rec.uploaded_parts > 0:
+                self.db.increment_recordings(rec.creator_id)
+                try:
+                    m = await self.bot.send_message(
+                        rec.chat_id,
+                        f"✅ ضبط <b>{html.escape(rec.creator_name)}</b> تموم شد · "
+                        f"{rec.uploaded_parts} پارت · {fmt_duration(rec.uploaded_duration)} · {fmt_bytes(rec.uploaded_bytes)}",
+                        parse_mode="html",
+                    )
+                    schedule_delete(m, self.notify_ttl())
                 except Exception:
                     pass
 
-    async def _capture_ffmpeg_part(self, rec: ActiveRecording, output_mp4: Path) -> Tuple[bool, bool]:
-        """Record HLS/FLV/RTMP directly with FFmpeg (-c copy, no re-encoding)."""
-        cmd = [FFMPEG_BIN or "ffmpeg", "-y"]
-        if rec.stream_url.lower().startswith(("http://", "https://")):
-            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-        cmd += [
-            "-i", rec.stream_url,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            str(output_mp4),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=open(output_mp4.with_suffix(".ffmpeg.log"), "wb"),
-        )
-        reached_size_cap = False
-        try:
-            while proc.returncode is None:
-                if rec.stop_event.is_set():
-                    break
-                if output_mp4.exists():
-                    sz = output_mp4.stat().st_size
-                    rec.bytes_written = sz
-                    if sz >= MAX_SINGLE_FILE_BYTES:
-                        reached_size_cap = True
-                        break
-                _, free_mb, _ = get_disk_stats()
-                if free_mb < MIN_FREE_DISK_MB:
-                    log.warning("Disk low (%.0f MB free) - finalizing %s", free_mb, rec.creator_id)
-                    rec.stop_event.set()
-                    break
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    continue
-        finally:
-            if proc.returncode is None:
-                try:
-                    if proc.stdin:
-                        proc.stdin.write(b"q\n")
-                        await proc.stdin.drain()
-                    await asyncio.wait_for(proc.wait(), timeout=10.0)
-                except Exception:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except Exception:
-                        proc.kill()
-        return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
+            self.db.finish_recording_record(
+                rec.db_rec_id,
+                status=final_status,
+                duration_sec=rec.uploaded_duration,
+                file_size_bytes=rec.uploaded_bytes,
+                tg_chat_id=rec.chat_id,
+                notes=notes,
+            )
+            self.db.update_watch_status(rec.creator_id, "offline", display_name=rec.creator_name)
+            self.active.pop(rec.creator_id, None)
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self._changed()
 
-    async def _capture_agora_part(
-        self, rec: ActiveRecording, work_dir: Path, output_mp4: Path
-    ) -> Tuple[bool, bool]:
-        """Record Agora RTC stream (H.264 video + PCM audio) and mux cleanly into MP4."""
-        h264_file = work_dir / f"raw_p{rec.part_number}.h264"
-        pcm_file = work_dir / f"raw_p{rec.part_number}.pcm"
+    def notify_ttl(self) -> int:
+        raw = self.db.get_setting("notify_ttl", "60")
+        return int(raw) if raw.isdigit() else 60
+
+    def _should_split(self, rec: ActiveRecording, seg_bytes: int) -> bool:
+        if rec.split_event.is_set():
+            rec.split_event.clear()
+            return True
+        if seg_bytes >= self.part_cap_bytes():
+            return True
+        sp = self.split_seconds()
+        if sp > 0 and time.time() - rec.seg_started_at >= sp:
+            return True
+        return False
+
+    # ------------------------------------------------------------------ FFmpeg (HLS/FLV/RTMP)
+    async def _ffmpeg_session(self, rec: ActiveRecording, work_dir: Path, enqueue: Any) -> None:
+        while True:
+            part_no = rec.part_number
+            out = work_dir / f"{sanitize_filename(rec.creator_name)}_part{part_no}.mp4"
+            cmd = [FFMPEG_BIN or "ffmpeg", "-y", "-loglevel", "error"]
+            if rec.stream_url.lower().startswith(("http://", "https://")):
+                cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+            # fragmented MP4: playable even if ffmpeg is killed, no extra rewrite at the end
+            cmd += ["-i", rec.stream_url, "-c", "copy", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(out)]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            rec.seg_started_at = time.time()
+            rec.connected = True
+            rec.status_text = "در حال ضبط"
+            self._changed()
+            split = False
+            try:
+                while proc.returncode is None:
+                    if rec.stop_event.is_set():
+                        break
+                    sz = out.stat().st_size if out.exists() else 0
+                    rec.bytes_written = sz
+                    if self._should_split(rec, sz):
+                        split = True
+                        break
+                    _, free_mb, _ = get_disk_stats()
+                    if free_mb < MIN_FREE_DISK_MB:
+                        rec.stop_event.set()
+                        break
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                if proc.returncode is None:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.write(b"q\n")
+                            await proc.stdin.drain()
+                        await asyncio.wait_for(proc.wait(), timeout=10.0)
+                    except Exception:
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except Exception:
+                            proc.kill()
+            if out.exists() and out.stat().st_size > 10_000:
+                enqueue(lambda p=out, n=part_no: self._upload_job(rec, p, n))
+                rec.part_number += 1
+            if split and not rec.stop_event.is_set():
+                continue
+            return
+
+    # ------------------------------------------------------------------ Agora RTC
+    async def _agora_session(self, rec: ActiveRecording, work_dir: Path, enqueue: Any) -> None:
+        def seg_paths(n: int) -> Tuple[Path, Path]:
+            return work_dir / f"raw_p{n}.h264", work_dir / f"raw_p{n}.pcm"
+
+        h264_file, pcm_file = seg_paths(rec.part_number)
         receiver = AgoraStreamReceiver(rec.stream_url, h264_file, pcm_file)
-        reached_size_cap = False
 
         # Try candidate UIDs / tokens quickly if Agora returns fail(8) (INVALID_TOKEN / UID mismatch)
         attempts: List[Tuple[str, str]] = [(receiver.token, u) for u in receiver.uid_candidates]
@@ -2175,197 +2420,177 @@ class RecordingManager:
                     pass
                 receiver._conn = None
 
+        rec.connected = connected_ok
+        rec.status_text = "در حال ضبط" if connected_ok else "اتصال ناموفق"
+        rec.seg_started_at = time.time()
+        self._changed()
+        last_seg: Dict[str, Any] = {}
+        session_start = time.time()
+        last_enter = time.time()
+        receiver.event_times.clear()
         try:
             while not rec.stop_event.is_set():
-                await asyncio.sleep(2.0)
-                rec.bytes_written = receiver.bytes_written
-
-                # Fast-exit if Agora rejected all token/UID candidates
+                await asyncio.sleep(1.0)
+                if connected_ok and receiver.event_times:
+                    log.warning("Agora connection dropped for %s: %s", rec.creator_id, receiver.conn_events[-3:])
+                    rec.status_text = "اتصال قطع شد، اتصال مجدد..."
+                    break
+                ref = receiver.last_video_at or session_start
+                if connected_ok and time.time() - ref >= VIDEO_STALL_TIMEOUT:
+                    log.warning("Video stalled for %s (%.0fs), reconnecting", rec.creator_id, time.time() - ref)
+                    rec.status_text = "تصویر قطع شد، اتصال مجدد..."
+                    break
+                if rec.livestream_id and time.time() - last_enter >= 40:
+                    last_enter = time.time()
+                    bg_task(self.api._request_smart("livestream/enter", {"livestream_id": str(rec.livestream_id)}))
+                rec.bytes_written = receiver.seg_bytes
+                if receiver.seg_video_frames == 1:
+                    rec.seg_started_at = receiver.seg_started_at
                 if not connected_ok and any(ev.startswith("fail(") for ev in receiver.conn_events) and receiver.video_frames == 0:
                     break
-                # Auto-stop when broadcaster stops sending frames
-                idle = time.time() - receiver.last_frame_at
-                if idle >= AGORA_INACTIVITY_TIMEOUT:
-                    log.info("Agora stream %s inactive for %.0fs, finishing.", rec.creator_id, idle)
-                    break
-
-                # Roll over before hitting Telegram's 2 GB MTProto cap
-                if receiver.bytes_written >= MAX_SINGLE_FILE_BYTES:
-                    reached_size_cap = True
-                    break
-
-                # Disk safety guard
                 _, free_mb, _ = get_disk_stats()
                 if free_mb < MIN_FREE_DISK_MB:
-                    log.warning("Low disk (%.0f MB free), finalizing Agora stream %s", free_mb, rec.creator_id)
                     rec.stop_event.set()
                     break
+                if self._should_split(rec, receiver.seg_bytes) and receiver.seg_video_frames > 0:
+                    part_no = rec.part_number
+                    rec.part_number += 1
+                    nh, npcm = seg_paths(rec.part_number)
+                    old = await asyncio.to_thread(receiver.rotate, nh, npcm)
+                    rec.seg_started_at = time.time()
+                    rec.bytes_written = 0
+                    enqueue(lambda o=old, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
+                    self._changed()
         finally:
-            fps = receiver.estimated_fps()
-            sr = receiver.sample_rate
-            ch = receiver.channels
+            last_seg = receiver.segment_snapshot()
             await asyncio.to_thread(receiver.close)
 
-        rec.status_text = (
+        rec.agora_diag = (
             f"v={receiver.video_frames}, a={receiver.audio_frames}, rc={receiver.connect_rc}, "
-            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, tok={len(receiver.token)}, "
-            f"{receiver.diag_flags}, h264={h264_file.stat().st_size if h264_file.exists() else 0}B, "
-            f"pcm={pcm_file.stat().st_size if pcm_file.exists() else 0}B, cb_err={receiver.cb_error or '-'}"
+            f"ev={','.join(receiver.conn_events[:6])}, uid={receiver.uid}, cb_err={receiver.cb_error or '-'}"
         )
-        rec.agora_diag = rec.status_text
-        log.info("Agora capture ended for %s: %s", rec.creator_id, rec.status_text)
-        mux_cmd = build_mux_command(
-            FFMPEG_BIN or "ffmpeg",
-            h264_file,
-            pcm_file,
-            output_mp4,
-            fps=fps,
-            sample_rate=sr,
-            channels=ch,
-        )
-        if not mux_cmd:
-            return False, False
-        if receiver.video_frames == 0:
-            log.warning("No video frames for %s; skipping mux. %s", rec.creator_id, rec.status_text)
-            h264_file.unlink(missing_ok=True)
-            pcm_file.unlink(missing_ok=True)
-            return False, False
-
-        proc = await asyncio.create_subprocess_exec(
-            *mux_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr_bytes = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("FFmpeg mux error: %s", stderr_bytes.decode("utf-8", errors="ignore")[-400:])
-
-        # Clean up raw intermediate streams right away to save disk
-        h264_file.unlink(missing_ok=True)
-        pcm_file.unlink(missing_ok=True)
-
-        return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
-
-    async def _upload_part_to_telegram(
-        self,
-        rec: ActiveRecording,
-        mp4_path: Path,
-        duration_sec: int,
-        status_msg: Any,
-    ) -> Tuple[int, int, int]:
-        """Upload up to 2 GB MP4 via Telethon MTProto with progress, cover thumb & contact sheet."""
-        rec.status_text = "در حال آپلود به تلگرام..."
-        fsize = mp4_path.stat().st_size
-        _, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
-
-        make_sheet = self.db.get_setting("contact_sheet", "1") == "1"
-        thumb_path = mp4_path.with_suffix(".thumb.jpg")
-        sheet_path = mp4_path.with_suffix(".sheet.jpg")
-        thumb_file, sheet_file = await asyncio.to_thread(
-            generate_thumbnail_and_contact_sheet,
-            mp4_path,
-            thumb_path,
-            sheet_path,
-            duration_sec,
-            make_sheet,
-        )
-
-        # Send Contact Sheet preview first (just like @superliverec_bot)
-        if sheet_file and sheet_file.exists():
-            try:
-                await self.bot.send_file(
-                    rec.chat_id,
-                    str(sheet_file),
-                    caption=(
-                        f"🖼 <b>پیش‌نمایش ضبط (Contact Sheet)</b>\n"
-                        f"👤 {html.escape(rec.creator_name)} (<code>{rec.creator_id}</code>)\n"
-                        f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>"
-                    ),
-                    parse_mode="html",
-                )
-            except Exception as e:
-                log.warning("Contact sheet upload failed: %s", e)
-
-        # Throttled progress callback
-        last_update = [0.0]
-
-        async def progress_cb(current: int, total: int) -> None:
-            now = time.time()
-            if status_msg and (now - last_update[0] >= 5.0 or current == total):
-                last_update[0] = now
-                pct = (current / max(1, total)) * 100.0
+        log.info("Agora session ended for %s: %s", rec.creator_id, rec.agora_diag)
+        if last_seg.get("video_frames", 0) > 0:
+            part_no = rec.part_number
+            rec.part_number += 1
+            enqueue(lambda o=last_seg, n=part_no: self._mux_and_upload(rec, o, work_dir, n))
+        else:
+            for k in ("h264", "pcm"):
                 try:
-                    await status_msg.edit(
-                        f"⬆️ <b>در حال آپلود ویدیو به تلگرام...</b>\n"
-                        f"👤 {html.escape(rec.creator_name)} (پارت {rec.part_number})\n"
-                        f"📊 پیشرفت: <code>{pct:.1f}%</code> ({fmt_bytes(current)} / {fmt_bytes(total)})",
+                    Path(last_seg.get(k)).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    async def _mux_and_upload(self, rec: ActiveRecording, seg: Dict[str, Any], work_dir: Path, part_no: int) -> None:
+        h264: Path = seg["h264"]
+        pcm: Path = seg["pcm"]
+        out = work_dir / f"{sanitize_filename(rec.creator_name)}_part{part_no}.mp4"
+        fps = seg["video_frames"] / max(1.0, seg["elapsed"])
+        rec.upload_status = f"پارت {part_no}: آمادهسازی فایل..."
+        cmd = build_mux_command(FFMPEG_BIN or "ffmpeg", h264, pcm, out, fps=fps,
+                                sample_rate=seg["sample_rate"], channels=seg["channels"])
+        if cmd:
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                log.error("Mux error: %s", err.decode("utf-8", "ignore")[-400:])
+        h264.unlink(missing_ok=True)
+        pcm.unlink(missing_ok=True)
+        if out.exists() and out.stat().st_size > 10_000:
+            await self._upload_job(rec, out, part_no)
+
+    # ------------------------------------------------------------------ upload
+    async def _upload_job(self, rec: ActiveRecording, mp4_path: Path, part_no: int) -> None:
+        async with self._upload_sem:
+            dur, width, height = await asyncio.to_thread(probe_video_metadata, mp4_path)
+            fsize = mp4_path.stat().st_size
+            thumb_path = mp4_path.with_suffix(".thumb.jpg")
+            sheet_path = mp4_path.with_suffix(".sheet.jpg")
+            thumb_file, sheet_file = await asyncio.to_thread(
+                generate_thumbnail_and_contact_sheet, mp4_path, thumb_path, sheet_path, dur, True
+            )
+            if not sheet_file and thumb_file:
+                sheet_file = thumb_file  # very short clip: use the cover as preview
+
+            caption = (
+                f"🎬 <b>{html.escape(rec.creator_name)}</b>  ·  پارت {part_no}\n"
+                f"⏱ <code>{fmt_duration(dur)}</code>   💾 <code>{fmt_bytes(fsize)}</code>   📐 <code>{width}×{height}</code>\n"
+                f"📅 {local_now_str()}   🆔 <code>{rec.creator_id}</code>\n"
+                f"#u{rec.creator_id}"
+            )
+            last_update = [0.0]
+
+            async def progress_cb(current: int, total: int) -> None:
+                now = time.time()
+                if now - last_update[0] >= 3.0 or current == total:
+                    last_update[0] = now
+                    rec.upload_status = f"پارت {part_no}: آپلود {current * 100 / max(1, total):.0f}%"
+
+            sheet_msg = None
+            if sheet_file and sheet_file.exists():
+                try:
+                    sheet_msg = await self.bot.send_file(
+                        rec.chat_id, str(sheet_file),
+                        caption=f"🖼 پیشنمایش · <b>{html.escape(rec.creator_name)}</b> · پارت {part_no}",
+                        parse_mode="html",
+                    )
+                except Exception as e:
+                    log.warning("Preview upload failed: %s", e)
+
+            attrs = [DocumentAttributeVideo(duration=max(1, dur), w=width, h=height, supports_streaming=True)]
+            sent = None
+            for attempt in range(5):
+                try:
+                    sent = await self.bot.send_file(
+                        rec.chat_id, str(mp4_path), caption=caption, parse_mode="html",
+                        thumb=str(thumb_file) if thumb_file else None, attributes=attrs,
+                        supports_streaming=True, progress_callback=progress_cb,
+                        reply_to=sheet_msg.id if sheet_msg else None,
+                    )
+                    break
+                except FloodWaitError as fw:
+                    await asyncio.sleep(int(getattr(fw, "seconds", 10)) + 2)
+                except Exception as e:
+                    log.warning("Upload error %s part %d (try %d): %s", rec.creator_id, part_no, attempt + 1, e)
+                    await asyncio.sleep(5 * (attempt + 1))
+
+            thumb_path.unlink(missing_ok=True)
+            sheet_path.unlink(missing_ok=True)
+
+            if sent is None:
+                dest = FAILED_DIR / mp4_path.name
+                try:
+                    shutil.move(str(mp4_path), str(dest))
+                except Exception:
+                    dest = mp4_path
+                rec.upload_status = f"پارت {part_no}: آپلود ناموفق"
+                try:
+                    await self.bot.send_message(
+                        rec.chat_id,
+                        f"❌ آپلود پارت {part_no} از <b>{html.escape(rec.creator_name)}</b> ناموفق بود.\n"
+                        f"فایل روی سرور نگه داشته شد: <code>{html.escape(str(dest))}</code>",
                         parse_mode="html",
                     )
                 except Exception:
                     pass
+                return
 
-        date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        part_label = f" | پارت {rec.part_number}" if rec.part_number > 1 else ""
-        caption = (
-            f"🎬 <b>{html.escape(rec.creator_name)}</b>{part_label}\n"
-            f"🆔 آیدی: <code>{rec.creator_id}</code>\n"
-            f"⏱ مدت: <code>{fmt_duration(duration_sec)}</code> | 💾 حجم: <code>{fmt_bytes(fsize)}</code>\n"
-            f"📐 کیفیت: <code>{width}x{height}</code> | 📅 {date_str}"
-        )
-        if rec.agora_diag:
-            caption += f"\n🛠 <code>{html.escape(rec.agora_diag[:400])}</code>"
+            # Uploaded -> free the disk immediately
+            mp4_path.unlink(missing_ok=True)
+            rec.uploaded_parts += 1
+            rec.uploaded_duration += dur
+            rec.uploaded_bytes += fsize
+            rec.upload_status = f"پارت {part_no}: ارسال شد ✅"
+            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
+                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
 
-        attrs = [
-            DocumentAttributeVideo(
-                duration=max(1, duration_sec),
-                w=width,
-                h=height,
-                supports_streaming=True,
-            )
-        ]
-
-        sent = None
-        for attempt in range(3):
-            try:
-                sent = await self.bot.send_file(
-                    rec.chat_id,
-                    str(mp4_path),
-                    caption=caption,
-                    parse_mode="html",
-                    thumb=str(thumb_file) if thumb_file else None,
-                    attributes=attrs,
-                    supports_streaming=True,
-                    progress_callback=progress_cb,
-                )
-                break
-            except FloodWaitError as fw:
-                wait_s = int(getattr(fw, "seconds", 10)) + 2
-                log.warning("FloodWait %ss while uploading %s (attempt %d)", wait_s, rec.creator_id, attempt + 1)
-                await asyncio.sleep(wait_s)
-            except Exception as e:
-                log.warning("Upload error for %s (attempt %d): %s", rec.creator_id, attempt + 1, e)
-                await asyncio.sleep(5 * (attempt + 1))
-        if sent is None:
-            raise RuntimeError(f"آپلود ناموفق بود؛ فایل روی دیسک نگه داشته شد: {mp4_path}")
-
-        # Optional: Forward to user's private Archive Channel
-        arch_chat_raw = self.db.get_setting("archive_chat_id", "")
-        arch_chat_id = 0
-        arch_msg_id = 0
-        if arch_chat_raw:
-            try:
-                arch_chat_id = int(arch_chat_raw)
-                fwd = await self.bot.forward_messages(arch_chat_id, sent)
-                if isinstance(fwd, list) and fwd:
-                    arch_msg_id = fwd[0].id
-                elif hasattr(fwd, "id"):
-                    arch_msg_id = fwd.id
-            except Exception as e:
-                log.warning("Failed forwarding to archive channel %s: %s", arch_chat_raw, e)
-
-        thumb_path.unlink(missing_ok=True)
-        sheet_path.unlink(missing_ok=True)
-        return getattr(sent, "id", 0), arch_chat_id, arch_msg_id
+            arch_raw = self.db.get_setting("archive_chat_id", "")
+            if arch_raw:
+                try:
+                    msgs = [m for m in (sheet_msg, sent) if m]
+                    await self.bot.forward_messages(int(arch_raw), msgs)
+                except Exception as e:
+                    log.warning("Archive forward failed: %s", e)
 
 
 # ==============================================================================
@@ -2373,12 +2598,14 @@ class RecordingManager:
 # ==============================================================================
 
 class WatchlistMonitor:
-    def __init__(self, db: Database, api: SuperLiveClient, rec_mgr: RecordingManager):
+    def __init__(self, db: Database, api: SuperLiveClient, rec_mgr: RecordingManager, bot: TelegramClient):
         self.db = db
         self.api = api
         self.rec_mgr = rec_mgr
+        self.bot = bot
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        self._notified_ls: Dict[str, str] = {}  # creator_id -> livestream_id already announced
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -2389,47 +2616,71 @@ class WatchlistMonitor:
         if self._task:
             self._task.cancel()
 
+    async def _announce_live(self, owner_id: int, info: CreatorStreamInfo, started: bool) -> None:
+        key = info.livestream_id or "live"
+        if self._notified_ls.get(info.creator_id) == key:
+            return
+        self._notified_ls[info.creator_id] = key
+        if self.db.get_setting("notify_live", "1") != "1":
+            return
+        try:
+            m = await self.bot.send_message(
+                owner_id,
+                f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
+                + (" · ⏺ ضبط شروع شد" if started else ""),
+                parse_mode="html",
+                buttons=[[Button.inline("👤 صفحه استریمر", data=f"p:{info.creator_id}:0")]],
+            )
+            ttl = self.rec_mgr.notify_ttl()
+            if ttl > 0:
+                schedule_delete(m, ttl)
+        except Exception as e:
+            log.warning("Live notice failed: %s", e)
+
     async def _loop(self) -> None:
         log.info("Watchlist monitor started.")
         while not self._stop.is_set():
             try:
-                interval = int(self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL)))
+                interval = int(self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL)) or DEFAULT_POLL_INTERVAL)
                 interval = max(10, min(300, interval))
                 owner_id = self.db.get_owner_id()
-                if owner_id:
-                    items = self.db.list_watchlist()
-                    discover_map: Optional[Dict[str, Dict[str, Any]]] = None
-                    if items:
-                        try:
-                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=4)
-                        except Exception as e:
-                            log.warning("Batch discover fetch failed: %s", e)
-                    for item in items:
-                        if self._stop.is_set():
-                            break
-                        cid = item["creator_id"]
-                        if not item["auto_record"] or self.rec_mgr.is_recording(cid):
-                            continue
-                        try:
-                            info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
-                            if info.is_live:
-                                self.db.update_watch_status(
-                                    cid, "live", display_name=info.display_name, username=info.username
-                                )
-                                ok, msg = await self.rec_mgr.start_recording(
-                                    info, chat_id=owner_id, triggered_by="watchlist"
-                                )
-                                if ok:
-                                    log.info("Auto-started recording for %s", cid)
-                                else:
-                                    log.debug("Skipped auto-record for %s: %s", cid, msg)
-                            else:
-                                self.db.update_watch_status(
-                                    cid, "offline", display_name=info.display_name, username=info.username
-                                )
-                        except Exception as e:
-                            log.warning("Poll error for creator %s: %s", cid, e)
-                        await asyncio.sleep(1.2)
+                items = self.db.list_watchlist() if owner_id else []
+                discover_map: Optional[Dict[str, Dict[str, Any]]] = None
+                if items:
+                    try:
+                        discover_map, _, _ = await self.api.fetch_discover_map(max_pages=8)
+                    except Exception as e:
+                        log.warning("Batch discover fetch failed: %s", e)
+                for item in items:
+                    if self._stop.is_set():
+                        break
+                    cid = item["creator_id"]
+                    if self.rec_mgr.is_recording(cid):
+                        continue
+                    try:
+                        info = await self.api.check_creator_and_get_stream(cid, discover_map=discover_map)
+                        if info.creator_id and info.creator_id != cid and info.creator_id.isdigit():
+                            log.info("Watchlist id %s -> real user_id %s", cid, info.creator_id)
+                            self.db.migrate_watch(cid, info.creator_id)
+                            if self.rec_mgr.is_recording(info.creator_id):
+                                continue
+                            cid = info.creator_id
+                        if info.is_live:
+                            self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
+                            started = False
+                            if item["auto_record"]:
+                                ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
+                                started = ok
+                                if not ok:
+                                    log.debug("Skip auto-record %s: %s", cid, msg)
+                            await self._announce_live(owner_id, info, started)
+                        else:
+                            self._notified_ls.pop(cid, None)
+                            self.rec_mgr.manually_stopped_ls.pop(cid, None)
+                            self.db.update_watch_status(cid, "offline", display_name=info.display_name, username=info.username)
+                    except Exception as e:
+                        log.warning("Poll error for creator %s: %s", cid, e)
+                    await asyncio.sleep(0.8)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
@@ -2442,14 +2693,53 @@ class WatchlistMonitor:
 # TELEGRAM BOT UI & HANDLERS (Telethon MTProto)
 # ==============================================================================
 
+KB_WATCH = "📋 واچلیست"
+KB_ACTIVE = "⏺ در حال ضبط"
+KB_ADD = "➕ افزودن استریمر"
+KB_REC = "🎬 ضبط فوری"
+KB_ARCHIVE = "📚 آرشیو"
+KB_SETTINGS = "⚙️ تنظیمات"
+KB_HOME = "🏠 داشبورد"
+KB_ALL = {KB_WATCH, KB_ACTIVE, KB_ADD, KB_REC, KB_ARCHIVE, KB_SETTINGS, KB_HOME}
+SEP = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+
+
+def _kb_button(label: str) -> Any:
+    kwargs: Dict[str, Any] = {"resize": True}
+    try:
+        if "persistent" in inspect.signature(Button.text).parameters:
+            kwargs["persistent"] = True
+    except Exception:
+        pass
+    return Button.text(label, **kwargs)
+
+
+def main_keyboard() -> List[List[Any]]:
+    return [
+        [_kb_button(KB_WATCH), _kb_button(KB_ACTIVE)],
+        [_kb_button(KB_ADD), _kb_button(KB_REC)],
+        [_kb_button(KB_ARCHIVE), _kb_button(KB_SETTINGS)],
+        [_kb_button(KB_HOME)],
+    ]
+
+
+def short(name: str, n: int = 18) -> str:
+    name = (name or "").strip()
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
 class SuperLiveRecBot:
     def __init__(self):
         self.db = Database(DB_PATH)
         self.api = SuperLiveClient(self.db)
         self.bot = TelegramClient(str(SESSION_PATH), TG_API_ID, TG_API_HASH)
         self.rec_mgr = RecordingManager(self.bot, self.db, self.api)
-        self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr)
+        self.monitor = WatchlistMonitor(self.db, self.api, self.rec_mgr, self.bot)
         self._awaiting_input: Dict[int, str] = {}
+        self._panel: Dict[int, Any] = {}           # chat_id -> current panel message
+        self._panel_view: Dict[int, Tuple[str, tuple]] = {}  # chat_id -> (view name, args) for auto refresh
+        self._panel_until: Dict[int, float] = {}
+        self._panel_last: Dict[int, str] = {}
 
     def _is_owner(self, user_id: int) -> bool:
         owner = self.db.get_owner_id()
@@ -2458,86 +2748,351 @@ class SuperLiveRecBot:
             return True
         return user_id == owner
 
-    def _dashboard_text_and_buttons(self) -> Tuple[str, List[List[Any]]]:
+    # ------------------------------------------------------------------ rendering
+    def _status_icon(self, cid: str, last_status: str) -> str:
+        if self.rec_mgr.is_recording(cid):
+            return "⏺"
+        return "🔴" if last_status == "live" else "⚫"
+
+    def render(self, view: str, *args: Any) -> Tuple[str, List[List[Any]]]:
+        return getattr(self, f"_v_{view}")(*args)
+
+    def _v_home(self) -> Tuple[str, List[List[Any]]]:
         wl = self.db.list_watchlist()
         live_cnt = sum(1 for x in wl if x["last_status"] == "live")
-        active_cnt = len(self.rec_mgr.active)
-        total_recs = self.db.count_recordings()
+        active = list(self.rec_mgr.active.values())
+        cnt, dur, size = self.db.clip_stats()
         used_mb, free_mb, total_mb = get_disk_stats()
         ram_used, ram_total = get_ram_usage_mb()
-
-        agora_badge = "✅ آماده" if AGORA_AVAILABLE else "❌ نصب نیست"
-        ffmpeg_badge = "✅ آماده" if FFMPEG_BIN else "❌ نصب نیست"
-        ram_line = f"{ram_used:.0f} / {ram_total:.0f} MB" if ram_total > 0 else f"{ram_used:.0f} MB"
-
-        text = (
-            "🎥 <b>SuperLiveRec Personal Unlimited</b>\n"
-            "<i>الهام‌گرفته از @superliverec_bot و StreamRecorder.io — بدون محدودیت تعداد</i>\n\n"
-            f"🔴 در حال ضبط الان: <b>{active_cnt}</b> استریم\n"
-            f"👀 واچ‌لیست: <b>{len(wl)}</b> نفر (آنلاین: <b>{live_cnt}</b>)\n"
-            f"📚 آرشیو ضبط‌شده‌ها: <b>{total_recs}</b> ویدیو\n"
-            f"⬆️ سقف آپلود هر فایل: <b>تا 2 گیگابایت</b> (MTProto)\n\n"
-            f"🖥 <b>وضعیت سرور:</b>\n"
-            f"• رم: <code>{ram_line}</code> | دیسک خالی: <code>{free_mb/1024:.2f} / {total_mb/1024:.1f} GB</code>\n"
-            f"• موتور Agora: {agora_badge} | FFmpeg: {ffmpeg_badge}\n\n"
-            "💡 برای شروع کافیه آیدی عددی یا لینک پروفایل SuperLive رو همینجا بفرستی یا از دکمه‌ها استفاده کنی:"
-        )
+        ram = f"{ram_used/1024:.1f}/{ram_total/1024:.1f} GB" if ram_total else f"{ram_used:.0f} MB"
+        lines = [
+            "🎥 <b>SuperLive Recorder</b>",
+            SEP,
+            f"⏺ در حال ضبط: <b>{len(active)}</b>",
+            f"👀 واچلیست: <b>{len(wl)}</b>   ·   🔴 آنلاین: <b>{live_cnt}</b>",
+            f"📚 آرشیو: <b>{cnt}</b> ویدیو   ·   <b>{fmt_duration(dur)}</b>   ·   <b>{fmt_bytes(size)}</b>",
+            SEP,
+            f"💽 دیسک آزاد: <code>{free_mb/1024:.1f}/{total_mb/1024:.1f} GB</code>   🧠 رم: <code>{ram}</code>",
+            f"⚙️ Agora {'✅' if AGORA_AVAILABLE else '❌'}   ·   FFmpeg {'✅' if FFMPEG_BIN else '❌'}",
+        ]
+        if active:
+            lines.append(SEP)
+            for r in active[:6]:
+                lines.append(f"⏺ <b>{html.escape(short(r.creator_name, 22))}</b> · <code>{fmt_duration(time.time() - r.started_at)}</code>")
+        lines.append("\n<i>آیدی، لینک پروفایل یا لینک لایو رو هر وقت خواستی همینجا بفرست.</i>")
         buttons = [
-            [
-                Button.inline("➕ افزودن به واچ‌لیست", data="act:add_watch"),
-                Button.inline("🎬 ضبط فوری (Rec)", data="act:manual_rec"),
-            ],
-            [
-                Button.inline(f"📋 واچ‌لیست ({len(wl)})", data="page:watchlist:0"),
-                Button.inline(f"🔴 در حال ضبط ({active_cnt})", data="page:active"),
-            ],
-            [
-                Button.inline("📚 آرشیو ویدیوها", data="page:archive:0"),
-                Button.inline("⚙️ تنظیمات", data="page:settings"),
-            ],
-            [Button.inline("🔄 بروزرسانی داشبورد", data="page:home")],
+            [Button.inline(f"📋 واچلیست ({len(wl)})", data="w:0"), Button.inline(f"⏺ ضبطها ({len(active)})", data="a")],
+            [Button.inline("📚 آرشیو", data="ar:0"), Button.inline("⚙️ تنظیمات", data="s")],
+            [Button.inline("🔄 بروزرسانی", data="h")],
+        ]
+        return "\n".join(lines), buttons
+
+    def _v_watchlist(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
+        items = self.db.list_watchlist()
+        # recording first, then live, then offline
+        items.sort(key=lambda x: (0 if self.rec_mgr.is_recording(x["creator_id"]) else (1 if x["last_status"] == "live" else 2)))
+        per = 8
+        pages = max(1, (len(items) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        chunk = items[page * per:(page + 1) * per]
+        rec_n = sum(1 for x in items if self.rec_mgr.is_recording(x["creator_id"]))
+        live_n = sum(1 for x in items if x["last_status"] == "live")
+        lines = [
+            f"📋 <b>واچلیست</b>  ·  {len(items)} نفر",
+            f"⏺ {rec_n} در حال ضبط   🔴 {live_n} آنلاین   ⚫ {len(items) - live_n} آفلاین",
+            SEP,
+        ]
+        if not chunk:
+            lines.append("هنوز کسی اضافه نشده. از دکمه «➕ افزودن استریمر» استفاده کن.")
+        else:
+            lines.append("<i>روی هر نفر بزن تا جزئیات و ضبطهاش رو ببینی.</i>")
+        buttons: List[List[Any]] = []
+        for it in chunk:
+            cid = it["creator_id"]
+            icon = self._status_icon(cid, it["last_status"])
+            extra = ""
+            r = self.rec_mgr.active.get(cid)
+            if r:
+                extra = f" · {fmt_duration(time.time() - r.started_at)}"
+            auto = "" if it["auto_record"] else " ⏸"
+            buttons.append([Button.inline(f"{icon} {short(it['display_name'] or cid)}{extra}{auto}", data=f"p:{cid}:0")])
+        nav: List[Any] = []
+        if page > 0:
+            nav.append(Button.inline("‹ قبلی", data=f"w:{page-1}"))
+        if pages > 1:
+            nav.append(Button.inline(f"{page+1}/{pages}", data=f"w:{page}"))
+        if page < pages - 1:
+            nav.append(Button.inline("بعدی ›", data=f"w:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("➕ افزودن", data="add"), Button.inline("🔄", data=f"w:{page}"), Button.inline("🏠", data="h")])
+        return "\n".join(lines), buttons
+
+    def _v_person(self, cid: str, page: int = 0) -> Tuple[str, List[List[Any]]]:
+        w = self.db.get_watch(cid) or {}
+        r = self.rec_mgr.active.get(cid)
+        name = w.get("display_name") or (r.creator_name if r else "") or cid
+        cnt, dur, size = self.db.clip_stats(cid)
+        if r:
+            st = "⏺ در حال ضبط"
+        elif w.get("last_status") == "live":
+            st = "🔴 آنلاین"
+        else:
+            st = "⚫ آفلاین"
+        lines = [
+            f"👤 <b>{html.escape(name)}</b>",
+            f"🆔 <code>{cid}</code>" + (f"   @{html.escape(w['username'])}" if w.get("username") else ""),
+            SEP,
+            f"📡 وضعیت: {st}",
+        ]
+        if w:
+            lines.append(f"🤖 ضبط خودکار: {'✅ روشن' if w.get('auto_record') else '⏸ خاموش'}")
+            if w.get("last_seen_live"):
+                lines.append(f"🕘 آخرین لایو: <code>{iso_to_local(w['last_seen_live'])}</code>")
+        else:
+            lines.append("<i>این استریمر توی واچلیست نیست.</i>")
+        if r:
+            lines += [
+                SEP,
+                f"⏱ کل ضبط: <code>{fmt_duration(time.time() - r.started_at)}</code>   ·   پارت فعلی: <code>{fmt_duration(time.time() - r.seg_started_at)}</code>",
+                f"💾 پارت فعلی: <code>{fmt_bytes(r.bytes_written)}</code>   ·   ارسالشده: <b>{r.uploaded_parts}</b> پارت",
+            ]
+            if r.upload_status:
+                lines.append(f"📤 {html.escape(r.upload_status)}")
+        lines += [SEP, f"📚 ضبطها: <b>{cnt}</b> ویدیو · <b>{fmt_duration(dur)}</b> · <b>{fmt_bytes(size)}</b>"]
+
+        per = 6
+        clips = self.db.list_clips(cid, limit=per, offset=page * per)
+        buttons: List[List[Any]] = []
+        if r:
+            buttons.append([Button.inline("📤 ارسال تا اینجا", data=f"sp:{cid}"), Button.inline("⏹ توقف ضبط", data=f"st:{cid}")])
+        else:
+            buttons.append([Button.inline("🎬 ضبط فوری", data=f"qr:{cid}")])
+        if w:
+            buttons.append([
+                Button.inline("⏸ خاموش کردن خودکار" if w.get("auto_record") else "▶️ روشن کردن خودکار", data=f"tg:{cid}"),
+                Button.inline("🗑 حذف", data=f"rmq:{cid}"),
+            ])
+        else:
+            buttons.append([Button.inline("➕ افزودن به واچلیست", data=f"qw:{cid}")])
+        for c in clips:
+            buttons.append([Button.inline(
+                f"▶️ {iso_to_local(c['created_at'])} · پ{c['part_no']} · {fmt_duration(c['duration_sec'])} · {fmt_bytes(c['size_bytes'])}",
+                data=f"c:{c['id']}",
+            )])
+        nav: List[Any] = []
+        if page > 0:
+            nav.append(Button.inline("‹ جدیدترها", data=f"p:{cid}:{page-1}"))
+        if (page + 1) * per < cnt:
+            nav.append(Button.inline("قدیمیترها ›", data=f"p:{cid}:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("‹ واچلیست", data="w:0"), Button.inline("🔄", data=f"p:{cid}:{page}"), Button.inline("🏠", data="h")])
+        return "\n".join(lines), buttons
+
+    def _v_active(self) -> Tuple[str, List[List[Any]]]:
+        actives = list(self.rec_mgr.active.values())
+        lines = [f"⏺ <b>ضبطهای فعال</b>  ·  {len(actives)}", SEP]
+        buttons: List[List[Any]] = []
+        if not actives:
+            lines.append("الان چیزی در حال ضبط نیست.")
+        for r in actives:
+            conn = "🟢" if r.connected else "🟡"
+            lines.append(
+                f"{conn} <b>{html.escape(short(r.creator_name, 24))}</b>\n"
+                f"   ⏱ <code>{fmt_duration(time.time() - r.started_at)}</code> کل  ·  "
+                f"<code>{fmt_duration(time.time() - r.seg_started_at)}</code> پارت {r.part_number}  ·  💾 <code>{fmt_bytes(r.bytes_written)}</code>\n"
+                f"   📤 {r.uploaded_parts} پارت ارسال شده" + (f"  ·  {html.escape(r.upload_status)}" if r.upload_status else "")
+            )
+            buttons.append([
+                Button.inline(f"👤 {short(r.creator_name, 12)}", data=f"p:{r.creator_id}:0"),
+                Button.inline("📤 ارسال", data=f"sp:{r.creator_id}"),
+                Button.inline("⏹ توقف", data=f"st:{r.creator_id}"),
+            ])
+        if actives:
+            lines.append(f"\n<i>«📤 ارسال» = هرچی تا الان ضبط شده فرستاده میشه و ضبط بدون وقفه ادامه پیدا میکنه.</i>")
+            buttons.append([Button.inline("⏹ توقف همه", data="stallq")])
+        buttons.append([Button.inline("🔄 بروزرسانی", data="a"), Button.inline("🏠", data="h")])
+        return "\n".join(lines), buttons
+
+    def _v_archive(self, page: int = 0) -> Tuple[str, List[List[Any]]]:
+        per = 8
+        rows = self.db.clip_creators(limit=per + 1, offset=page * per)
+        more = len(rows) > per
+        rows = rows[:per]
+        cnt, dur, size = self.db.clip_stats()
+        lines = [f"📚 <b>آرشیو</b>  ·  {cnt} ویدیو · {fmt_duration(dur)} · {fmt_bytes(size)}", SEP]
+        if not rows:
+            lines.append("هنوز ویدیویی ضبط نشده.")
+        else:
+            lines.append("<i>روی هر استریمر بزن تا ویدیوهاش رو مرتب ببینی.</i>")
+        buttons: List[List[Any]] = []
+        for r in rows:
+            buttons.append([Button.inline(
+                f"👤 {short(r['creator_name'] or r['creator_id'])} · {r['cnt']} ویدیو · {fmt_duration(r['dur'] or 0)}",
+                data=f"p:{r['creator_id']}:0",
+            )])
+        nav: List[Any] = []
+        if page > 0:
+            nav.append(Button.inline("‹ قبلی", data=f"ar:{page-1}"))
+        if more:
+            nav.append(Button.inline("بعدی ›", data=f"ar:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("🏠", data="h")])
+        return "\n".join(lines), buttons
+
+    def _v_settings(self) -> Tuple[str, List[List[Any]]]:
+        g = self.db.get_setting
+        notify = g("notify_live", "1") == "1"
+        ttl = g("notify_ttl", "60")
+        split = g("split_minutes", "0")
+        part = g("part_mb", "1900")
+        poll = g("poll_interval", str(DEFAULT_POLL_INTERVAL))
+        arch = g("archive_chat_id", "") or "خاموش"
+        ttl_txt = "هیچوقت" if ttl == "0" else f"{ttl} ثانیه"
+        split_txt = "خاموش" if split == "0" else f"هر {split} دقیقه"
+        text = "\n".join([
+            "⚙️ <b>تنظیمات</b>",
+            SEP,
+            f"🔔 اعلان لایو شدن: <b>{'روشن' if notify else 'خاموش'}</b>",
+            f"🧹 حذف خودکار اعلانها بعد از: <b>{ttl_txt}</b>",
+            f"✂️ ارسال خودکار تکهتکه: <b>{split_txt}</b>",
+            f"📦 حداکثر حجم هر پارت: <b>{part} MB</b>",
+            f"⏱ بازه چک واچلیست: <b>{poll} ثانیه</b>",
+            f"🗄 کانال آرشیو: <code>{html.escape(arch)}</code>",
+            SEP,
+            "• واچلیست و ضبط همزمان: <b>نامحدود</b>",
+            "• پیشنمایش برای همه ویدیوها: <b>همیشه</b>",
+            "• حذف فایل از سرور بعد از ارسال: <b>همیشه</b>",
+            "\n<i>کانال آرشیو:</i> <code>/setarchive -100…</code>  ·  <code>/setarchive off</code>",
+        ])
+        buttons = [
+            [Button.inline(f"🔔 اعلان: {'ON' if notify else 'OFF'}", data="set:notify"), Button.inline(f"🧹 حذف: {ttl_txt}", data="set:ttl")],
+            [Button.inline(f"✂️ تکهتکه: {split_txt}", data="set:split"), Button.inline(f"📦 {part}MB", data="set:part")],
+            [Button.inline(f"⏱ چک: {poll}s", data="set:poll")],
+            [Button.inline("🏠", data="h")],
         ]
         return text, buttons
 
+    # ------------------------------------------------------------------ panel handling
+    async def show(self, event: Any, view: str, *args: Any, edit: bool = False, live: bool = True) -> None:
+        """Show a view in a single 'panel' message per chat (old panels are removed to keep the chat clean)."""
+        text, buttons = self.render(view, *args)
+        chat_id = event.chat_id
+        if edit:
+            try:
+                await event.edit(text, parse_mode="html", buttons=buttons)
+                msg = await event.get_message()
+                self._panel[chat_id] = msg
+            except MessageNotModifiedError:
+                pass
+        else:
+            old = self._panel.get(chat_id)
+            msg = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons)
+            self._panel[chat_id] = msg
+            if old is not None:
+                try:
+                    await old.delete()
+                except Exception:
+                    pass
+        self._panel_view[chat_id] = (view, args)
+        self._panel_last[chat_id] = text
+        self._panel_until[chat_id] = time.time() + (900 if live else 0)
+
+    async def _panel_refresher(self) -> None:
+        """Auto-refresh the open panel (live timers / statuses) every 10 s for 15 minutes."""
+        while True:
+            await asyncio.sleep(10)
+            for chat_id, msg in list(self._panel.items()):
+                try:
+                    if time.time() > self._panel_until.get(chat_id, 0):
+                        continue
+                    view, args = self._panel_view.get(chat_id, ("home", ()))
+                    if view not in ("home", "watchlist", "person", "active"):
+                        continue
+                    text, buttons = self.render(view, *args)
+                    if text == self._panel_last.get(chat_id):
+                        continue
+                    await msg.edit(text, parse_mode="html", buttons=buttons)
+                    self._panel_last[chat_id] = text
+                except MessageNotModifiedError:
+                    pass
+                except FloodWaitError as fw:
+                    await asyncio.sleep(int(getattr(fw, "seconds", 10)))
+                except Exception:
+                    self._panel_until[chat_id] = 0
+
+    async def toast(self, event: Any, text: str, ttl: int = 8, **kw: Any) -> Any:
+        m = await self.bot.send_message(event.chat_id, text, parse_mode="html", **kw)
+        schedule_delete(m, ttl)
+        return m
+
+    async def _delete_user_msg(self, event: Any) -> None:
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ handlers
     def _register_handlers(self) -> None:
         @self.bot.on(events.NewMessage(pattern=r"^/(start|menu)(@\w+)?(\s.*)?$"))
         async def cmd_start(event: Any) -> None:
             if not self._is_owner(event.sender_id):
-                await event.reply("⛔ این ربات شخصی هست و فقط برای مالک سرور فعاله.")
+                await event.reply("⛔ این ربات شخصیه.")
                 return
             self._awaiting_input.pop(event.sender_id, None)
-            text, buttons = self._dashboard_text_and_buttons()
-            await event.reply(text, parse_mode="html", buttons=buttons)
+            await self._delete_user_msg(event)
+            # (re)attach the persistent bottom keyboard
+            kb = await self.bot.send_message(event.chat_id, "⌨️ منوی پایین فعال شد.", buttons=main_keyboard())
+            schedule_delete(kb, 3)
+            await self.show(event, "home")
+
+        @self.bot.on(events.NewMessage(func=lambda e: e.is_private and (e.raw_text or "") in KB_ALL))
+        async def on_keyboard(event: Any) -> None:
+            if not self._is_owner(event.sender_id):
+                return
+            t = event.raw_text
+            self._awaiting_input.pop(event.sender_id, None)
+            await self._delete_user_msg(event)
+            if t == KB_WATCH:
+                await self.show(event, "watchlist", 0)
+            elif t == KB_ACTIVE:
+                await self.show(event, "active")
+            elif t == KB_ARCHIVE:
+                await self.show(event, "archive", 0)
+            elif t == KB_SETTINGS:
+                await self.show(event, "settings")
+            elif t == KB_HOME:
+                await self.show(event, "home")
+            elif t == KB_ADD:
+                self._awaiting_input[event.sender_id] = "watch"
+                await self.toast(event, "➕ آیدی، لینک پروفایل یا لینک لایو استریمر رو بفرست:", ttl=60)
+            elif t == KB_REC:
+                self._awaiting_input[event.sender_id] = "rec"
+                await self.toast(event, "🎬 آیدی، لینک پروفایل یا لینک لایو رو بفرست تا فوری ضبط بشه:", ttl=60)
 
         @self.bot.on(events.NewMessage(pattern=r"^/watch(?:\s+(.+))?$"))
         async def cmd_watch(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 return
             arg = (event.pattern_match.group(1) or "").strip()
+            await self._delete_user_msg(event)
             if not arg:
                 self._awaiting_input[event.sender_id] = "watch"
-                await event.reply("➕ آیدی عددی، یوزرنیم یا لینک پروفایل SuperLive رو بفرست تا به واچ‌لیست اضافه بشه:")
+                await self.toast(event, "➕ آیدی یا لینک رو بفرست:", ttl=60)
                 return
             await self._handle_add_watch(event, arg)
-
-        @self.bot.on(events.NewMessage(pattern=r"^/unwatch\s+(.+)$"))
-        async def cmd_unwatch(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
-                return
-            cid = extract_creator_identifier(event.pattern_match.group(1))
-            if self.db.remove_watch(cid):
-                await event.reply(f"🗑 استریمر <code>{html.escape(cid)}</code> از واچ‌لیست حذف شد.", parse_mode="html")
-            else:
-                await event.reply("این آیدی توی واچ‌لیست پیدا نشد.")
 
         @self.bot.on(events.NewMessage(pattern=r"^/rec(?:\s+(.+))?$"))
         async def cmd_rec(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 return
             arg = (event.pattern_match.group(1) or "").strip()
+            await self._delete_user_msg(event)
             if not arg:
                 self._awaiting_input[event.sender_id] = "rec"
-                await event.reply("🎬 آیدی یا لینک استریمر SuperLive رو بفرست تا فوری ضبطش شروع بشه:")
+                await self.toast(event, "🎬 آیدی یا لینک رو بفرست:", ttl=60)
                 return
             await self._handle_manual_rec(event, arg)
 
@@ -2546,36 +3101,13 @@ class SuperLiveRecBot:
             if not self._is_owner(event.sender_id):
                 return
             arg = (event.pattern_match.group(1) or "").strip().lower()
+            await self._delete_user_msg(event)
             if arg == "all":
-                cnt = await self.rec_mgr.stop_all()
-                await event.reply(f"⏹ دستور توقف برای {cnt} ضبط فعال ارسال شد (فایل‌ها پس از آماده‌سازی ارسال می‌شن).")
-                return
-            if not arg:
-                await self._send_active_view(event)
-                return
-            cid = extract_creator_identifier(arg)
-            if await self.rec_mgr.stop_recording(cid):
-                await event.reply(f"⏹ ضبط <code>{html.escape(cid)}</code> در حال توقف و ارسال ویدیوست...", parse_mode="html")
-            else:
-                await event.reply("این استریمر الان در حال ضبط نیست.")
-
-        @self.bot.on(events.NewMessage(pattern=r"^/watchlist$"))
-        async def cmd_watchlist(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
-                return
-            await self._send_watchlist_view(event, page=0)
-
-        @self.bot.on(events.NewMessage(pattern=r"^/active$"))
-        async def cmd_active(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
-                return
-            await self._send_active_view(event)
-
-        @self.bot.on(events.NewMessage(pattern=r"^/(archive|history)$"))
-        async def cmd_archive(event: Any) -> None:
-            if not self._is_owner(event.sender_id):
-                return
-            await self._send_archive_view(event, page=0)
+                for r in list(self.rec_mgr.active.values()):
+                    await self.rec_mgr.stop_recording(r.creator_id)
+            elif arg:
+                await self.rec_mgr.stop_recording(extract_creator_identifier(arg))
+            await self.show(event, "active")
 
         @self.bot.on(events.NewMessage(pattern=r"^/check\s+(.+)$"))
         async def cmd_check(event: Any) -> None:
@@ -2583,6 +3115,7 @@ class SuperLiveRecBot:
                 return
             raw = event.pattern_match.group(1).strip()
             msg = await event.reply("🔍 در حال بررسی وضعیت استریمر...")
+            await self._delete_user_msg(event)
             cid, uname, dname, _ = await self.api.resolve_creator(raw)
             if not cid:
                 await msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
@@ -2600,8 +3133,8 @@ class SuperLiveRecBot:
                 parse_mode="html",
                 buttons=[
                     [
-                        Button.inline("➕ افزودن به واچ‌لیست", data=f"qwatch:{info.creator_id}"),
-                        Button.inline("🎬 ضبط فوری", data=f"qrec:{info.creator_id}"),
+                        Button.inline("➕ افزودن به واچ‌لیست", data=f"qw:{info.creator_id}"),
+                        Button.inline("🎬 ضبط فوری", data=f"qr:{info.creator_id}"),
                     ]
                 ],
             )
@@ -2684,295 +3217,198 @@ class SuperLiveRecBot:
                 self.db.set_setting("archive_chat_id", val)
                 await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
 
-        @self.bot.on(events.NewMessage(pattern=r"^/settings$"))
-        async def cmd_settings(event: Any) -> None:
+        @self.bot.on(events.NewMessage(pattern=r"^/(settings|watchlist|active|archive|history)$"))
+        async def cmd_views(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 return
-            await self._send_settings_view(event)
+            name = event.pattern_match.group(1)
+            await self._delete_user_msg(event)
+            view = {"history": "archive"}.get(name, name)
+            await self.show(event, view, *((0,) if view in ("watchlist", "archive") else ()))
 
-        @self.bot.on(events.NewMessage(func=lambda e: e.is_private and e.text and not e.text.startswith("/")))
+        @self.bot.on(events.NewMessage(func=lambda e: e.is_private and e.raw_text and not e.raw_text.startswith("/") and e.raw_text not in KB_ALL))
         async def on_plain_text(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 return
             mode = self._awaiting_input.pop(event.sender_id, None)
-            raw = event.text.strip()
+            raw = event.raw_text.strip()
             if mode == "rec":
+                await self._delete_user_msg(event)
                 await self._handle_manual_rec(event, raw)
             elif mode == "watch":
+                await self._delete_user_msg(event)
                 await self._handle_add_watch(event, raw)
-            else:
-                # Smart direct-paste: if user pastes a SuperLive link or numeric ID directly
-                if "superlive" in raw.lower() or "spl-live" in raw.lower() or re.fullmatch(r"\d{5,15}", raw):
-                    cid = extract_creator_identifier(raw)
-                    await event.reply(
-                        f"آیدی <code>{html.escape(cid)}</code> تشخیص داده شد. چیکار کنم؟",
-                        parse_mode="html",
-                        buttons=[
-                            [
-                                Button.inline("➕ اضافه به واچ‌لیست", data=f"qwatch:{cid}"),
-                                Button.inline("🎬 ضبط فوری", data=f"qrec:{cid}"),
-                            ]
-                        ],
-                    )
+            elif "superlive" in raw.lower() or "spl-live" in raw.lower() or "sprlv" in raw.lower() or re.fullmatch(r"\d{5,15}", raw):
+                await self._delete_user_msg(event)
+                m = await self.toast(event, "🔍 در حال شناسایی...", ttl=30)
+                cid, _, dname, _ = await self.api.resolve_creator(raw)
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+                if not cid:
+                    await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
+                    return
+                await self.show(event, "person", cid, 0)
 
         @self.bot.on(events.CallbackQuery())
         async def on_callback(event: Any) -> None:
             if not self._is_owner(event.sender_id):
-                await event.answer("⛔ دسترسی ندارید", alert=True)
+                await event.answer("⛔", alert=True)
                 return
             data = event.data.decode("utf-8", errors="ignore")
             try:
-                if data == "page:home":
-                    text, buttons = self._dashboard_text_and_buttons()
-                    await event.edit(text, parse_mode="html", buttons=buttons)
-                elif data == "act:add_watch":
+                parts = data.split(":")
+                head = parts[0]
+                if head == "h":
+                    await self.show(event, "home", edit=True)
+                elif head == "w":
+                    await self.show(event, "watchlist", int(parts[1]), edit=True)
+                elif head == "a":
+                    await self.show(event, "active", edit=True)
+                elif head == "ar":
+                    await self.show(event, "archive", int(parts[1]), edit=True)
+                elif head == "s":
+                    await self.show(event, "settings", edit=True)
+                elif head == "p":
+                    await self.show(event, "person", parts[1], int(parts[2]) if len(parts) > 2 else 0, edit=True)
+                elif head == "add":
                     self._awaiting_input[event.sender_id] = "watch"
                     await event.answer()
-                    await event.respond("➕ آیدی عددی، یوزرنیم یا لینک پروفایل SuperLive رو بفرست:")
-                elif data == "act:manual_rec":
-                    self._awaiting_input[event.sender_id] = "rec"
-                    await event.answer()
-                    await event.respond("🎬 آیدی یا لینک استریمر رو برای ضبط فوری بفرست:")
-                elif data.startswith("page:watchlist:"):
-                    page = int(data.split(":")[2])
-                    await self._send_watchlist_view(event, page=page, edit=True)
-                elif data == "page:active":
-                    await self._send_active_view(event, edit=True)
-                elif data.startswith("page:archive:"):
-                    page = int(data.split(":")[2])
-                    await self._send_archive_view(event, page=page, edit=True)
-                elif data == "page:settings":
-                    await self._send_settings_view(event, edit=True)
-                elif data.startswith("qwatch:"):
-                    cid = data.split(":", 1)[1]
+                    await self.toast(event, "➕ آیدی، لینک پروفایل یا لینک لایو رو بفرست:", ttl=60)
+                    return
+                elif head == "qw":
                     await event.answer("در حال افزودن...")
-                    await self._handle_add_watch(event, cid)
-                elif data.startswith("qrec:"):
-                    cid = data.split(":", 1)[1]
+                    await self._handle_add_watch(event, parts[1], panel_edit=True)
+                elif head == "qr":
                     await event.answer("در حال بررسی لایو...")
-                    await self._handle_manual_rec(event, cid)
-                elif data.startswith("toggle:"):
-                    cid = data.split(":", 1)[1]
-                    val = self.db.toggle_auto_record(cid)
-                    await event.answer("ضبط خودکار روشن شد ✅" if val else "ضبط خودکار خاموش شد ⏸")
-                    await self._send_watchlist_view(event, page=0, edit=True)
-                elif data.startswith("rmwatch:"):
-                    cid = data.split(":", 1)[1]
-                    self.db.remove_watch(cid)
-                    await event.answer("از واچ‌لیست حذف شد 🗑")
-                    await self._send_watchlist_view(event, page=0, edit=True)
-                elif data.startswith("stop:"):
-                    cid = data.split(":", 1)[1]
-                    ok = await self.rec_mgr.stop_recording(cid)
-                    await event.answer("در حال توقف و ارسال ویدیو..." if ok else "ضبط فعالی پیدا نشد")
-                    await self._send_active_view(event, edit=True)
-                elif data.startswith("set:"):
-                    await self._handle_setting_toggle(event, data.split(":", 1)[1])
+                    await self._handle_manual_rec(event, parts[1], panel_edit=True)
+                elif head == "tg":
+                    val = self.db.toggle_auto_record(parts[1])
+                    await event.answer("ضبط خودکار روشن ✅" if val else "ضبط خودکار خاموش ⏸")
+                    await self.show(event, "person", parts[1], 0, edit=True)
+                    return
+                elif head == "rmq":
+                    await event.edit(
+                        "🗑 این استریمر از واچلیست حذف بشه؟\n<i>ویدیوهای ضبطشده حذف نمیشن.</i>",
+                        parse_mode="html",
+                        buttons=[[Button.inline("✅ بله، حذف کن", data=f"rm:{parts[1]}"), Button.inline("‹ انصراف", data=f"p:{parts[1]}:0")]],
+                    )
+                elif head == "rm":
+                    self.db.remove_watch(parts[1])
+                    await event.answer("حذف شد 🗑")
+                    await self.show(event, "watchlist", 0, edit=True)
+                    return
+                elif head == "sp":
+                    ok = await self.rec_mgr.split_recording(parts[1])
+                    await event.answer("📤 تا اینجا ارسال میشه؛ ضبط ادامه داره" if ok else "ضبط فعالی نیست", alert=False)
+                    return
+                elif head == "st":
+                    ok = await self.rec_mgr.stop_recording(parts[1])
+                    await event.answer("⏹ ضبط متوقف شد؛ فایل در حال ارسال" if ok else "ضبط فعالی نیست")
+                    await asyncio.sleep(0.5)
+                    await self.show(event, self._panel_view.get(event.chat_id, ("active", ()))[0] if self._panel_view.get(event.chat_id, ("",))[0] in ("person", "active") else "active",
+                                    *self._panel_view.get(event.chat_id, ("active", ()))[1] if self._panel_view.get(event.chat_id, ("",))[0] in ("person", "active") else (), edit=True)
+                    return
+                elif head == "stallq":
+                    await event.edit("⏹ همه ضبطها متوقف بشن؟", buttons=[[Button.inline("✅ بله", data="stall"), Button.inline("‹ انصراف", data="a")]])
+                elif head == "stall":
+                    for r in list(self.rec_mgr.active.values()):
+                        await self.rec_mgr.stop_recording(r.creator_id)
+                    await event.answer("همه متوقف شدن")
+                    await self.show(event, "active", edit=True)
+                    return
+                elif head == "c":
+                    clip = self.db.get_clip(int(parts[1]))
+                    if not clip:
+                        await event.answer("پیدا نشد", alert=True)
+                        return
+                    try:
+                        ids = [i for i in (clip["sheet_msg_id"], clip["msg_id"]) if i]
+                        await self.bot.forward_messages(event.chat_id, ids, clip["chat_id"])
+                        await event.answer("👇 ارسال شد")
+                    except Exception:
+                        await event.answer("این ویدیو دیگه در دسترس نیست (شاید پاک شده)", alert=True)
+                    return
+                elif head == "set":
+                    await self._handle_setting_toggle(event, parts[1])
+                    return
+                else:
+                    await event.answer()
+                    return
+                await event.answer()
             except MessageNotModifiedError:
                 await event.answer()
             except Exception as e:
                 log.warning("Callback error (%s): %s", data, e)
-                await event.answer("خطا در اجرای دستور", alert=False)
+                try:
+                    await event.answer("خطا", alert=False)
+                except Exception:
+                    pass
 
-    async def _handle_add_watch(self, event: Any, raw: str) -> None:
-        wait_msg = await event.respond("⏳ در حال شناسایی استریمر در SuperLive...")
+    # ------------------------------------------------------------------ actions
+    async def _handle_add_watch(self, event: Any, raw: str, panel_edit: bool = False) -> None:
+        wait = await self.toast(event, "⏳ در حال شناسایی استریمر...", ttl=30)
         cid, uname, dname, avatar = await self.api.resolve_creator(raw)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
         if not cid:
-            await wait_msg.edit("❌ نتونستم آیدی معتبری از این متن استخراج کنم.")
+            await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
         added = self.db.add_watch(cid, uname, dname, avatar)
         info = await self.api.check_creator_and_get_stream(cid)
+        if info.display_name:
+            self.db.update_watch_status(cid, "live" if info.is_live else "offline", display_name=info.display_name, username=info.username)
         if info.is_live:
-            self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
-            ok, rec_msg = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="watchlist")
-            await wait_msg.edit(
-                f"{'✅ به واچ‌لیست اضافه شد' if added else '♻️ در واچ‌لیست بروزرسانی شد'}: "
-                f"<b>{html.escape(info.display_name or dname or cid)}</b> (<code>{cid}</code>)\n"
-                f"{rec_msg}",
-                parse_mode="html",
-            )
-        else:
-            await wait_msg.edit(
-                f"{'✅ به واچ‌لیست اضافه شد' if added else '♻️ در واچ‌لیست بود (بروزرسانی شد)'}:\n"
-                f"👤 <b>{html.escape(info.display_name or dname or cid)}</b> (<code>{cid}</code>)\n"
-                f"⚫ وضعیت فعلی: آفلاین — به محض آنلاین شدن خودکار ضبط می‌شه.",
-                parse_mode="html",
-                buttons=[[Button.inline("📋 مشاهده واچ‌لیست", data="page:watchlist:0")]],
-            )
+            ok, _ = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="watchlist")
+            self.monitor._notified_ls[info.creator_id] = info.livestream_id or "live"
+        await self.toast(event, ("✅ به واچلیست اضافه شد" if added else "♻️ از قبل توی واچلیست بود") +
+                         (" · ⏺ لایوه، ضبط شروع شد" if info.is_live else ""), ttl=6)
+        await self.show(event, "person", info.creator_id or cid, 0, edit=panel_edit)
 
-    async def _handle_manual_rec(self, event: Any, raw: str) -> None:
-        wait_msg = await event.respond("🔍 در حال بررسی آنلاین بودن استریمر...")
+    async def _handle_manual_rec(self, event: Any, raw: str, panel_edit: bool = False) -> None:
+        wait = await self.toast(event, "🔍 در حال بررسی لایو...", ttl=30)
         cid, _, dname, _ = await self.api.resolve_creator(raw)
         if not cid:
-            await wait_msg.edit("❌ صاحب این لایو/آیدی پیدا نشد (شاید لایو تموم شده).")
+            try:
+                await wait.delete()
+            except Exception:
+                pass
+            await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
             return
         info = await self.api.check_creator_and_get_stream(cid)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
         if not info.is_live:
-            await wait_msg.edit(
-                f"⚫ استریمر <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.\n"
-                f"می‌خوای به واچ‌لیست اضافه کنم تا هر وقت آنلاین شد خودکار ضبط بشه؟",
-                parse_mode="html",
-                buttons=[[Button.inline("➕ اضافه به واچ‌لیست", data=f"qwatch:{info.creator_id}")]],
-            )
-            return
-        ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
-        await wait_msg.edit(msg_text, parse_mode="html")
-
-    async def _send_watchlist_view(self, event: Any, page: int = 0, edit: bool = False) -> None:
-        items = self.db.list_watchlist()
-        per_page = 6
-        total_pages = max(1, (len(items) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        chunk = items[page * per_page : (page + 1) * per_page]
-
-        lines = [f"📋 <b>واچ‌لیست شخصی (نامحدود) — صفحه {page+1}/{total_pages}</b>\n"]
-        buttons: List[List[Any]] = []
-        if not chunk:
-            lines.append("هنوز کسی توی واچ‌لیست نیست. با `/watch ID` یا دکمه پایین اضافه کن.")
+            await self.toast(event, f"⚫ <b>{html.escape(info.display_name or dname or cid)}</b> الان آفلاینه.", ttl=8)
         else:
-            for item in chunk:
-                cid = item["creator_id"]
-                name = html.escape(item["display_name"] or cid)
-                is_rec = self.rec_mgr.is_recording(cid)
-                st = "⏺ در حال ضبط" if is_rec else ("🔴 آنلاین" if item["last_status"] == "live" else "⚫ آفلاین")
-                auto = "✅" if item["auto_record"] else "⏸"
-                lines.append(f"• <b>{name}</b> (<code>{cid}</code>) — {st} | خودکار: {auto} | ضبط‌ها: {item['total_recordings']}")
-                buttons.append(
-                    [
-                        Button.inline(f"🎬 ضبط {item['display_name'][:12] or cid}", data=f"qrec:{cid}"),
-                        Button.inline(f"{'⏸' if item['auto_record'] else '▶️'} خودکار", data=f"toggle:{cid}"),
-                        Button.inline("🗑 حذف", data=f"rmwatch:{cid}"),
-                    ]
-                )
-
-        nav: List[Any] = []
-        if page > 0:
-            nav.append(Button.inline("⬅️ قبلی", data=f"page:watchlist:{page-1}"))
-        if page < total_pages - 1:
-            nav.append(Button.inline("بعدی ➡️", data=f"page:watchlist:{page+1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([Button.inline("➕ افزودن جدید", data="act:add_watch"), Button.inline("🏠 منو", data="page:home")])
-
-        text = "\n".join(lines)
-        if edit:
-            await event.edit(text, parse_mode="html", buttons=buttons)
-        else:
-            await event.reply(text, parse_mode="html", buttons=buttons)
-
-    async def _send_active_view(self, event: Any, edit: bool = False) -> None:
-        actives = list(self.rec_mgr.active.values())
-        lines = [f"🔴 <b>ضبط‌های فعال الان ({len(actives)})</b>\n"]
-        buttons: List[List[Any]] = []
-        if not actives:
-            lines.append("در حال حاضر هیچ استریمی در حال ضبط نیست.")
-        else:
-            for rec in actives:
-                elapsed = fmt_duration(time.time() - rec.started_at)
-                lines.append(
-                    f"• <b>{html.escape(rec.creator_name)}</b> (<code>{rec.creator_id}</code>)\n"
-                    f"  ⏱ {elapsed} | 💾 {fmt_bytes(rec.bytes_written)} | پارت {rec.part_number}\n"
-                    f"  📌 {html.escape(rec.status_text)}"
-                )
-                buttons.append([Button.inline(f"⏹ توقف و ارسال {rec.creator_name[:16]}", data=f"stop:{rec.creator_id}")])
-
-        buttons.append([Button.inline("🔄 بروزرسانی", data="page:active"), Button.inline("🏠 منو", data="page:home")])
-        text = "\n".join(lines)
-        if edit:
-            await event.edit(text, parse_mode="html", buttons=buttons)
-        else:
-            await event.reply(text, parse_mode="html", buttons=buttons)
-
-    async def _send_archive_view(self, event: Any, page: int = 0, edit: bool = False) -> None:
-        per_page = 8
-        rows = self.db.list_recent_recordings(limit=per_page, offset=page * per_page)
-        lines = [f"📚 <b>آرشیو ضبط‌شده‌ها — صفحه {page+1}</b>\n"]
-        if not rows:
-            lines.append("هنوز ویدیویی در آرشیو ثبت نشده.")
-        else:
-            for r in rows:
-                icon = "✅" if r["status"] == "completed" else ("🔴" if r["status"] == "recording" else "⚠️")
-                dt = (r["started_at"] or "")[:16].replace("T", " ")
-                lines.append(
-                    f"{icon} <b>{html.escape(r['creator_name'] or r['creator_id'])}</b> — "
-                    f"<code>{fmt_duration(r['duration_sec'])}</code> | <code>{fmt_bytes(r['file_size_bytes'])}</code>\n"
-                    f"   📅 {dt} | وضعیت: <code>{r['status']}</code>"
-                )
-        nav: List[Any] = []
-        if page > 0:
-            nav.append(Button.inline("⬅️ قبلی", data=f"page:archive:{page-1}"))
-        if len(rows) == per_page:
-            nav.append(Button.inline("بعدی ➡️", data=f"page:archive:{page+1}"))
-        buttons: List[List[Any]] = []
-        if nav:
-            buttons.append(nav)
-        buttons.append([Button.inline("🏠 منو", data="page:home")])
-        text = "\n".join(lines)
-        if edit:
-            await event.edit(text, parse_mode="html", buttons=buttons)
-        else:
-            await event.reply(text, parse_mode="html", buttons=buttons)
-
-    async def _send_settings_view(self, event: Any, edit: bool = False) -> None:
-        sheet = self.db.get_setting("contact_sheet", "1") == "1"
-        notify = self.db.get_setting("notify_live", "1") == "1"
-        auto_del = self.db.get_setting("auto_delete", "1") == "1"
-        poll = self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
-        conc = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
-        arch = self.db.get_setting("archive_chat_id", "تنظیم نشده")
-
-        text = (
-            "⚙️ <b>تنظیمات SuperLiveRec</b>\n\n"
-            f"🖼 ارسال Contact Sheet (پیش‌نمایش ۴×۳): {'✅ روشن' if sheet else '❌ خاموش'}\n"
-            f"🔔 اعلان شروع ضبط: {'✅ روشن' if notify else '❌ خاموش'}\n"
-            f"🧹 حذف خودکار فایل از دیسک بعد از آپلود: {'✅ روشن' if auto_del else '❌ خاموش'}\n"
-            f"⏱ بازه چک کردن واچ‌لیست: <code>{poll} ثانیه</code>\n"
-            f"⚡ سقف ضبط هم‌زمان: <code>{'نامحدود' if conc == '0' else conc}</code>\n"
-            f"📦 کانال آرشیو: <code>{html.escape(arch)}</code>\n\n"
-            "• تنظیم کانال آرشیو: <code>/setarchive -100...</code>\n"
-            "• لاگین اکانت SuperLive (اختیاری): <code>/login email password</code>"
-        )
-        buttons = [
-            [
-                Button.inline(f"🖼 Contact Sheet: {'ON' if sheet else 'OFF'}", data="set:sheet"),
-                Button.inline(f"🔔 اعلان لایو: {'ON' if notify else 'OFF'}", data="set:notify"),
-            ],
-            [
-                Button.inline(f"🧹 پاکسازی دیسک: {'ON' if auto_del else 'OFF'}", data="set:autodel"),
-                Button.inline(f"⏱ بازه چک ({poll}s)", data="set:poll"),
-            ],
-            [
-                Button.inline(f"⚡ هم‌زمان ({'∞' if conc == '0' else conc})", data="set:conc"),
-                Button.inline("🏠 منو", data="page:home"),
-            ],
-        ]
-        if edit:
-            await event.edit(text, parse_mode="html", buttons=buttons)
-        else:
-            await event.reply(text, parse_mode="html", buttons=buttons)
+            ok, msg_text = await self.rec_mgr.start_recording(info, chat_id=event.chat_id, triggered_by="manual")
+            await self.toast(event, msg_text, ttl=6)
+        await self.show(event, "person", info.creator_id or cid, 0, edit=panel_edit)
 
     async def _handle_setting_toggle(self, event: Any, key: str) -> None:
-        if key == "sheet":
-            cur = self.db.get_setting("contact_sheet", "1")
-            self.db.set_setting("contact_sheet", "0" if cur == "1" else "1")
-        elif key == "notify":
-            cur = self.db.get_setting("notify_live", "1")
-            self.db.set_setting("notify_live", "0" if cur == "1" else "1")
-        elif key == "autodel":
-            cur = self.db.get_setting("auto_delete", "1")
-            self.db.set_setting("auto_delete", "0" if cur == "1" else "1")
+        g, st = self.db.get_setting, self.db.set_setting
+
+        def cycle(name: str, opts: List[str], default: str) -> None:
+            cur = g(name, default)
+            st(name, opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else opts[0])
+
+        if key == "notify":
+            st("notify_live", "0" if g("notify_live", "1") == "1" else "1")
+        elif key == "ttl":
+            cycle("notify_ttl", ["30", "60", "300", "0"], "60")
+        elif key == "split":
+            cycle("split_minutes", ["0", "10", "20", "30", "60"], "0")
+        elif key == "part":
+            cycle("part_mb", ["500", "1000", "1500", "1900"], "1900")
         elif key == "poll":
-            opts = ["15", "25", "45", "60"]
-            cur = self.db.get_setting("poll_interval", str(DEFAULT_POLL_INTERVAL))
-            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else "25"
-            self.db.set_setting("poll_interval", nxt)
-        elif key == "conc":
-            opts = ["4", "8", "15", "0"]
-            cur = self.db.get_setting("max_concurrent", str(DEFAULT_MAX_CONCURRENT))
-            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else "8"
-            self.db.set_setting("max_concurrent", nxt)
-        await event.answer("تنظیمات ذخیره شد ✅")
-        await self._send_settings_view(event, edit=True)
+            cycle("poll_interval", ["15", "25", "45", "60"], str(DEFAULT_POLL_INTERVAL))
+        await event.answer("ذخیره شد ✅")
+        await self.show(event, "settings", edit=True)
 
     async def _start_health_server(self) -> Optional[web.AppRunner]:
         port_raw = os.environ.get("PORT", "").strip()
@@ -3004,27 +3440,34 @@ class SuperLiveRecBot:
         return runner
 
     async def run(self) -> None:
-        # Clean up stale interrupted recordings & orphan temp directories from prior restarts
         stale = self.db.mark_stale_recordings_interrupted()
         if stale:
             log.info("Marked %d stale recordings as interrupted.", stale)
-        if self.db.get_setting("auto_delete", "1") == "1":
-            for child in RECORDINGS_DIR.iterdir():
-                try:
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        for child in RECORDINGS_DIR.iterdir():
+            try:
+                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         self._register_handlers()
         health_runner = await self._start_health_server()
-        log.info("Starting SuperLiveRec Personal Unlimited Bot (Telethon MTProto)...")
         await self.bot.start(bot_token=BOT_TOKEN)
         me = await self.bot.get_me()
-        log.info("Logged in as @%s (id=%s) | FFmpeg=%s | Agora=%s", me.username, me.id, FFMPEG_BIN, AGORA_AVAILABLE)
+        log.info("Logged in as @%s | FFmpeg=%s | Agora=%s", me.username, FFMPEG_BIN, AGORA_AVAILABLE)
+        try:
+            from telethon.tl.functions.bots import SetBotCommandsRequest
+            from telethon.tl.types import BotCommand, BotCommandScopeDefault
+            await self.bot(SetBotCommandsRequest(scope=BotCommandScopeDefault(), lang_code="", commands=[
+                BotCommand("start", "داشبورد و منوی پایین"),
+                BotCommand("rec", "ضبط فوری با آیدی یا لینک"),
+                BotCommand("watch", "افزودن به واچلیست"),
+                BotCommand("check", "بررسی وضعیت استریمر"),
+                BotCommand("debug", "گزارش فنی API"),
+            ]))
+        except Exception as e:
+            log.debug("set commands failed: %s", e)
         self.monitor.start()
+        bg_task(self._panel_refresher())
         try:
             await self.bot.run_until_disconnected()
         finally:
@@ -3033,7 +3476,7 @@ class SuperLiveRecBot:
             tasks = [r.task for r in list(self.rec_mgr.active.values()) if r.task]
             if tasks:
                 log.info("Waiting for %d recordings to finalize...", len(tasks))
-                await asyncio.wait(tasks, timeout=600)
+                await asyncio.wait(tasks, timeout=900)
             await self.api.close()
             if health_runner:
                 await health_runner.cleanup()
