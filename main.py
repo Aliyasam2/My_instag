@@ -2282,13 +2282,31 @@ class RecordingManager:
         if client is None:
             return False, (f"⚠️ همه {self.max_concurrent()} اکانت SuperLive مشغول ضبطن. "
                            f"از ⚙️ تنظیمات › 👥 اکانتها یه اکانت دیگه اضافه کن.")
-        # Reserve the account, then get a fresh token issued for THIS account
-        self.busy[client.slot] = cid
-        try:
-            fresh = await client.check_creator_and_get_stream(cid, known_ls_id=str(stream_info.livestream_id or ""))
-        except Exception as e:
-            fresh = None
-            log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
+        # Try free accounts in pool; if one gets 400/401/403 on retrieve/enter, fall back to the next account
+        tried_slots = set()
+        fresh = None
+        known_ls = str(stream_info.livestream_id or "")
+        for _ in range(max(1, len(self.accounts()))):
+            self.busy[client.slot] = cid
+            tried_slots.add(client.slot)
+            try:
+                fresh = await client.check_creator_and_get_stream(cid, known_ls_id=known_ls)
+            except Exception as e:
+                fresh = None
+                log.warning("Fresh stream fetch failed (%s): %s", client.label, e)
+            if fresh and fresh.is_live and fresh.stream_url:
+                break
+            self.busy.pop(client.slot, None)
+            if not fresh or not fresh.is_live:
+                break
+            d = fresh.raw_debug
+            if d.get("retrieve_http") in (400, 401, 403) or d.get("enter_http") in (400, 401, 403):
+                nxt = next((c for c in self.accounts() if c.slot not in self.busy and c.slot not in tried_slots), None)
+                if nxt is not None:
+                    log.info("Account %s got %s/%s for %s, trying %s", client.label, d.get("retrieve_http"), d.get("enter_http"), cid, nxt.label)
+                    client = nxt
+                    continue
+            break
         if not fresh or not fresh.is_live or not fresh.stream_url:
             self.busy.pop(client.slot, None)
             if not fresh:
