@@ -18,7 +18,10 @@ Key Features:
 """
 
 import asyncio
+import base64
 import datetime
+import struct
+import zlib
 import html
 import inspect
 import json
@@ -246,6 +249,56 @@ def sanitize_filename(name: str) -> str:
     return cleaned[:48] or "creator"
 
 
+def decode_agora_token_007(token: str) -> Dict[str, Any]:
+    """Extract app_id, channel and uid embedded in an Agora AccessToken2 (007...)."""
+    if not isinstance(token, str) or not token.startswith("007"):
+        return {}
+    try:
+        raw = token[3:]
+        raw += "=" * (-len(raw) % 4)
+        buf = zlib.decompress(base64.b64decode(raw))
+        pos = 0
+
+        def u16() -> int:
+            nonlocal pos
+            v = struct.unpack_from("<H", buf, pos)[0]
+            pos += 2
+            return v
+
+        def u32() -> int:
+            nonlocal pos
+            v = struct.unpack_from("<I", buf, pos)[0]
+            pos += 4
+            return v
+
+        def rstr() -> bytes:
+            nonlocal pos
+            n = u16()
+            v = buf[pos:pos + n]
+            pos += n
+            return v
+
+        rstr()  # signature
+        out: Dict[str, Any] = {"app_id": rstr().decode("utf-8", "ignore")}
+        out["issue_ts"] = u32()
+        out["expire"] = u32()
+        u32()  # salt
+        for _ in range(u16()):
+            stype = u16()
+            for _ in range(u16()):
+                u16()
+                u32()
+            if stype == 1:  # RTC service
+                out["channel"] = rstr().decode("utf-8", "ignore")
+                out["uid"] = rstr().decode("utf-8", "ignore")
+                break
+            # Non-RTC services: RTM(2)/Streaming etc. carry one string (user_id) in most versions
+            rstr()
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ==============================================================================
 # DATABASE LAYER (SQLite — Watchlist, Archive, Settings, SuperLive Session)
 # ==============================================================================
@@ -257,9 +310,11 @@ class Database:
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+        # Single persistent connection (the old code leaked one connection per query)
+        if getattr(self, "_db", None) is None:
+            self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+            self._db.row_factory = sqlite3.Row
+        return self._db
 
     def _init_db(self) -> None:
         with self._lock, self._conn() as conn:
@@ -523,8 +578,10 @@ class SuperLiveClient:
         self._session: Optional[aiohttp.ClientSession] = None
         env_tok = os.environ.get("SUPERLIVE_TOKEN", "").strip()
         env_dev = os.environ.get("SUPERLIVE_DEVICE_ID", "").strip()
-        self._token: str = env_tok or db.get_setting("superlive_token", "")
-        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or uuid.uuid4().hex
+        default_sl_tok = "99da0e6171df700c93e67f436815af2026b8dd6a"
+        default_sl_dev = "42dabfbd4b8b05a85122b64d078755c1"
+        self._token: str = env_tok or db.get_setting("superlive_token", "") or default_sl_tok
+        self._device_id: str = env_dev or db.get_setting("superlive_device_id", "") or default_sl_dev
         self._auth_scheme: str = db.get_setting("superlive_auth_scheme", "Token")
         self._rtc_id: str = (
             os.environ.get("SUPERLIVE_RTC_ID", "").strip()
@@ -886,6 +943,7 @@ class SuperLiveClient:
         # Pick RTC token (strictly preferring non-RTM tokens)
         token = ""
         for pref_k in (
+            "agora_channel_token",
             "agora_token",
             "agora_rtc_token",
             "rtc_token",
@@ -918,13 +976,27 @@ class SuperLiveClient:
 
         # Build prioritized candidate UIDs (explicit API uid, self._rtc_id, "0")
         explicit_uid = (
-            flat.get("agora_uid")
+            flat.get("agora_id")
+            or flat.get("agora_uid")
             or flat.get("agora_user_id")
             or flat.get("rtc_uid")
             or flat.get("viewer_uid")
             or flat.get("rtc_id")
             or ""
         )
+
+        # AccessToken2 (007) embeds the exact app_id / channel / uid it was issued for -> trust it
+        tok_info = decode_agora_token_007(token)
+        if debug_out is not None:
+            debug_out["token_info"] = str({k: v for k, v in tok_info.items()})
+        if tok_info.get("app_id") and re.fullmatch(r"[0-9a-fA-F]{32}", str(tok_info["app_id"])):
+            app_id = tok_info["app_id"]
+        if tok_info.get("channel"):
+            channel = tok_info["channel"]
+        if "uid" in tok_info:
+            # empty uid in token = any uid accepted
+            explicit_uid = tok_info["uid"] or explicit_uid
+
         uid_list: List[str] = []
         for u in (str(explicit_uid), str(self._rtc_id), "0"):
             u = u.strip()
@@ -1022,9 +1094,14 @@ class SuperLiveClient:
                 info.title = str(matched_item.get("title") or "")
                 is_live_flag = bool(ls_id)
                 info.raw_debug["discover_cache_hit"] = True
+        cache_ls_id = ls_id
+        cache_name = info.display_name
 
         # 1) Query user profile only if not already matched in discover_map
-        prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
+        if cache_ls_id:
+            prof_resp = {"_http_status": 200, "_skipped": "discover_hit"}
+        else:
+            prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
         if prof_resp.get("_http_status") in (401, 403):
             await self.ensure_initialized(force=True)
             prof_resp = await self._request_smart("users/profile", {"user_id": target_uid})
@@ -1043,6 +1120,12 @@ class SuperLiveClient:
         info.raw_debug["profile_sample"] = json.dumps(prof_resp, ensure_ascii=False)[:900]
 
         user_obj = self._extract_user_dict(prof_resp)
+        # SuperLive may ignore user_id and return the logged-in account's own profile -> discard it
+        if user_obj and str(user_obj.get("user_id") or "") not in ("", target_uid, str(creator_id)) \
+                and str(user_obj.get("shared_id") or "") != str(creator_id):
+            info.raw_debug["profile_mismatch"] = f"got {user_obj.get('user_id')} for {target_uid}"
+            user_obj = {}
+            prof_resp = {"_http_status": prof_resp.get("_http_status"), "_ignored": "own profile"}
         if user_obj:
             info.username = str(user_obj.get("username") or user_obj.get("shared_id") or "")
             info.display_name = str(user_obj.get("name") or user_obj.get("nickname") or info.username or target_uid)
@@ -1074,6 +1157,7 @@ class SuperLiveClient:
             or deep.get("stream_id")
             or deep.get("broadcast_id")
             or deep.get("room_id")
+            or cache_ls_id
             or ""
         )
         for nested_key in ("livestream", "current_livestream", "active_livestream"):
@@ -1167,6 +1251,18 @@ class SuperLiveClient:
         info.raw_debug["retrieve_sample"] = json.dumps(slim_ret, ensure_ascii=False)[:1100]
         info.raw_debug["enter_http"] = ent_resp.get("_http_status")
         info.raw_debug["enter_sample"] = json.dumps(ent_resp, ensure_ascii=False)[:700]
+
+        owner = self._deep_find_keys(ret_resp, ("livestream_owner_id",)).get("livestream_owner_id")
+        if owner:
+            info.creator_id = str(owner)
+        if cache_name and not info.display_name:
+            info.display_name = cache_name
+        if isinstance(ret_resp, dict) and isinstance(ret_resp.get("user"), dict):
+            ru = ret_resp["user"]
+            if ru.get("name"):
+                info.display_name = str(ru["name"])
+            if ru.get("user_id"):
+                info.creator_id = str(ru["user_id"])
 
         for candidate_resp in (ent_resp, ret_resp, prof_resp, user_obj):
             if not isinstance(candidate_resp, dict):
@@ -1936,7 +2032,7 @@ class RecordingManager:
                     increment_recordings=True,
                 )
             self.active.pop(rec.creator_id, None)
-            if self.db.get_setting("auto_delete", "1") == "1":
+            if self.db.get_setting("auto_delete", "1") == "1" and final_status != "error":
                 shutil.rmtree(work_dir, ignore_errors=True)
             if status_msg:
                 try:
@@ -1946,22 +2042,21 @@ class RecordingManager:
 
     async def _capture_ffmpeg_part(self, rec: ActiveRecording, output_mp4: Path) -> Tuple[bool, bool]:
         """Record HLS/FLV/RTMP directly with FFmpeg (-c copy, no re-encoding)."""
-        cmd = [
-            FFMPEG_BIN or "ffmpeg",
-            "-y",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
+        cmd = [FFMPEG_BIN or "ffmpeg", "-y"]
+        if rec.stream_url.lower().startswith(("http://", "https://")):
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        cmd += [
             "-i", rec.stream_url,
             "-c", "copy",
             "-movflags", "+faststart",
             str(output_mp4),
         ]
+        ff_log_fh = open(output_mp4.with_suffix(".ffmpeg.log"), "wb")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=ff_log_fh,
         )
         reached_size_cap = False
         try:
@@ -1996,6 +2091,10 @@ class RecordingManager:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except Exception:
                         proc.kill()
+            try:
+                ff_log_fh.close()
+            except Exception:
+                pass
         return output_mp4.exists() and output_mp4.stat().st_size > 10_000, reached_size_cap
 
     async def _capture_agora_part(
@@ -2197,6 +2296,11 @@ class RecordingManager:
                 wait_s = int(getattr(fw, "seconds", 10)) + 2
                 log.warning("FloodWait %ss while uploading %s (attempt %d)", wait_s, rec.creator_id, attempt + 1)
                 await asyncio.sleep(wait_s)
+            except Exception as e:
+                log.warning("Upload error for %s (attempt %d): %s", rec.creator_id, attempt + 1, e)
+                await asyncio.sleep(5 * (attempt + 1))
+        if sent is None:
+            raise RuntimeError(f"آپلود ناموفق بود؛ فایل روی دیسک نگه داشته شد: {mp4_path}")
 
         # Optional: Forward to user's private Archive Channel
         arch_chat_raw = self.db.get_setting("archive_chat_id", "")
@@ -2350,7 +2454,7 @@ class SuperLiveRecBot:
         return text, buttons
 
     def _register_handlers(self) -> None:
-        @self.bot.on(events.NewMessage(pattern=r"^/(start|menu)$"))
+        @self.bot.on(events.NewMessage(pattern=r"^/(start|menu)(@\w+)?(\s.*)?$"))
         async def cmd_start(event: Any) -> None:
             if not self._is_owner(event.sender_id):
                 await event.reply("⛔ این ربات شخصی هست و فقط برای مالک سرور فعاله.")
@@ -2470,6 +2574,7 @@ class SuperLiveRecBot:
                 f"• Retrieve/Enter HTTP: <code>{d.get('retrieve_http', '-')} / {d.get('enter_http', '-')}</code>\n"
                 f"• Live: <code>{info.is_live}</code> | ls_id: <code>{html.escape(info.livestream_id or '-')}</code>\n"
                 f"• Stream: <code>{html.escape((info.stream_url[:60] + '...') if len(info.stream_url) > 60 else (info.stream_url or '-'))}</code>\n"
+                f"• Token Info: <code>{html.escape(str(d.get('token_info', '-')))}</code>\n"
                 f"• Agora Keys: <code>{html.escape(str(d.get('agora_keys', '-'))[:600])}</code>\n\n"
                 f"<b>Profile JSON:</b>\n<code>{html.escape(str(d.get('profile_sample', ''))[:1200])}</code>\n\n"
                 f"<b>Retrieve/Enter JSON:</b>\n<code>{html.escape(str(d.get('retrieve_sample') or d.get('enter_sample') or d.get('discover_sample') or '')[:1200])}</code>"
@@ -2870,6 +2975,10 @@ class SuperLiveRecBot:
         finally:
             await self.monitor.stop()
             await self.rec_mgr.stop_all()
+            tasks = [r.task for r in list(self.rec_mgr.active.values()) if r.task]
+            if tasks:
+                log.info("Waiting for %d recordings to finalize...", len(tasks))
+                await asyncio.wait(tasks, timeout=600)
             await self.api.close()
             if health_runner:
                 await health_runner.cleanup()
