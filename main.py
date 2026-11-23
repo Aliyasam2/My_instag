@@ -2129,6 +2129,14 @@ class RecordingManager:
     def is_recording(self, creator_id: str) -> bool:
         return str(creator_id) in self.active
 
+    def max_concurrent(self) -> int:
+        raw = self.db.get_setting("max_concurrent", "1")
+        return int(raw) if raw.isdigit() else 1
+
+    def has_capacity(self) -> bool:
+        lim = self.max_concurrent()
+        return lim == 0 or len(self.active) < lim
+
     def split_seconds(self) -> int:
         raw = self.db.get_setting("split_minutes", "0")
         return int(raw) * 60 if raw.isdigit() else 0
@@ -2155,6 +2163,9 @@ class RecordingManager:
         else:
             self.manually_stopped_ls.pop(cid, None)
 
+        if not self.has_capacity():
+            return False, (f"⚠️ سقف ضبط همزمان ({self.max_concurrent()}) پره. با یه اکانت SuperLive، "
+                           f"ضبط همزمان چند لایو باعث میشه سرور اتصالها رو قطع کنه.")
         _, free_mb, _ = get_disk_stats()
         if free_mb < MIN_FREE_DISK_MB:
             return False, f"💽 فضای خالی دیسک کمه ({free_mb:.0f} MB)؛ ضبط جدید شروع نشد."
@@ -2273,16 +2284,17 @@ class RecordingManager:
                 final_status = "empty"
                 self._fail_cooldown[rec.creator_id] = time.time() + 180.0
                 notes = rec.agora_diag or "no data"
-                try:
-                    m = await self.bot.send_message(
-                        rec.chat_id,
-                        f"⚠️ از لایو <b>{html.escape(rec.creator_name)}</b> دیتایی دریافت نشد.\n"
-                        f"<code>{html.escape((rec.agora_diag or rec.status_text)[:350])}</code>",
-                        parse_mode="html",
-                    )
-                    schedule_delete(m, 120)
-                except Exception:
-                    pass
+                log.info("Empty recording for %s (%s): %s", rec.creator_id, rec.triggered_by, notes)
+                if rec.triggered_by == "manual" and not rec.manual_stop:
+                    try:
+                        m = await self.bot.send_message(
+                            rec.chat_id,
+                            f"⚠️ ضبط <b>{html.escape(rec.creator_name)}</b> ممکن نشد (سرور اجازه اتصال نداد).",
+                            parse_mode="html",
+                        )
+                        schedule_delete(m, 15)
+                    except Exception:
+                        pass
             elif rec.uploaded_parts > 0:
                 self.db.increment_recordings(rec.creator_id)
                 try:
@@ -2440,9 +2452,7 @@ class RecordingManager:
                     log.warning("Video stalled for %s (%.0fs), reconnecting", rec.creator_id, time.time() - ref)
                     rec.status_text = "تصویر قطع شد، اتصال مجدد..."
                     break
-                if rec.livestream_id and time.time() - last_enter >= 40:
-                    last_enter = time.time()
-                    bg_task(self.api._request_smart("livestream/enter", {"livestream_id": str(rec.livestream_id)}))
+
                 rec.bytes_written = receiver.seg_bytes
                 if receiver.seg_video_frames == 1:
                     rec.seg_started_at = receiver.seg_started_at
@@ -2620,16 +2630,21 @@ class WatchlistMonitor:
         key = info.livestream_id or "live"
         if self._notified_ls.get(info.creator_id) == key:
             return
+        if not info.stream_url:
+            return  # not joinable (private/ended) -> stay silent
         self._notified_ls[info.creator_id] = key
         if self.db.get_setting("notify_live", "1") != "1":
             return
+        row = [Button.inline("👤 صفحه", data=f"p:{info.creator_id}:0")]
+        if not started:
+            row.insert(0, Button.inline("🎬 ضبط فوری", data=f"qr:{info.creator_id}"))
         try:
             m = await self.bot.send_message(
                 owner_id,
                 f"🔴 <b>{html.escape(info.display_name or info.creator_id)}</b> لایو شد"
-                + (" · ⏺ ضبط شروع شد" if started else ""),
+                + (" · ⏺ ضبط خودکار شروع شد" if started else ""),
                 parse_mode="html",
-                buttons=[[Button.inline("👤 صفحه استریمر", data=f"p:{info.creator_id}:0")]],
+                buttons=[row],
             )
             ttl = self.rec_mgr.notify_ttl()
             if ttl > 0:
@@ -2668,7 +2683,7 @@ class WatchlistMonitor:
                         if info.is_live:
                             self.db.update_watch_status(cid, "live", display_name=info.display_name, username=info.username)
                             started = False
-                            if item["auto_record"]:
+                            if item["auto_record"] and self.rec_mgr.has_capacity():
                                 ok, msg = await self.rec_mgr.start_recording(info, chat_id=owner_id, triggered_by="watchlist")
                                 started = ok
                                 if not ok:
@@ -2714,13 +2729,20 @@ def _kb_button(label: str) -> Any:
     return Button.text(label, **kwargs)
 
 
-def main_keyboard() -> List[List[Any]]:
-    return [
-        [_kb_button(KB_WATCH), _kb_button(KB_ACTIVE)],
-        [_kb_button(KB_ADD), _kb_button(KB_REC)],
-        [_kb_button(KB_ARCHIVE), _kb_button(KB_SETTINGS)],
-        [_kb_button(KB_HOME)],
-    ]
+def main_keyboard() -> Any:
+    from telethon.tl.types import KeyboardButton, KeyboardButtonRow, ReplyKeyboardMarkup
+    rows = [[KB_WATCH, KB_ACTIVE], [KB_ADD, KB_REC], [KB_ARCHIVE, KB_SETTINGS], [KB_HOME]]
+    trows = [KeyboardButtonRow([KeyboardButton(t) for t in r]) for r in rows]
+    kw: Dict[str, Any] = {"rows": trows, "resize": True}
+    try:
+        params = inspect.signature(ReplyKeyboardMarkup.__init__).parameters
+        if "persistent" in params:
+            kw["persistent"] = True
+        if "placeholder" in params:
+            kw["placeholder"] = "آیدی یا لینک رو بفرست…"
+    except Exception:
+        pass
+    return ReplyKeyboardMarkup(**kw)
 
 
 def short(name: str, n: int = 18) -> str:
@@ -2949,6 +2971,8 @@ class SuperLiveRecBot:
         split = g("split_minutes", "0")
         part = g("part_mb", "1900")
         poll = g("poll_interval", str(DEFAULT_POLL_INTERVAL))
+        conc = g("max_concurrent", "1")
+        conc_txt = "نامحدود" if conc == "0" else conc
         arch = g("archive_chat_id", "") or "خاموش"
         ttl_txt = "هیچوقت" if ttl == "0" else f"{ttl} ثانیه"
         split_txt = "خاموش" if split == "0" else f"هر {split} دقیقه"
@@ -2962,7 +2986,8 @@ class SuperLiveRecBot:
             f"⏱ بازه چک واچلیست: <b>{poll} ثانیه</b>",
             f"🗄 کانال آرشیو: <code>{html.escape(arch)}</code>",
             SEP,
-            "• واچلیست و ضبط همزمان: <b>نامحدود</b>",
+            f"⚡ ضبط همزمان: <b>{conc_txt}</b>  <i>(با یه اکانت SuperLive بیشتر از ۱ باعث قطعی میشه)</i>",
+            "• واچلیست: <b>نامحدود</b>",
             "• پیشنمایش برای همه ویدیوها: <b>همیشه</b>",
             "• حذف فایل از سرور بعد از ارسال: <b>همیشه</b>",
             "\n<i>کانال آرشیو:</i> <code>/setarchive -100…</code>  ·  <code>/setarchive off</code>",
@@ -2970,7 +2995,7 @@ class SuperLiveRecBot:
         buttons = [
             [Button.inline(f"🔔 اعلان: {'ON' if notify else 'OFF'}", data="set:notify"), Button.inline(f"🧹 حذف: {ttl_txt}", data="set:ttl")],
             [Button.inline(f"✂️ تکهتکه: {split_txt}", data="set:split"), Button.inline(f"📦 {part}MB", data="set:part")],
-            [Button.inline(f"⏱ چک: {poll}s", data="set:poll")],
+            [Button.inline(f"⏱ چک: {poll}s", data="set:poll"), Button.inline(f"⚡ همزمان: {conc_txt}", data="set:conc")],
             [Button.inline("🏠", data="h")],
         ]
         return text, buttons
@@ -3023,6 +3048,19 @@ class SuperLiveRecBot:
                 except Exception:
                     self._panel_until[chat_id] = 0
 
+    async def _ensure_keyboard(self, chat_id: int, force: bool = False) -> None:
+        """The message that carries the reply keyboard must NOT be deleted, or Telegram hides the keyboard."""
+        old_id = self.db.get_setting(f"kb_msg_{chat_id}", "")
+        if old_id and not force:
+            return
+        m = await self.bot.send_message(chat_id, "⌨️ منوی ربات پایین صفحهست.", buttons=main_keyboard())
+        self.db.set_setting(f"kb_msg_{chat_id}", str(m.id))
+        if old_id.isdigit():
+            try:
+                await self.bot.delete_messages(chat_id, [int(old_id)])
+            except Exception:
+                pass
+
     async def toast(self, event: Any, text: str, ttl: int = 8, **kw: Any) -> Any:
         m = await self.bot.send_message(event.chat_id, text, parse_mode="html", **kw)
         schedule_delete(m, ttl)
@@ -3044,8 +3082,7 @@ class SuperLiveRecBot:
             self._awaiting_input.pop(event.sender_id, None)
             await self._delete_user_msg(event)
             # (re)attach the persistent bottom keyboard
-            kb = await self.bot.send_message(event.chat_id, "⌨️ منوی پایین فعال شد.", buttons=main_keyboard())
-            schedule_delete(kb, 3)
+            await self._ensure_keyboard(event.chat_id, force=True)
             await self.show(event, "home")
 
         @self.bot.on(events.NewMessage(func=lambda e: e.is_private and (e.raw_text or "") in KB_ALL))
@@ -3407,6 +3444,8 @@ class SuperLiveRecBot:
             cycle("part_mb", ["500", "1000", "1500", "1900"], "1900")
         elif key == "poll":
             cycle("poll_interval", ["15", "25", "45", "60"], str(DEFAULT_POLL_INTERVAL))
+        elif key == "conc":
+            cycle("max_concurrent", ["1", "2", "3", "0"], "1")
         await event.answer("ذخیره شد ✅")
         await self.show(event, "settings", edit=True)
 
@@ -3466,6 +3505,12 @@ class SuperLiveRecBot:
             ]))
         except Exception as e:
             log.debug("set commands failed: %s", e)
+        owner = self.db.get_owner_id()
+        if owner:
+            try:
+                await self._ensure_keyboard(owner, force=True)
+            except Exception as e:
+                log.debug("keyboard restore failed: %s", e)
         self.monitor.start()
         bg_task(self._panel_refresher())
         try:
