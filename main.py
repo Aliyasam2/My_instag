@@ -3511,6 +3511,43 @@ class SuperLiveRecBot:
                 self.db.set_setting("archive_chat_id", val)
                 await event.reply(f"✅ کانال آرشیو روی <code>{html.escape(val)}</code> تنظیم شد.", parse_mode="html")
 
+        @self.bot.on(events.NewMessage(pattern=r"^/whoami$"))
+        async def cmd_whoami(event: Any) -> None:
+            """Check each account's token: does the server recognise it? (users/me)"""
+            if not self._is_owner(event.sender_id):
+                return
+            await self._delete_user_msg(event)
+            msg = await event.respond("🔍 در حال بررسی اکانتها...")
+            lines = ["🪪 <b>وضعیت اکانتها</b>", SEP]
+            for slot, c in sorted(self.pool.clients.items()):
+                tag = " (اصلی)" if slot == 0 else ""
+                if not c.has_token():
+                    lines.append(f"⚪ <b>{html.escape(c.label)}</b>{tag} — بدون توکن")
+                    continue
+                ok = False
+                detail = ""
+                for scheme in ("Token", "Bearer"):
+                    c._auth_scheme = scheme
+                    res = await c._post("users/me", {})
+                    st = res.get("_http_status")
+                    u = c._extract_user_dict(res)
+                    if st in (200, 201) and u.get("user_id"):
+                        ok = True
+                        c.db.set_setting(c._k("superlive_auth_scheme"), scheme)
+                        detail = f"user_id=<code>{u.get('user_id')}</code> · نام: {html.escape(str(u.get('name') or '-'))} · scheme={scheme}"
+                        break
+                    err = res.get("error") if isinstance(res.get("error"), dict) else {}
+                    detail = f"HTTP <code>{st}</code> · <code>{html.escape(str(err.get('message') or res.get('_error') or '-'))}</code>"
+                lines.append(
+                    f"{'✅' if ok else '❌'} <b>{html.escape(c.label)}</b>{tag}\n"
+                    f"     📱 device: <code>{html.escape(c._device_id[:14])}…</code>\n"
+                    f"     {detail}"
+                )
+            lines += [SEP,
+                      "❌ = سرور این توکن رو قبول نداره (معمولاً Device-Id با توکن جور نیست یا توکن منقضیه).",
+                      "برای درست کردن: توکن و <code>Device-Id</code> رو با هم از مرورگر بردار و با 🔑 توی «👥 اکانتها» دوباره ست کن."]
+            await msg.edit("\n".join(lines)[:4000], parse_mode="html", link_preview=False)
+
         @self.bot.on(events.NewMessage(pattern=r"^/guesttest\s+(.+)$"))
         async def cmd_guesttest(event: Any) -> None:
             """Test: can a brand-new GUEST device (no login) get an Agora token and receive video?"""
@@ -3750,7 +3787,7 @@ class SuperLiveRecBot:
                 elif head == "acct":
                     self._awaiting_input[event.sender_id] = f"acctok:{parts[1]}"
                     await event.answer()
-                    await self.toast(event, "🔑 توکن جدید این اکانت رو بفرست (اختیاری: بعدش با فاصله device_id):", ttl=90)
+                    await self.toast(event, "🔑 توکن این اکانت رو بفرست. بهتره <b>Device-Id</b> رو هم بعدش با فاصله بفرستی:\n<code>توکن device_id</code>", ttl=90)
                     return
                 elif head == "accrmq":
                     await event.edit("🗑 این اکانت حذف بشه؟", buttons=[[Button.inline("✅ بله", data=f"accrm:{parts[1]}"), Button.inline("‹ انصراف", data="acc")]])
@@ -3894,6 +3931,7 @@ class SuperLiveRecBot:
                 BotCommand("watch", "افزودن به واچلیست"),
                 BotCommand("check", "بررسی وضعیت استریمر"),
                 BotCommand("debug", "گزارش فنی API"),
+                BotCommand("whoami", "بررسی سالم بودن اکانتها"),
             ]))
         except Exception as e:
             log.debug("set commands failed: %s", e)
