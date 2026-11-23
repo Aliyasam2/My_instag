@@ -87,6 +87,8 @@ MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", "500"))
 AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
+# How many pages of /discover (live list) to scan when looking for a creator
+DISCOVER_PAGES = int(os.environ.get("DISCOVER_PAGES", "15"))
 # Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
 DEFAULT_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "8"))
 
@@ -801,9 +803,42 @@ class SuperLiveClient:
                             return sub0
         return {}
 
+    async def expand_short_link(self, raw: str) -> str:
+        """Expand app share links (https://sprlv.link/s/XXXX or /XXXX) into the real superlive URL/ids."""
+        m = re.search(r"https?://(?:www\.)?sprlv\.link/[^\s]+", raw)
+        if not m:
+            return raw
+        url = m.group(0)
+        sess = await self._get_session()
+        texts: List[str] = []
+        try:
+            async with sess.get(url, allow_redirects=True, headers={"User-Agent": self._headers()["User-Agent"]}) as resp:
+                texts.append(str(resp.url))
+                for h in resp.history:
+                    texts.append(str(h.headers.get("Location", "")))
+                try:
+                    texts.append((await resp.text())[:20000])
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("Short link expand failed for %s: %s", url, e)
+            return raw
+        blob = urllib.parse.unquote(" ".join(texts))
+        mls = re.search(r"livestream[/=_](?:id[=/])?(\d{5,16})", blob)
+        if mls:
+            log.info("Short link %s -> livestream %s", url, mls.group(1))
+            return f"https://superlive.chat/livestream/{mls.group(1)}"
+        mu = re.search(r"(?:user_id|profile|users?)[/=](\d{5,16})", blob)
+        if mu:
+            log.info("Short link %s -> user %s", url, mu.group(1))
+            return mu.group(1)
+        log.warning("Short link %s could not be parsed: %s", url, blob[:300])
+        return raw
+
     async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
         """Resolve any SuperLive user_id, public shared_id, username, or URL into (real_user_id, username, display_name, avatar)."""
         await self.ensure_initialized()
+        raw_query = await self.expand_short_link(raw_query)
         ident = extract_creator_identifier(raw_query)
         if not ident:
             return "", "", "", ""
@@ -837,6 +872,15 @@ class SuperLiveClient:
 
         # 2) Resolve via profile_share_search (translates public shared_id like 59534891 -> internal user_id)
         found_u = await self._search_by_shared_id(ident)
+        if not found_u:
+            # 3) Creator is live? The discover list contains both shared_id and real user_id
+            try:
+                dmap, _, _ = await self.fetch_discover_map(max_pages=DISCOVER_PAGES)
+                item = dmap.get(str(ident)) or dmap.get(str(ident).lower())
+                if item:
+                    found_u = item.get("user") or item.get("host") or item.get("broadcaster") or item
+            except Exception as e:
+                log.warning("discover lookup failed for %s: %s", ident, e)
         if found_u:
             cid = str(found_u.get("user_id") or found_u.get("id") or ident)
             uname = str(found_u.get("username") or found_u.get("shared_id") or "")
@@ -1194,7 +1238,7 @@ class SuperLiveClient:
         disc_data: Dict[str, Any] = {}
         if not ls_id and discover_map is None:
             cursor: Any = None
-            for page_idx in range(4):
+            for page_idx in range(DISCOVER_PAGES):
                 disc_data = await self._request_smart("discover", {"next": cursor, "type": 0})
                 if page_idx == 0:
                     info.raw_debug["discover_http"] = disc_data.get("_http_status")
@@ -2401,7 +2445,7 @@ class WatchlistMonitor:
                     discover_map: Optional[Dict[str, Dict[str, Any]]] = None
                     if items:
                         try:
-                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=4)
+                            discover_map, _, _ = await self.api.fetch_discover_map(max_pages=DISCOVER_PAGES)
                         except Exception as e:
                             log.warning("Batch discover fetch failed: %s", e)
                     for item in items:
@@ -2702,10 +2746,18 @@ class SuperLiveRecBot:
                 await self._handle_add_watch(event, raw)
             else:
                 # Smart direct-paste: if user pastes a SuperLive link or numeric ID directly
-                if "superlive" in raw.lower() or "spl-live" in raw.lower() or re.fullmatch(r"\d{5,15}", raw):
-                    cid = extract_creator_identifier(raw)
+                if "superlive" in raw.lower() or "spl-live" in raw.lower() or "sprlv" in raw.lower() or raw.startswith("@") or re.fullmatch(r"\d{5,15}", raw):
+                    wait = await event.reply("🔍 در حال شناسایی...")
+                    cid, _, dname, _ = await self.api.resolve_creator(raw)
+                    try:
+                        await wait.delete()
+                    except Exception:
+                        pass
+                    if not cid or len(f"qwatch:{cid}".encode()) > 64:
+                        await event.reply("❌ نتونستم استریمر رو از این لینک/آیدی پیدا کنم.")
+                        return
                     await event.reply(
-                        f"آیدی <code>{html.escape(cid)}</code> تشخیص داده شد. چیکار کنم؟",
+                        f"👤 <b>{html.escape(dname or cid)}</b> (<code>{html.escape(cid)}</code>) پیدا شد. چیکار کنم؟",
                         parse_mode="html",
                         buttons=[
                             [
