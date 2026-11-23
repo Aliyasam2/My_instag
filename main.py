@@ -794,6 +794,7 @@ class SuperLiveClient:
         if not db.get_setting(self._k("superlive_rtc_id"), ""):
             db.set_setting(self._k("superlive_rtc_id"), self._rtc_id)
         self.label: str = db.get_setting(self._k("superlive_label"), "") or f"اکانت {slot + 1}"
+        self.last_resolve_error: str = ""
 
     def _k(self, key: str) -> str:
         return key if self.slot == 0 else f"acc{self.slot}_{key}"
@@ -1009,27 +1010,113 @@ class SuperLiveClient:
                             return sub0
         return {}
 
+    async def _expand_short_url(self, raw_query: str) -> str:
+        m = re.search(r"https?://sprlv\.link/[^\s]+", raw_query, re.I)
+        if not m:
+            return raw_query
+        try:
+            sess = await self._get_session()
+            async with sess.get(m.group(0), allow_redirects=True) as resp:
+                return str(resp.url)
+        except Exception:
+            return raw_query
+
     async def resolve_creator(self, raw_query: str) -> Tuple[str, str, str, str]:
         """Resolve any SuperLive user_id, public shared_id, username, or URL into (real_user_id, username, display_name, avatar)."""
+        self.last_resolve_error = ""
         await self.ensure_initialized()
-        ident = extract_creator_identifier(raw_query)
+        expanded = await self._expand_short_url(raw_query)
+        ident = extract_creator_identifier(expanded)
         if not ident:
+            self.last_resolve_error = "فرمت آیدی یا لینک معتبر نیست."
             return "", "", "", ""
 
         # 0) Livestream link -> ask SuperLive who owns this livestream
         if ident.startswith("ls:"):
             ls_id = ident[3:]
             ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
-            owner = self._deep_find_keys(ret, ("livestream_owner_id",)).get("livestream_owner_id")
-            u = ret.get("user") if isinstance(ret.get("user"), dict) else {}
-            if not u:
-                lsobj = ret.get("livestream") if isinstance(ret.get("livestream"), dict) else {}
-                u = lsobj.get("user") if isinstance(lsobj.get("user"), dict) else {}
+            if ret.get("_http_status") in (401, 403):
+                await self.ensure_initialized(force=True)
+                ret = await self._request_smart("livestream/retrieve", {"livestream_id": ls_id})
+
+            # Extract owner from multiple possible response structures
+            found = self._deep_find_keys(
+                ret,
+                ("livestream_owner_id", "owner_id", "host_id", "streamer_id", "broadcaster_id", "creator_id"),
+            )
+            owner = (
+                found.get("livestream_owner_id")
+                or found.get("owner_id")
+                or found.get("host_id")
+                or found.get("streamer_id")
+                or found.get("broadcaster_id")
+                or found.get("creator_id")
+            )
+            u: Dict[str, Any] = {}
+            for container in (
+                ret,
+                ret.get("livestream") if isinstance(ret.get("livestream"), dict) else {},
+                ret.get("data") if isinstance(ret.get("data"), dict) else {},
+            ):
+                if not isinstance(container, dict):
+                    continue
+                for ukey in ("user", "host", "owner", "broadcaster", "streamer"):
+                    cand = container.get(ukey)
+                    if isinstance(cand, dict) and (cand.get("user_id") or cand.get("id")):
+                        u = cand
+                        break
+                if u:
+                    break
             cid = str(owner or u.get("user_id") or u.get("id") or "")
             if cid:
                 uname = str(u.get("username") or u.get("shared_id") or "")
                 dname = str(u.get("name") or uname or cid)
                 return cid, uname, dname, self._extract_avatar(u) if u else ""
+
+            # Fallback: search live streams in /discover by livestream_id
+            try:
+                cursor: Any = None
+                for _ in range(6):
+                    disc = await self._request_smart("discover", {"next": cursor, "type": 0})
+                    if not isinstance(disc, dict):
+                        break
+                    items = (
+                        disc.get("items")
+                        or disc.get("livestreams")
+                        or disc.get("streams")
+                        or (disc.get("data") or {}).get("items")
+                        or (disc.get("data") if isinstance(disc.get("data"), list) else [])
+                        or []
+                    )
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        host = item.get("user") or item.get("host") or item.get("broadcaster") or item
+                        item_ls = str(host.get("livestream_id") or item.get("livestream_id") or item.get("id") or "")
+                        if item_ls == ls_id:
+                            cid = str(host.get("user_id") or host.get("id") or item.get("user_id") or "")
+                            if cid:
+                                uname = str(host.get("username") or host.get("shared_id") or "")
+                                dname = str(host.get("name") or uname or cid)
+                                return cid, uname, dname, self._extract_avatar(host)
+                    cursor = disc.get("next")
+                    if not cursor:
+                        break
+            except Exception:
+                pass
+
+            http_st = ret.get("_http_status", 0)
+            err_msg = ""
+            if isinstance(ret.get("error"), dict):
+                err_msg = str(ret["error"].get("message") or ret["error"].get("code") or "")
+            elif ret.get("message") or ret.get("_error"):
+                err_msg = str(ret.get("message") or ret.get("_error"))
+            if http_st in (401, 403) or not self._token:
+                self.last_resolve_error = f"HTTP {http_st} — توکن SuperLive نامعتبر یا لاگین نشده (از /login یا /settoken وارد شو)."
+            elif err_msg:
+                self.last_resolve_error = f"HTTP {http_st}: {err_msg}"
+            else:
+                self.last_resolve_error = f"HTTP {http_st} — لایو بسته شده یا صاحب لایو در پاسخ سرور نبود."
             log.warning("Could not resolve livestream %s owner: %s", ls_id, json.dumps(ret, ensure_ascii=False)[:300])
             return "", "", "", ""
 
@@ -3607,7 +3694,8 @@ class SuperLiveRecBot:
                 except Exception:
                     pass
                 if not cid:
-                    await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
+                    reason = f"\n<code>{html.escape(self.api.last_resolve_error)}</code>" if self.api.last_resolve_error else ""
+                    await self.toast(event, f"❌ استریمری با این آیدی/لینک پیدا نشد.{reason}", ttl=20)
                     return
                 await self.show(event, "person", cid, 0)
 
@@ -3733,7 +3821,8 @@ class SuperLiveRecBot:
         except Exception:
             pass
         if not cid:
-            await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
+            reason = f"\n<code>{html.escape(self.api.last_resolve_error)}</code>" if self.api.last_resolve_error else ""
+            await self.toast(event, f"❌ استریمری با این آیدی/لینک پیدا نشد.{reason}", ttl=20)
             return
         added = self.db.add_watch(cid, uname, dname, avatar)
         info = await self.api.check_creator_and_get_stream(cid, light=True)
@@ -3754,7 +3843,8 @@ class SuperLiveRecBot:
                 await wait.delete()
             except Exception:
                 pass
-            await self.toast(event, "❌ استریمری با این آیدی/لینک پیدا نشد.")
+            reason = f"\n<code>{html.escape(self.api.last_resolve_error)}</code>" if self.api.last_resolve_error else ""
+            await self.toast(event, f"❌ استریمری با این آیدی/لینک پیدا نشد.{reason}", ttl=20)
             return
         info = await self.api.check_creator_and_get_stream(cid, light=True)
         try:
