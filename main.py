@@ -3456,15 +3456,40 @@ class SuperLiveRecBot:
             work = RECORDINGS_DIR / f"guesttest_{slot}"
             try:
                 init = await guest.ensure_initialized(force=True)
+                guid = str(init.get("guid") or "")
+                if not guest.has_token() and guid:
+                    # SuperLive web guests are identified by the "guid" returned from /initialize
+                    guest._token = guid
+                    lines.append(f"ℹ️ توکن نداد ولی <code>guid</code> داد؛ از همون به عنوان توکن مهمان استفاده میشه.")
                 lines.append(f"1️⃣ initialize: HTTP <code>{init.get('_http_status')}</code> · توکن مهمان: <b>{'✅ گرفت' if guest.has_token() else '❌ نگرفت'}</b>")
                 if not guest.has_token():
                     lines.append(f"<code>{html.escape(json.dumps(init, ensure_ascii=False)[:500])}</code>")
+                # Auth probe: which scheme (if any) does the server accept for this guest?
+                probe = await guest._post("users/me", {})
+                lines.append(f"   🔐 users/me با {guest._auth_scheme}: HTTP <code>{probe.get('_http_status')}</code>")
 
                 cid, _, dname, _ = await self.api.resolve_creator(raw)  # resolve with main account (read-only)
                 if not cid:
                     lines.append("❌ استریمر/لایو پیدا نشد.")
                     raise RuntimeError("stop")
+                main_info = await self.api.check_creator_and_get_stream(cid, light=True)
                 info = await guest.check_creator_and_get_stream(cid)
+                if not info.is_live and main_info.is_live and main_info.livestream_id:
+                    # guest couldn't see the profile; force the livestream id from the main account
+                    lines.append(f"ℹ️ اکانت اصلی لایو رو دید (<code>{main_info.livestream_id}</code>)؛ مهمان مستقیم وارد همون لایو میشه.")
+                    ls = main_info.livestream_id
+                    ret = await guest._request_smart("livestream/retrieve", {"livestream_id": ls})
+                    ent = await guest._request_smart("livestream/enter", {"livestream_id": ls})
+                    info.is_live = True
+                    info.livestream_id = ls
+                    info.raw_debug["retrieve_http"] = ret.get("_http_status")
+                    info.raw_debug["enter_http"] = ent.get("_http_status")
+                    info.raw_debug["enter_sample"] = json.dumps(ent, ensure_ascii=False)[:700]
+                    info.raw_debug["retrieve_sample"] = json.dumps(ret, ensure_ascii=False)[:700]
+                    info.stream_url = guest._extract_direct_stream_url(ent) or guest._extract_direct_stream_url(ret) or \
+                        guest._build_agora_uri({"retrieve": ret, "enter": ent}, ls_id=ls, debug_out=info.raw_debug)
+                elif not main_info.is_live:
+                    lines.append("⚠️ اکانت اصلی هم این استریمر رو آفلاین دید؛ تست رو موقع لایو بودنش تکرار کن.")
                 d = info.raw_debug
                 lines.append(f"2️⃣ استریمر: <b>{html.escape(info.display_name or dname or cid)}</b> · لایو: <b>{'✅' if info.is_live else '❌'}</b> · ls: <code>{info.livestream_id or '-'}</code>")
                 lines.append(f"3️⃣ retrieve/enter: <code>{d.get('retrieve_http', '-')}/{d.get('enter_http', '-')}</code> · توکن Agora: <b>{'✅' if info.stream_url.startswith('agora://') else ('✅ (HLS)' if info.stream_url else '❌')}</b>")
