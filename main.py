@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -53,6 +54,7 @@ from telethon.tl.types import DocumentAttributeVideo
 # CONFIGURATION (Override via Environment Variables on Altare / VPS)
 # ==============================================================================
 
+# Set BOT_TOKEN in the server environment; never commit a live token.
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
     "8837565058:AAFDtM7wJRI2AOgV67dPDdK-206STorQ1Ew",
@@ -63,8 +65,8 @@ BOT_TOKEN = os.environ.get(
 TG_API_ID = int(os.environ.get("TG_API_ID", "2040"))
 TG_API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627").strip()
 
-# Optional: lock bot to your Telegram numeric user ID (0 = auto-bind to first /start user)
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+# Lock bot to the owner's Telegram numeric user ID. Override via OWNER_ID if needed.
+OWNER_ID = int(os.environ.get("OWNER_ID", "404470349"))
 
 # SuperLive Web API & Agora defaults
 SUPERLIVE_API_BASE = os.environ.get("SUPERLIVE_API_BASE", "https://api.spl-live.com/api/web").rstrip("/")
@@ -88,8 +90,8 @@ AGORA_INACTIVITY_TIMEOUT = int(os.environ.get("AGORA_INACTIVITY_TIMEOUT", "45"))
 VIDEO_STALL_TIMEOUT = int(os.environ.get("VIDEO_STALL_TIMEOUT", "12"))
 # Watchlist check interval (seconds)
 DEFAULT_POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "25"))
-# Max simultaneous recordings safeguard (0 = truly unlimited, default 8 for 6 GiB RAM / 10 GiB Disk)
-DEFAULT_MAX_CONCURRENT = 0  # unlimited
+# Resource safeguard; actual concurrency is also limited by available SuperLive accounts.
+DEFAULT_MAX_CONCURRENT = max(1, int(os.environ.get("MAX_CONCURRENT_RECORDINGS", "2")))
 
 # ==============================================================================
 # LOGGING
@@ -2204,13 +2206,15 @@ class RecordingManager:
         return self.pool.usable() or [self.pool.primary]
 
     def free_account(self) -> Optional[SuperLiveClient]:
+        if len(self.active) >= self.max_concurrent():
+            return None
         for c in self.accounts():
             if c.slot not in self.busy:
                 return c
         return None
 
     def max_concurrent(self) -> int:
-        return len(self.accounts())
+        return min(len(self.accounts()), DEFAULT_MAX_CONCURRENT)
 
     def has_capacity(self) -> bool:
         return self.free_account() is not None
@@ -2344,6 +2348,7 @@ class RecordingManager:
         work_dir.mkdir(parents=True, exist_ok=True)
         upload_lock = asyncio.Lock()
         upload_tasks: List[asyncio.Task] = []
+        upload_failures: List[str] = []
         final_status = "completed"
         notes = ""
 
@@ -2355,6 +2360,7 @@ class RecordingManager:
                     async with upload_lock:  # keeps parts in order
                         await coro_factory()
                 except Exception as e:
+                    upload_failures.append(str(e)[:250])
                     log.exception("Upload job failed for %s: %s", rec.creator_id, e)
                 finally:
                     rec.uploads_pending -= 1
@@ -2427,6 +2433,11 @@ class RecordingManager:
                 except Exception:
                     pass
 
+            if upload_failures:
+                final_status = "upload_failed" if rec.uploaded_parts == 0 else "partial_upload"
+                notes = (notes + " | " if notes else "") + "Upload failed; local files retained: " + "; ".join(upload_failures[:3])
+                log.error("Retaining local recording files after upload failure: %s", work_dir)
+
             self.db.finish_recording_record(
                 rec.db_rec_id,
                 status=final_status,
@@ -2439,7 +2450,8 @@ class RecordingManager:
             self.active.pop(rec.creator_id, None)
             if rec.client is not None and self.busy.get(rec.client.slot) == rec.creator_id:
                 self.busy.pop(rec.client.slot, None)
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if not upload_failures:
+                shutil.rmtree(work_dir, ignore_errors=True)
             self._changed()
 
     def notify_ttl(self) -> int:
@@ -2712,16 +2724,17 @@ class RecordingManager:
                     )
                 except Exception:
                     pass
-                return
+                # Surface failure to lifecycle; retain this file for recovery.
+                raise RuntimeError(f"Telegram upload failed for part {part_no}; retained at {dest}")
 
-            # Uploaded -> free the disk immediately
+            # Telegram confirmed the send. Persist metadata before deleting the local copy.
+            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
+                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
             mp4_path.unlink(missing_ok=True)
             rec.uploaded_parts += 1
             rec.uploaded_duration += dur
             rec.uploaded_bytes += fsize
             rec.upload_status = f"پارت {part_no}: ارسال شد ✅"
-            self.db.add_clip(rec.db_rec_id, rec.creator_id, rec.creator_name, part_no, dur, fsize,
-                             rec.chat_id, sent.id, sheet_msg.id if sheet_msg else 0)
 
             arch_raw = self.db.get_setting("archive_chat_id", "")
             if arch_raw:
@@ -3807,15 +3820,12 @@ class SuperLiveRecBot:
         return runner
 
     async def run(self) -> None:
+        if not BOT_TOKEN:
+            raise RuntimeError("BOT_TOKEN is missing. Set it as an environment variable before starting the bot.")
         stale = self.db.mark_stale_recordings_interrupted()
         if stale:
             log.info("Marked %d stale recordings as interrupted.", stale)
-        for child in RECORDINGS_DIR.iterdir():
-            try:
-                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+        # Preserve interrupted/failed recordings for recovery; successfully sent MP4 parts are deleted immediately.
         self._register_handlers()
         health_runner = await self._start_health_server()
         await self.bot.start(bot_token=BOT_TOKEN)
@@ -3868,3 +3878,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
